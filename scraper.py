@@ -1,7 +1,7 @@
 import json
 import re
 import asyncio
-from typing import Dict, List, Set, Any
+from typing import Dict, List, Set, Any, Tuple
 from urllib.parse import urlparse, unquote
 from bs4 import BeautifulSoup
 try:
@@ -49,7 +49,7 @@ async def head_check(url: str, timeout: float = 5.0) -> bool:
     except Exception:
         return False
 
-async def fetch_with_httpx(url: str) -> tuple[str, str]:
+async def fetch_with_httpx(url: str) -> Tuple[str, str]:
     headers = {
         'User-Agent': 'Mozilla/5.0 (compatible; BusinessAuditBot/2.0; +https://example.com/bot)'
     }

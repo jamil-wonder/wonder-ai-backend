@@ -14,7 +14,6 @@ call venv\Scripts\activate.bat
 echo [3/4] Installing Required Packages...
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-pip install --force-reinstall greenlet
 
 echo [4/4] Installing Browser Binaries for Data Scraping...
 playwright install chromium
