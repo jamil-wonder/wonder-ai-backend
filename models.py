@@ -1,0 +1,66 @@
+from pydantic import BaseModel, Field
+from typing import List, Dict, Any, Optional
+
+class ScoreBreakdown(BaseModel):
+    total: int
+    businessName: Optional[int] = None
+    description: Optional[int] = None
+    logo: Optional[int] = None
+    language: Optional[int] = None
+    phone: Optional[int] = None
+    email: Optional[int] = None
+    address: Optional[int] = None
+    hoursVisible: Optional[int] = None
+    hoursStructured: Optional[int] = None
+    socialLinks: Optional[int] = None
+    booking: Optional[int] = None
+    present: Optional[int] = None
+    correctType: Optional[int] = None
+    keyFields: Optional[int] = None
+    ssl: Optional[int] = None
+    mobile: Optional[int] = None
+    canonical: Optional[int] = None
+    sitemap: Optional[int] = None
+    robots: Optional[int] = None
+
+class Scores(BaseModel):
+    total: int
+    grade: str
+    coreIdentity: ScoreBreakdown
+    contact: ScoreBreakdown
+    operating: ScoreBreakdown
+    trust: ScoreBreakdown
+    schema: ScoreBreakdown  # 'schema' is a reserved word in some contexts, using alias if needed, but pydantic v2 handles it fine usually, or we just leave it
+    technical: ScoreBreakdown
+
+    class Config:
+        populate_by_name = True
+
+class ScrapeResult(BaseModel):
+    url: str
+    title: str
+    businessName: str
+    description: str
+    emails: List[str]
+    phones: List[str]
+    addresses: List[str]
+    socialLinks: Dict[str, str]
+    openingHours: List[str]
+    logoUrl: Optional[str] = None
+    language: str
+    canonicalUrl: Optional[str] = None
+    sitemapFound: bool
+    robotsTxtFound: bool
+    hasSSL: bool
+    hasMobileMeta: bool
+    hasAnalytics: bool
+    pageSpeedHints: List[str]
+    schemas: List[Dict[str, Any]]
+    scores: Dict[str, Any]
+    rawMeta: Dict[str, str]
+    warnings: List[str]
+    seoInfo: Optional[Dict[str, Any]] = None
+    technologies: List[str] = Field(default_factory=list)
+
+class ScrapeRequest(BaseModel):
+    url: str
