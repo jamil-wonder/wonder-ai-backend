@@ -1,9 +1,19 @@
+import asyncio
+import sys
+
+# Windows asyncio workaround for Playwright
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from models import ScrapeRequest, ScrapeResult
+from models import ScrapeRequest, ScrapeResult, AiInsightsRequest, AiInsightsResult
 from scraper import scrape_website
-from phase2_models import MultiScanRequest, MultiScanResult
-from conflict_engine import run_multi_scan
+from ai_agent import get_ai_insights
+from phase2_models import CompareRequest, CompareResult
+from competitor_engine import run_competitor_analysis
+from phase3_models import ContentAnalysisRequest, ContentAnalysisResponse
+from content_agent import analyze_url_content
 import traceback
 import uvicorn
 
@@ -26,14 +36,35 @@ async def api_scrape(request: ScrapeRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/scan/multi", response_model=MultiScanResult)
-async def api_scan_multi(request: MultiScanRequest):
+@app.post("/api/scan/compare", response_model=CompareResult)
+async def api_scan_compare(request: CompareRequest):
+    print(f"\n[API] Received comparison request for primary URL: {request.primary_url}")
+    print(f"[API] Competitors to check: {request.competitor_urls}")
     try:
-        result = await run_multi_scan(request)
+        result = await run_competitor_analysis(request)
+        print("[API] Comparison completed successfully.\n")
         return result
     except Exception as e:
+        print(f"[API] ERROR in comparison: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+@app.post("/api/ai-insights", response_model=AiInsightsResult)
+async def api_ai_insights(request: AiInsightsRequest):
+    try:
+        insight = await get_ai_insights(request.businessName, request.url)
+        return AiInsightsResult(success=True, insights=[insight])
+    except Exception as e:
+        traceback.print_exc()
+        return AiInsightsResult(success=False, insights=[], error=str(e))
+
+@app.post("/api/scan/content", response_model=ContentAnalysisResponse)
+async def api_scan_content(request: ContentAnalysisRequest):
+    print(f"\n[API] Received content analysis request for URL: {request.url}")
+    try:
+        result = await analyze_url_content(request.url)
+        return result
+    except Exception as e:
+        print(f"[API] ERROR in content analysis: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))

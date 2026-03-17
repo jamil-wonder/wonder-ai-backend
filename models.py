@@ -64,3 +64,20 @@ class ScrapeResult(BaseModel):
 
 class ScrapeRequest(BaseModel):
     url: str
+
+class AiModelInsight(BaseModel):
+    modelName: str
+    isKnown: bool
+    summary: str
+    sentiment: str
+    platforms: List[str]
+    evidence: List[str]
+
+class AiInsightsRequest(BaseModel):
+    url: str
+    businessName: str
+
+class AiInsightsResult(BaseModel):
+    success: bool
+    insights: List[AiModelInsight] = Field(default_factory=list)
+    error: Optional[str] = None

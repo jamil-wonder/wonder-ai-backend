@@ -5,3 +5,5 @@ beautifulsoup4
 pydantic
 httpx
 gunicorn
+google-genai
+python-dotenv
