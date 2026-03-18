@@ -81,3 +81,10 @@ class AiInsightsResult(BaseModel):
     success: bool
     insights: List[AiModelInsight] = Field(default_factory=list)
     error: Optional[str] = None
+
+class WishlistRequest(BaseModel):
+    email: str
+
+class TrackUrlRequest(BaseModel):
+    url: str
+    phase: str

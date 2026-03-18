@@ -7,3 +7,4 @@ httpx
 gunicorn
 google-genai
 python-dotenv
+motor
