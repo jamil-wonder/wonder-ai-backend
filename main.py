@@ -117,6 +117,15 @@ async def api_get_wishlist():
         print(f"[API] ERROR fetching wishlist emails: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.delete("/api/wishlist")
+async def api_delete_wishlist(email: str):
+    try:
+        await wishlist_col.delete_one({"email": email})
+        return {"success": True}
+    except Exception as e:
+        print(f"[API] ERROR deleting wishlist email {email}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/track-url")
 async def api_track_url(request: TrackUrlRequest):
     try:
@@ -135,6 +144,15 @@ async def api_get_urls():
         return {"success": True, "urls": urls}
     except Exception as e:
         print(f"[API] ERROR fetching tracking urls: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/track-url")
+async def api_delete_track_url(url: str, phase: str):
+    try:
+        await urls_col.delete_one({"url": url, "phase": phase})
+        return {"success": True}
+    except Exception as e:
+        print(f"[API] ERROR deleting tracking url {url}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
