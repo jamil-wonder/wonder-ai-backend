@@ -24,6 +24,18 @@ load_dotenv()
 
 app = FastAPI(title="Wonder AI Backend")
 
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
+if allowed_origins_env.strip():
+    allowed_origins = [origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()]
+else:
+    allowed_origins = [
+        "https://wonderscore.ai",
+        "https://www.wonderscore.ai",
+        "https://api.wonderscore.ai",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
 # Setup MongoDB
 MONGO_URL = os.getenv("MONGODB_URL", "mongodb+srv://jamil_db_user:qBfb3HtWmwvEEEkb@wonderai-db.qozs3tl.mongodb.net/?appName=wonderai-db")
 try:
@@ -36,7 +48,7 @@ except Exception as e:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
