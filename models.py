@@ -88,3 +88,37 @@ class WishlistRequest(BaseModel):
 class TrackUrlRequest(BaseModel):
     url: str
     phase: str
+
+# Authentication Models
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password: str
+
+class UserResponse(BaseModel):
+    id: str
+    name: str
+    email: str
+    created_at: str
+    role: str = "user"
+    status: str = "active"
+
+class UserRoleUpdateRequest(BaseModel):
+    role: str
+
+class SearchHistoryResponse(BaseModel):
+    id: str
+    user_id: Optional[str] = None
+    user_email: Optional[str] = None
+    url: str
+    phase: str
+    timestamp: Optional[str] = None
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user: UserResponse
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str

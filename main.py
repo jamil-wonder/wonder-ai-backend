@@ -5,8 +5,10 @@ import sys
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
+from bson import ObjectId
 from models import ScrapeRequest, ScrapeResult, AiInsightsRequest, AiInsightsResult, WishlistRequest, TrackUrlRequest
 from scraper import scrape_website
 from ai_agent import get_ai_insights
@@ -14,6 +16,16 @@ from phase2_models import CompareRequest, CompareResult
 from competitor_engine import run_competitor_analysis
 from phase3_models import ContentAnalysisRequest, ContentAnalysisResponse
 from content_agent import analyze_url_content
+from models import UserCreate, UserResponse, Token, LoginRequest
+
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+from pydantic import BaseModel
+import secrets
+import bcrypt
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+
 import traceback
 import uvicorn
 import os
@@ -43,6 +55,7 @@ try:
     db = mongo_client.get_database("wonderai")
     wishlist_col = db.get_collection("wishlist")
     urls_col = db.get_collection("urls")
+    users_col = db.get_collection("users")
 except Exception as e:
     print(f"[API] Error connecting to MongoDB: {e}")
 
@@ -54,11 +67,246 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Authentication Config
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("CRITICAL SECURITY ERROR: JWT_SECRET_KEY is missing from environment variables.")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 7 days
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+
+def get_password_hash(password: str) -> str:
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# --- Dependencies ---
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
+
+async def get_current_user_optional(token: str = Depends(oauth2_scheme)):
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("id")
+        if user_id is None:
+            return None
+        user = await users_col.find_one({"_id": ObjectId(user_id)})
+        if user:
+            return {
+                "id": str(user["_id"]), 
+                "email": user["email"], 
+                "role": user.get("role", "user"), 
+                "status": user.get("status", "active")
+            }
+    except Exception:
+        pass
+    return None
+
+async def get_current_user(user: dict = Depends(get_current_user_optional)):
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+    if user.get("status") == "banned":
+        raise HTTPException(status_code=403, detail="Your account has been restricted.")
+    return user
+
+async def get_current_admin_user(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Insufficient privileges. Admin access required.")
+    return current_user
+
+# --- Auth Routes ---
+
+class GoogleAuthRequest(BaseModel):
+    credential: str
+
+@app.post("/api/auth/google", response_model=Token)
+async def api_google_login(request: GoogleAuthRequest):
+    try:
+        client_id = os.getenv("GOOGLE_CLIENT_ID")
+        if not client_id:
+            raise HTTPException(status_code=500, detail="Google Client ID not configured")
+            
+        idinfo = id_token.verify_oauth2_token(
+            request.credential, google_requests.Request(), client_id
+        )
+
+        email = idinfo.get("email")
+        name = idinfo.get("name")
+        
+        if not email:
+            raise HTTPException(status_code=400, detail="Invalid Google token payload")
+
+        user = await users_col.find_one({"email": email})
+        
+        if not user:
+            total_users = await users_col.count_documents({})
+            assigned_role = "admin" if total_users == 0 else "user"
+            
+            hashed_password = get_password_hash(secrets.token_urlsafe(32))
+            
+            new_user = {
+                "name": name,
+                "email": email,
+                "hashed_password": hashed_password,
+                "role": assigned_role,
+                "status": "active",
+                "created_at": datetime.utcnow().isoformat()
+            }
+            result = await users_col.insert_one(new_user)
+            user_id = str(result.inserted_id)
+            user_role = assigned_role
+            user_status = "active"
+            created_at = new_user["created_at"]
+        else:
+            user_id = str(user["_id"])
+            user_role = user.get("role", "user")
+            user_status = user.get("status", "active")
+            created_at = user.get("created_at", datetime.utcnow().isoformat())
+            name = user.get("name", name)
+
+        if user_status == "banned":
+            raise HTTPException(status_code=403, detail="Your account has been restricted.")
+
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": email, "id": user_id}, expires_delta=access_token_expires
+        )
+
+        user_response = UserResponse(
+            id=user_id,
+            name=name,
+            email=email,
+            created_at=created_at,
+            role=user_role,
+            status=user_status
+        )
+
+        return Token(access_token=access_token, token_type="bearer", user=user_response)
+
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[API] ERROR during google auth: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/auth/signup", response_model=Token)
+async def api_signup(user: UserCreate):
+    try:
+        # Check if user already exists
+        existing_user = await users_col.find_one({"email": user.email})
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Email already registered")
+
+        # Create new user (automatically assign first user as admin conditionally if no users exist)
+        total_users = await users_col.count_documents({})
+        assigned_role = "admin" if total_users == 0 else "user"
+
+        hashed_password = get_password_hash(user.password)
+        new_user = {
+            "name": user.name,
+            "email": user.email,
+            "hashed_password": hashed_password,
+            "role": assigned_role,
+            "status": "active",
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        result = await users_col.insert_one(new_user)
+        user_id = str(result.inserted_id)
+
+        # Generate JWT token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user.email, "id": user_id}, expires_delta=access_token_expires
+        )
+
+        user_response = UserResponse(
+            id=user_id,
+            name=user.name,
+            email=user.email,
+            created_at=new_user["created_at"],
+            role=new_user["role"],
+            status=new_user["status"]
+        )
+
+        return Token(access_token=access_token, token_type="bearer", user=user_response)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[API] ERROR during signup: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/auth/login", response_model=Token)
+async def api_login(request: LoginRequest):
+    try:
+        # Find user
+        user = await users_col.find_one({"email": request.email})
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+
+        # Verify password
+        if not verify_password(request.password, user["hashed_password"]):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+
+        user_id = str(user["_id"])
+
+        # Generate JWT token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user["email"], "id": user_id}, expires_delta=access_token_expires
+        )
+
+        user_response = UserResponse(
+            id=user_id,
+            name=user["name"],
+            email=user["email"],
+            created_at=user.get("created_at", datetime.utcnow().isoformat()),
+            role=user.get("role", "user"),
+            status=user.get("status", "active")
+        )
+
+        return Token(access_token=access_token, token_type="bearer", user=user_response)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[API] ERROR during login: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# --- Existing Data Routes ---
+
 @app.post("/api/scrape", response_model=ScrapeResult)
-async def api_scrape(request: ScrapeRequest):
+async def api_scrape(request: ScrapeRequest, current_user: dict = Depends(get_current_user_optional)):
     try:
         try:
-            await urls_col.insert_one({"url": request.url, "phase": "phase1"})
+            doc = {
+                "url": request.url, 
+                "phase": "phase1", 
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            if current_user:
+                doc["user_id"] = current_user["id"]
+                doc["user_email"] = current_user["email"]
+            await urls_col.insert_one(doc)
         except:
             pass
         result = await scrape_website(request.url)
@@ -68,14 +316,31 @@ async def api_scrape(request: ScrapeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/scan/compare", response_model=CompareResult)
-async def api_scan_compare(request: CompareRequest):
+async def api_scan_compare(request: CompareRequest, current_user: dict = Depends(get_current_user_optional)):
     print(f"\n[API] Received comparison request for primary URL: {request.primary_url}")
     print(f"[API] Competitors to check: {request.competitor_urls}")
     try:
         try:
-            await urls_col.insert_one({"url": request.primary_url, "phase": "phase2_primary"})
+            doc = {
+                "url": request.primary_url, 
+                "phase": "phase2_primary",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            if current_user:
+                doc["user_id"] = current_user["id"]
+                doc["user_email"] = current_user["email"]
+            await urls_col.insert_one(doc)
+
             for comp in request.competitor_urls:
-                await urls_col.insert_one({"url": comp, "phase": "phase2_competitor"})
+                comp_doc = {
+                    "url": comp, 
+                    "phase": "phase2_competitor",
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+                if current_user:
+                    comp_doc["user_id"] = current_user["id"]
+                    comp_doc["user_email"] = current_user["email"]
+                await urls_col.insert_one(comp_doc)
         except:
             pass
         result = await run_competitor_analysis(request)
@@ -96,11 +361,19 @@ async def api_ai_insights(request: AiInsightsRequest):
         return AiInsightsResult(success=False, insights=[], error=str(e))
 
 @app.post("/api/scan/content", response_model=ContentAnalysisResponse)
-async def api_scan_content(request: ContentAnalysisRequest):
+async def api_scan_content(request: ContentAnalysisRequest, current_user: dict = Depends(get_current_user_optional)):
     print(f"\n[API] Received content analysis request for URL: {request.url}")
     try:
         try:
-            await urls_col.insert_one({"url": request.url, "phase": "phase3"})
+            doc = {
+                "url": request.url, 
+                "phase": "phase3",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            if current_user:
+                doc["user_id"] = current_user["id"]
+                doc["user_email"] = current_user["email"]
+            await urls_col.insert_one(doc)
         except:
             pass
         result = await analyze_url_content(request.url)
@@ -139,9 +412,17 @@ async def api_delete_wishlist(email: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/track-url")
-async def api_track_url(request: TrackUrlRequest):
+async def api_track_url(request: TrackUrlRequest, current_user: dict = Depends(get_current_user_optional)):
     try:
-        await urls_col.insert_one({"url": request.url, "phase": request.phase})
+        doc = {
+            "url": request.url, 
+            "phase": request.phase,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        if current_user:
+            doc["user_id"] = current_user["id"]
+            doc["user_email"] = current_user["email"]
+        await urls_col.insert_one(doc)
         return {"success": True}
     except Exception as e:
         print(f"[API] ERROR saving tracking url {request.url}: {e}")
@@ -165,6 +446,77 @@ async def api_delete_track_url(url: str, phase: str):
         return {"success": True}
     except Exception as e:
         print(f"[API] ERROR deleting tracking url {url}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Admin Dash Routes ---
+
+from models import UserRoleUpdateRequest
+
+@app.get("/api/admin/users")
+async def admin_get_users(admin: dict = Depends(get_current_admin_user)):
+    try:
+        users = []
+        async for u in users_col.find({}):
+            users.append({
+                "id": str(u["_id"]),
+                "name": u.get("name"),
+                "email": u.get("email"),
+                "role": u.get("role", "user"),
+                "status": u.get("status", "active"),
+                "created_at": u.get("created_at")
+            })
+        return {"success": True, "users": users}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/admin/users/{user_id}/role")
+async def admin_update_user_role(user_id: str, request: UserRoleUpdateRequest, admin: dict = Depends(get_current_admin_user)):
+    try:
+        if admin["id"] == user_id:
+            raise HTTPException(status_code=400, detail="Admins cannot change their own role")
+        
+        upd = await users_col.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"role": request.role}}
+        )
+        if upd.matched_count == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+        return {"success": True, "role": request.role}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/searches")
+async def admin_get_searches(admin: dict = Depends(get_current_admin_user)):
+    try:
+        searches = []
+        async for doc in urls_col.find({}).sort("timestamp", -1):
+            searches.append({
+                "id": str(doc["_id"]),
+                "url": doc["url"],
+                "phase": doc.get("phase", "unknown"),
+                "timestamp": doc.get("timestamp"),
+                "user_id": doc.get("user_id"),
+                "user_email": doc.get("user_email")
+            })
+        return {"success": True, "searches": searches}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/wishlist-full")
+async def admin_get_wishlist_full(admin: dict = Depends(get_current_admin_user)):
+    try:
+        emails = []
+        # Support full documents, with potentially a logged created_at date
+        async for doc in wishlist_col.find({}):
+            emails.append({
+                "id": str(doc["_id"]),
+                "email": doc["email"],
+                "timestamp": doc.get("timestamp")
+            })
+        return {"success": True, "wishlist": emails}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
