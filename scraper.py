@@ -1,9 +1,11 @@
 import json
 import re
 import asyncio
+import sys
 from typing import Dict, List, Set, Any, Tuple
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urljoin, parse_qs
 from bs4 import BeautifulSoup
+
 try:
     from playwright.async_api import async_playwright
     PLAYWRIGHT_AVAILABLE = True
@@ -13,6 +15,7 @@ except (ImportError, Exception):
 
 import httpx
 from models import ScrapeResult, Scores, ScoreBreakdown
+import ai_agent
 
 SOCIAL_PATTERNS = {
     'facebook':  re.compile(r'facebook\.com/(?!sharer|share|login|dialog)([\w.%-]+)', re.I),
@@ -41,6 +44,105 @@ def get_grade(score: int) -> str:
     if score >= 50: return 'D'
     return 'F'
 
+def can_use_playwright_on_current_loop() -> bool:
+    """
+    Playwright launches a subprocess. On Windows this requires a loop that
+    supports subprocess transports (typically ProactorEventLoop).
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        return False
+    if sys.platform != "win32":
+        return True
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return True
+
+    proactor_cls = getattr(asyncio, "ProactorEventLoop", None)
+    if proactor_cls is None:
+        return True
+    return isinstance(loop, proactor_cls)
+
+
+async def _fetch_with_playwright(target_url: str) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "content": "",
+        "final_url": target_url,
+        "used_playwright": False,
+        "timed_out": False,
+        "screenshot_bytes": None,
+        "warnings": [],
+    }
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=[
+            '--disable-blink-features=AutomationControlled',
+            '--disable-gpu',
+            '--no-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-extensions',
+        ])
+        context = await browser.new_context(viewport={'width': 1280, 'height': 1600})
+        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        page = await context.new_page()
+
+        async def route_intercept(route):
+            if route.request.resource_type in ['media', 'font']:
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await page.route("**/*", route_intercept)
+
+        try:
+            await page.goto(target_url, wait_until='domcontentloaded', timeout=25000)
+        except Exception as e:
+            if 'Timeout' in str(type(e)):
+                result["timed_out"] = True
+                result["warnings"].append('Page load timed out — results may be incomplete.')
+            else:
+                await browser.close()
+                raise e
+
+        if not result["timed_out"]:
+            await asyncio.sleep(2.5)
+
+        try:
+            result["content"] = await page.content()
+        except Exception:
+            result["content"] = ""
+
+        content_lower = result["content"].lower()
+        cf_triggers = ['just a moment', 'cloudflare', '403 forbidden', '<title>403</title>', 'access denied', 'please enable cookies', 'cf-browser-verification', 'security check']
+
+        if any(trigger in content_lower for trigger in cf_triggers):
+            result["warnings"].append("Cloudflare / 403 block detected. Dropping Playwright context.")
+            result["used_playwright"] = False
+        else:
+            result["final_url"] = page.url
+            result["used_playwright"] = True
+            try:
+                result["screenshot_bytes"] = await page.screenshot(type='jpeg', quality=50, full_page=True)
+            except Exception:
+                result["screenshot_bytes"] = None
+            if result["final_url"] != target_url:
+                result["warnings"].append(f"Redirected to {result['final_url']}")
+
+        await browser.close()
+
+    return result
+
+
+def _run_playwright_in_thread(target_url: str) -> Dict[str, Any]:
+    # Dedicated thread runner to avoid incompatible server loop restrictions on Windows.
+    if sys.platform == "win32":
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        except Exception:
+            pass
+    return asyncio.run(_fetch_with_playwright(target_url))
+
 async def head_check(url: str, timeout: float = 5.0) -> bool:
     try:
         async with httpx.AsyncClient(verify=False) as client:
@@ -51,10 +153,15 @@ async def head_check(url: str, timeout: float = 5.0) -> bool:
 
 async def fetch_with_httpx(url: str) -> Tuple[str, str]:
     headers = {
-        'User-Agent': 'Mozilla/5.0 (compatible; BusinessAuditBot/2.0; +https://example.com/bot)'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5'
     }
     async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=30.0) as client:
         response = await client.get(url, headers=headers)
+        if response.status_code in [403, 401, 429]:
+            # Some WAFs target simulated browser UAs. Re-try natively.
+            response = await client.get(url)
         return response.text, str(response.url)
 
 async def scrape_website(url: str) -> dict:
@@ -72,68 +179,97 @@ async def scrape_website(url: str) -> dict:
     final_url = target_url
     timed_out = False
     used_playwright = False
+    screenshot_bytes = None
 
-    if PLAYWRIGHT_AVAILABLE:
+    playwright_enabled = can_use_playwright_on_current_loop()
+    if PLAYWRIGHT_AVAILABLE and not playwright_enabled:
+        warnings.append("Playwright disabled on current Windows event loop. Falling back to HTTP fetch.")
+
+    if playwright_enabled:
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, args=[
-                    '--disable-gpu',
-                    '--disable-dev-shm-usage',
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-extensions',
-                ])
-                context = await browser.new_context(
-                    user_agent='Mozilla/5.0 (compatible; BusinessAuditBot/2.0; +https://example.com/bot)',
-                    viewport={'width': 1280, 'height': 800}
-                )
-                page = await context.new_page()
-
-                async def route_intercept(route):
-                    if route.request.resource_type in ['image', 'media', 'font', 'stylesheet']:
-                        await route.abort()
-                    else:
-                        await route.continue_()
-
-                await page.route("**/*", route_intercept)
-
-                try:
-                    await page.goto(target_url, wait_until='domcontentloaded', timeout=25000)
-                except Exception as e:
-                    if 'Timeout' in str(type(e)):
-                        timed_out = True
-                        warnings.append('Page load timed out — results may be incomplete.')
-                    else:
-                        raise e
-
-                if not timed_out:
-                    await asyncio.sleep(2.5)
-
-                content = await page.content()
-                final_url = page.url
-                used_playwright = True
-
-                if final_url != target_url:
-                    warnings.append(f'Redirected to {final_url}')
-
-                await browser.close()
+            pw_result = await _fetch_with_playwright(target_url)
+            content = pw_result["content"]
+            final_url = pw_result["final_url"]
+            used_playwright = pw_result["used_playwright"]
+            timed_out = pw_result["timed_out"]
+            screenshot_bytes = pw_result["screenshot_bytes"]
+            warnings.extend(pw_result["warnings"])
         except Exception as e:
             warnings.append(f"Playwright error: {str(e)[:100]}. Falling back to standard fetch.")
             print(f"Playwright Runtime Error: {e}")
+    elif PLAYWRIGHT_AVAILABLE:
+        # Try Playwright in a dedicated thread with its own Proactor loop on Windows.
+        try:
+            pw_result = await asyncio.to_thread(_run_playwright_in_thread, target_url)
+            content = pw_result["content"]
+            final_url = pw_result["final_url"]
+            used_playwright = pw_result["used_playwright"]
+            timed_out = pw_result["timed_out"]
+            screenshot_bytes = pw_result["screenshot_bytes"]
+            warnings.extend(pw_result["warnings"])
+            if used_playwright:
+                warnings.append("Playwright executed in dedicated worker thread mode.")
+        except Exception as e:
+            warnings.append(f"Playwright thread mode error: {str(e)[:100]}. Falling back to standard fetch.")
+            print(f"Playwright Thread Runtime Error: {e}")
 
     if not used_playwright:
         try:
             content, final_url = await fetch_with_httpx(target_url)
-            warnings.append("Note: JS-rendering is disabled. Dynamic content may be missing.")
+            warnings.append("Note: JS-rendering was disabled or blocked. Dynamic content missing.")
         except Exception as e:
             raise Exception(f"Failed to fetch {target_url}: {str(e)}")
 
     soup = BeautifulSoup(content, 'html.parser')
 
+    # Shallow Crawl for Contact/About Subpages
+    subpage_contents = []
+    crawl_queue = []
+    base_domain = urlparse(final_url).netloc
+    
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        low = href.lower()
+        if any(x in low for x in ['contact', 'about', 'location', 'find-us']):
+            full_link = urljoin(final_url, href)
+            try:
+                if urlparse(full_link).netloc == base_domain and full_link not in crawl_queue and full_link != final_url:
+                    crawl_queue.append(full_link)
+            except: pass
+            
+    crawl_queue = crawl_queue[:3]
+    if crawl_queue:
+        async def fetch_sub(u):
+            try:
+                # First attempt with httpx (fast)
+                txt, _ = await fetch_with_httpx(u)
+                
+                # Check if we hit a WAF
+                low_txt = txt.lower()
+                triggers = ['403 - forbidden', 'access denied', 'cloudflare', 'just a moment', 'security check', 'enable cookies']
+                if any(t in low_txt for t in triggers):
+                    if can_use_playwright_on_current_loop():
+                        async with async_playwright() as pw:
+                            b = await pw.chromium.launch(headless=True, args=['--disable-gpu', '--no-sandbox'])
+                            p = await b.new_page()
+                            await p.goto(u, wait_until='domcontentloaded', timeout=20000)
+                            txt = await p.content()
+                            await b.close()
+                return txt
+            except Exception as sub_e:
+                print(f"Sub-crawl error for {u}: {sub_e}")
+                return ""
+        results = await asyncio.gather(*(fetch_sub(u) for u in crawl_queue))
+        for r in results:
+            if r:
+                subpage_contents.append(BeautifulSoup(r, 'html.parser'))
+
+    all_soups = [soup] + subpage_contents
+
     schemas = []
     for script in soup.find_all('script', type='application/ld+json'):
         try:
-            parsed = json.loads(script.string or '')
+            parsed = json.loads(script.string or script.get_text() or '')
             if isinstance(parsed, list):
                 schemas.extend(parsed)
             else:
@@ -185,9 +321,10 @@ async def scrape_website(url: str) -> dict:
         description = raw_meta.get('description') or raw_meta.get('og:description') or raw_meta.get('twitter:description') or ''
 
     phones = set()
-    for a in soup.find_all('a', href=re.compile(r'^tel:')):
-        raw = unquote(a['href'].replace('tel:', '')).strip()
-        if raw: phones.add(normalise_phone(raw))
+    for s_doc in all_soups:
+        for a in s_doc.find_all('a', href=re.compile(r'^tel:')):
+            raw = unquote(a['href'].replace('tel:', '')).strip()
+            if raw: phones.add(normalise_phone(raw))
 
     for s in schemas:
         if isinstance(s, dict) and s.get('telephone'):
@@ -198,29 +335,32 @@ async def scrape_website(url: str) -> dict:
                 phones.add(normalise_phone(t))
 
     if len(phones) < 2:
-        for tag in soup.find_all(['footer', 'header', 'address']) + soup.select('.contact, [class*="contact"], [id*="contact"]'):
-            text = tag.get_text()
-            matches = PHONE_REGEX.findall(text)
-            for m in matches:
-                clean = m.strip()
-                if len(re.sub(r'\D', '', clean)) >= 7:
-                    phones.add(normalise_phone(clean))
+        for s_doc in all_soups:
+            for tag in s_doc.find_all(['footer', 'header', 'address']) + s_doc.select('.contact, [class*="contact"], [id*="contact"]'):
+                text = tag.get_text()
+                matches = PHONE_REGEX.findall(text)
+                for m in matches:
+                    clean = m.strip()
+                    if len(re.sub(r'\D', '', clean)) >= 7:
+                        phones.add(normalise_phone(clean))
 
     emails = set()
-    for a in soup.find_all('a', href=re.compile(r'^mailto:')):
-        raw = unquote(a['href'].replace('mailto:', '')).split('?')[0].strip().lower()
-        if raw: emails.add(raw)
+    for s_doc in all_soups:
+        for a in s_doc.find_all('a', href=re.compile(r'^mailto:')):
+            raw = unquote(a['href'].replace('mailto:', '')).split('?')[0].strip().lower()
+            if raw: emails.add(raw)
 
     for s in schemas:
         if isinstance(s, dict) and s.get('email'):
             emails.add(str(s['email']).lower())
 
     if len(emails) < 2:
-        for tag in soup.find_all(['footer', 'header', 'address']) + soup.select('.contact, [class*="contact"], [id*="contact"]'):
-            text = tag.get_text()
-            matches = EMAIL_REGEX.findall(text)
-            for m in matches:
-                emails.add(m.strip().lower())
+        for s_doc in all_soups:
+            for tag in s_doc.find_all(['footer', 'header', 'address']) + s_doc.select('.contact, [class*="contact"], [id*="contact"]'):
+                text = tag.get_text()
+                matches = EMAIL_REGEX.findall(text)
+                for m in matches:
+                    emails.add(m.strip().lower())
 
     addresses = set()
     for s in schemas:
@@ -240,16 +380,43 @@ async def scrape_website(url: str) -> dict:
             parts = [p for p in parts if p and isinstance(p, str)]
             if parts: addresses.add(', '.join(parts))
 
-    for tag in soup.find_all('address'):
-        addresses.add(tag.get_text().strip())
+    for s_doc in all_soups:
+        for tag in s_doc.find_all('address'):
+            addresses.add(tag.get_text().strip())
 
-    for a in soup.find_all(['a', 'iframe']):
-        href = a.get('href') or a.get('src') or ''
-        if 'maps.google' in href or 'goo.gl/maps' in href:
-            try:
-                q = urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get('q')
-                if q: addresses.add(unquote(q[0]))
-            except: pass
+        for a in s_doc.find_all(['a', 'iframe']):
+            href = a.get('href') or a.get('src') or ''
+            if any(x in href.lower() for x in ['maps.google', 'goo.gl/maps', 'google.com/maps']):
+                try:
+                    q = parse_qs(urlparse(href).query).get('q')
+                    if q: 
+                        addresses.add(unquote(q[0]))
+                    elif 'place/' in href:
+                        addr = href.split('place/')[1].split('/')[0]
+                        addresses.add(unquote(addr).replace('+', ' '))
+                except: pass
+
+    # Deep Text Regex Fallback for Addresses (especially for UK/US formats)
+    if not addresses:
+        ADDRESS_SNIP_REGEX = re.compile(r'(\d+\s+[A-Za-z0-9\s,]{5,50}(?:Street|St|Road|Rd|Avenue|Ave|Lane|Ln|Drive|Dr|Way|Square|Sq|Plaza|Pl|Gardens|Gdns|London|Manchester|Birmingham|W1|EC1|SW1|E1|N1|NW1|SE1|WC1|[\s,]{1,2}[A-Z]{1,2}\d{1,2}\s+\d[A-Z]{2}))', re.I)
+        for s_doc in all_soups:
+            text = s_doc.get_text()
+            # Look for common UK Postcode patterns at the end of snippets
+            postcode_matches = re.finditer(r'([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})', text, re.I)
+            for pm in postcode_matches:
+                start = max(0, pm.start() - 100)
+                snip = text[start:pm.end()]
+                # Extract the last few lines/parts ending in this postcode
+                parts = re.split(r'[\r\n]{1,2}', snip)
+                potential = parts[-1].strip()
+                if len(potential) > 10:
+                    addresses.add(potential)
+            
+            # Explicit search for Broadwick St style addresses
+            matches = ADDRESS_SNIP_REGEX.findall(text)
+            for m in matches:
+                if len(m.strip()) > 10:
+                    addresses.add(m.strip())
 
     opening_hours = []
     for s in schemas:
@@ -270,11 +437,14 @@ async def scrape_website(url: str) -> dict:
                 opening_hours.append(label)
 
     social_links = {}
-    for a in soup.find_all('a', href=True):
-        href = a['href']
-        for platform, pattern in SOCIAL_PATTERNS.items():
-            if platform not in social_links and pattern.search(href):
-                social_links[platform] = href if href.startswith('http') else f"https://{href}"
+    for s_doc in all_soups:
+        for a in s_doc.find_all('a', href=True):
+            try:
+                href = a['href']
+                for platform, pattern in SOCIAL_PATTERNS.items():
+                    if platform not in social_links and pattern.search(href):
+                        social_links[platform] = href if href.startswith('http') else f"https://{href}"
+            except: pass
 
     logo_url = None
     for s in schemas:
@@ -367,6 +537,20 @@ async def scrape_website(url: str) -> dict:
         head_check(f"{origin}/sitemap.xml"),
         head_check(f"{origin}/robots.txt")
     )
+
+    # ----- AI VISION FALLBACK -----
+    if screenshot_bytes and (not phones or not opening_hours or not addresses):
+        warnings.append('Triggering AI Vision Agent onto screenshot to locate missing visual data.')
+        vision_data = await ai_agent.get_vision_extraction(screenshot_bytes)
+        
+        if not phones and vision_data.get('phones'):
+            for p in vision_data['phones']: phones.add(normalise_phone(p))
+        if not emails and vision_data.get('emails'):
+            for e in vision_data['emails']: emails.add(e.lower())
+        if not addresses and vision_data.get('addresses'):
+            for a in vision_data['addresses']: addresses.add(a)
+        if not opening_hours and vision_data.get('hours'):
+            opening_hours.extend(vision_data['hours'])
 
     b_name_score = 8 if business_name else 0
     desc_score = 9 if description else 0

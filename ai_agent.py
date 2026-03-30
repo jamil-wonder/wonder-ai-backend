@@ -47,9 +47,55 @@ async def get_ai_insights(business_name: str, url: str) -> dict:
                 "sentiment": "Unknown", "platforms": [], "evidence": []
             }
     except Exception as e:
-        print(f"Error fetching AI insights: {{e}}")
+        print(f"Error fetching AI insights: {e}")
         return {
             "modelName": "Gemini", "isKnown": False, "summary": "Failed to fetch AI insights.",
             "sentiment": "Unknown", "platforms": [], "evidence": []
         }
+
+async def get_vision_extraction(screenshot_bytes: bytes) -> dict:
+    """
+    Given a screenshot of a website as bytes, ask Google Gemini to extract 
+    contact information and operating hours using Vision capabilities.
+    """
+    prompt = """
+    You are an AI data extraction agent. Analyze this screenshot of a business website.
+    Extract the following information if perfectly visible and identifiable:
+    1. Phone numbers
+    2. Email addresses
+    3. Physical addresses
+    4. Opening / Operating hours
+
+    You MUST respond in valid JSON format matching exactly this structure:
+    {
+        "phones": [],
+        "emails": [],
+        "addresses": [],
+        "hours": []
+    }
+    If a category is completely empty, or not explicitly found in the image, return an empty array for it. Do NOT hallucinate data. Make the hours array easy to read, e.g. ["Mon-Fri: 9am-5pm", "Sat: 10am-4pm"].
+    """
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                prompt,
+                types.Part.from_bytes(
+                    data=screenshot_bytes,
+                    mime_type="image/jpeg"
+                )
+            ],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1
+            )
+        )
+        if response and response.text:
+            return json.loads(response.text)
+        return {"phones": [], "emails": [], "addresses": [], "hours": []}
+    except Exception as e:
+        print(f"Error extracting vision data: {e}")
+        return {"phones": [], "emails": [], "addresses": [], "hours": []}
+
 

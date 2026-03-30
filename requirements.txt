@@ -7,8 +7,9 @@ httpx
 gunicorn
 google-genai
 python-dotenv
-motor==3.4.0
+motor>=3.7.1
 bcrypt
 python-jose[cryptography]==3.3.0
 google-auth==2.28.2
 python-multipart
+redis>=5.0.0

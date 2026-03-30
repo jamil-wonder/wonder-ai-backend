@@ -16,8 +16,19 @@ from phase2_models import CompareRequest, CompareResult
 from competitor_engine import run_competitor_analysis
 from phase3_models import ContentAnalysisRequest, ContentAnalysisResponse
 from content_agent import analyze_url_content
+from phase5_models import (
+    Phase5QuestionsRequest,
+    Phase5QuestionsResponse,
+    Phase5AnalyzeRequest,
+    Phase5AnalyzeResponse,
+    Phase5AnalyzeSingleRequest,
+    Phase5AnalyzeSingleResponse,
+    Phase5StartJobRequest,
+    Phase5StartJobResponse,
+    Phase5JobStatusResponse,
+)
+from phase5_agent import generate_brand_questions, rank_brand_in_ai, analyze_single_question
 from models import UserCreate, UserResponse, Token, LoginRequest
-
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from pydantic import BaseModel
@@ -29,12 +40,22 @@ from datetime import datetime, timedelta
 import traceback
 import uvicorn
 import os
+import uuid
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ReturnDocument
+from redis import asyncio as aioredis
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = FastAPI(title="Wonder AI Backend")
+
+# Phase 5 persistent worker settings
+PHASE5_WORKER_CONCURRENCY = int(os.getenv("PHASE5_WORKER_CONCURRENCY", "2"))
+PHASE5_WORKER_POLL_INTERVAL = float(os.getenv("PHASE5_WORKER_POLL_INTERVAL", "0.5"))
+PHASE5_WORKER_ID = f"{os.getenv('HOSTNAME', 'local')}-{uuid.uuid4().hex[:8]}"
+PHASE5_REDIS_URL = os.getenv("REDIS_URL", "").strip()
+PHASE5_REDIS_QUEUE_KEY = os.getenv("PHASE5_REDIS_QUEUE_KEY", "phase5:jobs:queue")
 
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
 if allowed_origins_env.strip():
@@ -50,12 +71,14 @@ else:
 
 # Setup MongoDB
 MONGO_URL = os.getenv("MONGODB_URL", "mongodb+srv://jamil_db_user:qBfb3HtWmwvEEEkb@wonderai-db.qozs3tl.mongodb.net/?appName=wonderai-db")
+phase5_jobs_col = None
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
     db = mongo_client.get_database("wonderai")
     wishlist_col = db.get_collection("wishlist")
     urls_col = db.get_collection("urls")
     users_col = db.get_collection("users")
+    phase5_jobs_col = db.get_collection("phase5_jobs")
 except Exception as e:
     print(f"[API] Error connecting to MongoDB: {e}")
 
@@ -518,6 +541,247 @@ async def admin_get_wishlist_full(admin: dict = Depends(get_current_admin_user))
         return {"success": True, "wishlist": emails}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ==============================================================================
+# PHASE 5 ROUTES
+# ==============================================================================
+@app.post("/api/phase5/generate-questions", response_model=Phase5QuestionsResponse)
+async def api_phase5_generate_questions(req: Phase5QuestionsRequest):
+    try:
+        questions = await generate_brand_questions(req.url)
+        return {"questions": questions}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/phase5/analyze", response_model=Phase5AnalyzeResponse)
+async def api_phase5_analyze(req: Phase5AnalyzeRequest):
+    try:
+        # q.model_dump() turns the pydantic model into a dictionary
+        questions_dicts = [q.model_dump() for q in req.questions]
+        results = await rank_brand_in_ai(req.url, questions_dicts)
+        return {"results": results}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/phase5/analyze-single", response_model=Phase5AnalyzeSingleResponse)
+async def api_phase5_analyze_single(req: Phase5AnalyzeSingleRequest):
+    try:
+        result = await analyze_single_question(req.url, req.question.model_dump())
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _process_phase5_job(job_doc: dict):
+    job_id = job_doc["job_id"]
+    try:
+        for q in job_doc.get("questions", []):
+            qid = q["id"]
+            await phase5_jobs_col.update_one(
+                {"job_id": job_id},
+                {
+                    "$set": {
+                        "current_question_id": qid,
+                        "updated_at": datetime.utcnow().isoformat(),
+                    }
+                },
+            )
+
+            result = await analyze_single_question(job_doc["url"], q)
+            await phase5_jobs_col.update_one(
+                {"job_id": job_id},
+                {
+                    "$set": {
+                        f"results.{qid}": result,
+                        "updated_at": datetime.utcnow().isoformat(),
+                    },
+                    "$inc": {"processed": 1},
+                },
+            )
+
+        await phase5_jobs_col.update_one(
+            {"job_id": job_id},
+            {
+                "$set": {
+                    "status": "completed",
+                    "current_question_id": None,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            },
+        )
+    except Exception as e:
+        traceback.print_exc()
+        await phase5_jobs_col.update_one(
+            {"job_id": job_id},
+            {
+                "$set": {
+                    "status": "failed",
+                    "current_question_id": None,
+                    "error": str(e),
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            },
+        )
+
+
+async def _phase5_worker_loop():
+    while True:
+        try:
+            redis_client = getattr(app.state, "phase5_redis", None)
+
+            claimed = None
+            if redis_client is not None:
+                queue_item = await redis_client.blpop(PHASE5_REDIS_QUEUE_KEY, timeout=5)
+                if queue_item:
+                    _, raw_job_id = queue_item
+                    queued_job_id = raw_job_id.decode("utf-8")
+                    claimed = await phase5_jobs_col.find_one_and_update(
+                        {"job_id": queued_job_id, "status": "queued"},
+                        {
+                            "$set": {
+                                "status": "running",
+                                "worker_id": PHASE5_WORKER_ID,
+                                "updated_at": datetime.utcnow().isoformat(),
+                            }
+                        },
+                        return_document=ReturnDocument.AFTER,
+                    )
+            else:
+                claimed = await phase5_jobs_col.find_one_and_update(
+                    {"status": "queued"},
+                    {
+                        "$set": {
+                            "status": "running",
+                            "worker_id": PHASE5_WORKER_ID,
+                            "updated_at": datetime.utcnow().isoformat(),
+                        }
+                    },
+                    sort=[("created_at", 1)],
+                    return_document=ReturnDocument.AFTER,
+                )
+
+            if not claimed:
+                await asyncio.sleep(PHASE5_WORKER_POLL_INTERVAL)
+                continue
+
+            await _process_phase5_job(claimed)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            traceback.print_exc()
+            await asyncio.sleep(PHASE5_WORKER_POLL_INTERVAL)
+
+
+@app.on_event("startup")
+async def _phase5_worker_startup():
+    if phase5_jobs_col is None:
+        app.state.phase5_worker_tasks = []
+        app.state.phase5_redis = None
+        return
+
+    app.state.phase5_redis = None
+    if PHASE5_REDIS_URL:
+        try:
+            redis_client = aioredis.from_url(PHASE5_REDIS_URL, decode_responses=False)
+            await redis_client.ping()
+            app.state.phase5_redis = redis_client
+            print(f"[Phase5] Redis queue enabled at {PHASE5_REDIS_URL}")
+        except Exception:
+            print(f"[Phase5] Redis unavailable ({PHASE5_REDIS_URL}). Falling back to Mongo polling workers.")
+            app.state.phase5_redis = None
+
+    await phase5_jobs_col.create_index("job_id", unique=True)
+    await phase5_jobs_col.create_index("status")
+    app.state.phase5_worker_tasks = [
+        asyncio.create_task(_phase5_worker_loop())
+        for _ in range(max(1, PHASE5_WORKER_CONCURRENCY))
+    ]
+
+
+@app.on_event("shutdown")
+async def _phase5_worker_shutdown():
+    tasks = getattr(app.state, "phase5_worker_tasks", [])
+    for t in tasks:
+        t.cancel()
+    for t in tasks:
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    redis_client = getattr(app.state, "phase5_redis", None)
+    if redis_client is not None:
+        try:
+            await redis_client.close()
+        except Exception:
+            pass
+
+
+@app.post("/api/phase5/start-job", response_model=Phase5StartJobResponse)
+async def api_phase5_start_job(req: Phase5StartJobRequest):
+    try:
+        if phase5_jobs_col is None:
+            raise HTTPException(status_code=503, detail="phase5 job storage unavailable")
+        questions_dicts = [q.model_dump() for q in req.questions]
+        if not questions_dicts:
+            raise HTTPException(status_code=400, detail="questions cannot be empty")
+
+        job_id = uuid.uuid4().hex
+        await phase5_jobs_col.insert_one({
+            "job_id": job_id,
+            "url": req.url,
+            "questions": questions_dicts,
+            "status": "queued",
+            "total": len(questions_dicts),
+            "processed": 0,
+            "current_question_id": None,
+            "results": {},
+            "error": None,
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+
+        redis_client = getattr(app.state, "phase5_redis", None)
+        if redis_client is not None:
+            try:
+                await redis_client.rpush(PHASE5_REDIS_QUEUE_KEY, job_id.encode("utf-8"))
+            except Exception:
+                print("[Phase5] Redis enqueue failed. Job remains queued in Mongo and will be picked by polling worker.")
+
+        return {
+            "job_id": job_id,
+            "status": "queued",
+            "total": len(questions_dicts),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/phase5/job-status/{job_id}", response_model=Phase5JobStatusResponse)
+async def api_phase5_job_status(job_id: str):
+    if phase5_jobs_col is None:
+        raise HTTPException(status_code=503, detail="phase5 job storage unavailable")
+    job = await phase5_jobs_col.find_one({"job_id": job_id}, {"_id": 0})
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "total": job["total"],
+        "processed": job["processed"],
+        "current_question_id": job.get("current_question_id"),
+        "results": job["results"],
+        "error": job.get("error"),
+    }
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
