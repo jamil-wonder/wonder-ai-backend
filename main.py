@@ -46,6 +46,7 @@ import traceback
 import uvicorn
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from redis import asyncio as aioredis
@@ -59,6 +60,7 @@ app = FastAPI(title="Wonder AI Backend")
 PHASE5_WORKER_CONCURRENCY = int(os.getenv("PHASE5_WORKER_CONCURRENCY", "2"))
 PHASE5_WORKER_POLL_INTERVAL = float(os.getenv("PHASE5_WORKER_POLL_INTERVAL", "0.5"))
 PHASE5_JOB_PARALLELISM = int(os.getenv("PHASE5_JOB_PARALLELISM", "5"))
+PHASE5_MODEL_MAX_THREADS = int(os.getenv("PHASE5_MODEL_MAX_THREADS", "24"))
 PHASE5_WORKER_ID = f"{os.getenv('HOSTNAME', 'local')}-{uuid.uuid4().hex[:8]}"
 PHASE5_REDIS_URL = os.getenv("REDIS_URL", "").strip()
 PHASE5_REDIS_QUEUE_KEY = os.getenv("PHASE5_REDIS_QUEUE_KEY", "phase5:jobs:queue")
@@ -654,23 +656,37 @@ async def _process_phase5_job(job_doc: dict):
             )
             return
 
-        brand_summary = await generate_brand_perception_summary(
-            url=job_doc["url"],
-            questions=questions,
-            results=accumulated_results,
-        )
-
         await phase5_jobs_col.update_one(
             {"job_id": job_id},
             {
                 "$set": {
                     "status": "completed",
                     "current_question_id": None,
-                    "brand_summary": brand_summary,
                     "updated_at": datetime.utcnow().isoformat(),
                 }
             },
         )
+
+        async def _finalize_brand_summary_async():
+            try:
+                brand_summary = await generate_brand_perception_summary(
+                    url=job_doc["url"],
+                    questions=questions,
+                    results=accumulated_results,
+                )
+                await phase5_jobs_col.update_one(
+                    {"job_id": job_id, "status": "completed"},
+                    {
+                        "$set": {
+                            "brand_summary": brand_summary,
+                            "updated_at": datetime.utcnow().isoformat(),
+                        }
+                    },
+                )
+            except Exception:
+                traceback.print_exc()
+
+        asyncio.create_task(_finalize_brand_summary_async())
     except Exception as e:
         traceback.print_exc()
         await phase5_jobs_col.update_one(
@@ -742,6 +758,10 @@ async def _phase5_worker_startup():
         return
 
     app.state.phase5_redis = None
+    loop = asyncio.get_running_loop()
+    app.state.phase5_executor = ThreadPoolExecutor(max_workers=max(4, PHASE5_MODEL_MAX_THREADS))
+    loop.set_default_executor(app.state.phase5_executor)
+
     if PHASE5_REDIS_URL:
         try:
             redis_client = aioredis.from_url(PHASE5_REDIS_URL, decode_responses=False)
@@ -777,6 +797,13 @@ async def _phase5_worker_shutdown():
     if redis_client is not None:
         try:
             await redis_client.close()
+        except Exception:
+            pass
+
+    executor = getattr(app.state, "phase5_executor", None)
+    if executor is not None:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
 

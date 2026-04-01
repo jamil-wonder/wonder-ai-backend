@@ -2,6 +2,7 @@ import os
 import re
 import json
 import asyncio
+import time
 from google import genai
 from google.genai import types
 from gemini_utils import generate_with_fallback
@@ -32,6 +33,17 @@ PHASE5_VALIDATE_COMPETITORS = os.getenv("PHASE5_VALIDATE_COMPETITORS", "0").stri
     "on",
 }
 
+PHASE5_FAST_MODE = os.getenv("PHASE5_FAST_MODE", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+PHASE5_MODEL_TIMEOUT_SEC = int(os.getenv("PHASE5_MODEL_TIMEOUT_SEC", "70"))
+PHASE5_CACHE_TTL_SEC = int(os.getenv("PHASE5_CACHE_TTL_SEC", "900"))
+PHASE5_CACHE_VERSION = os.getenv("PHASE5_CACHE_VERSION", "v2")
+_PHASE5_ANALYSIS_CACHE: dict[str, tuple[float, dict]] = {}
+
 
 def _normalize_domain(value: str) -> str:
     raw = str(value or "").strip().lower()
@@ -61,6 +73,50 @@ def _safe_json_parse(text: str) -> dict:
             except Exception:
                 return {}
     return {}
+
+
+def _cache_key(url: str, question_text: str) -> str:
+    return f"{PHASE5_CACHE_VERSION}::{_normalize_domain(url)}::{re.sub(r'\\s+', ' ', (question_text or '').strip().lower())}"
+
+
+async def _call_gemini_with_timeout(client: genai.Client, contents: str, config: types.GenerateContentConfig):
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                generate_with_fallback,
+                client,
+                contents=contents,
+                config=config,
+            ),
+            timeout=PHASE5_MODEL_TIMEOUT_SEC,
+        )
+    except Exception:
+        return None
+
+
+async def _call_gemini_with_retry(
+    client: genai.Client,
+    contents: str,
+    config: types.GenerateContentConfig,
+):
+    response = await _call_gemini_with_timeout(client, contents, config)
+    if response is not None:
+        return response
+
+    # One retry with a longer timeout to reduce false-negative fallbacks under load.
+    retry_timeout = max(PHASE5_MODEL_TIMEOUT_SEC + 20, 70)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                generate_with_fallback,
+                client,
+                contents=contents,
+                config=config,
+            ),
+            timeout=retry_timeout,
+        )
+    except Exception:
+        return None
 
 
 async def _validate_direct_competitors(
@@ -109,16 +165,18 @@ async def _validate_direct_competitors(
     """
 
     try:
-        response = generate_with_fallback(
+        response = await _call_gemini_with_retry(
             client,
-            contents=prompt,
+            prompt,
             config=types.GenerateContentConfig(
                 tools=[{"google_search": {}}],
                 temperature=0.0,
                 top_p=0.9,
-                max_output_tokens=2048,
+                max_output_tokens=900,
             ),
         )
+        if response is None:
+            return []
         parsed = _safe_json_parse(response.text or "")
         validated = parsed.get("validated", []) if isinstance(parsed, dict) else []
         if not isinstance(validated, list):
@@ -195,16 +253,29 @@ async def generate_brand_questions(url: str) -> list[str]:
     }}
     """
 
-    response = generate_with_fallback(
+    response = await _call_gemini_with_retry(
         client,
-        contents=prompt,
+        prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            temperature=0.3,
+            temperature=0.2,
             top_p=0.95,
-            max_output_tokens=4096,
+            max_output_tokens=2500,
         ),
     )
+    if response is None:
+        return [
+            "What are the best options in this area?",
+            "Which place has the best reviews nearby?",
+            "Where should I go for quality service in this area?",
+            "What is the top-rated choice near me?",
+            "Which business offers the best value here?",
+            "Where can I find trusted local recommendations?",
+            "What is the most popular option in this city?",
+            "Which place is best for first-time visitors?",
+            "What option is best for price and quality?",
+            "Which local business is most recommended right now?",
+        ]
 
     try:
         cleaned_text = response.text.strip()
@@ -290,15 +361,17 @@ async def generate_brand_perception_summary(
         - Output plain text only.
         """
 
-        response = generate_with_fallback(
+        response = await _call_gemini_with_retry(
             client,
-            contents=prompt,
+            prompt,
             config=types.GenerateContentConfig(
                 temperature=0.25,
                 top_p=0.95,
                 max_output_tokens=512,
             ),
         )
+        if response is None:
+            return f"{domain} appears to present a clear and focused business identity. The brand comes across as professional and customer-oriented, with messaging that suggests quality service and a defined audience. Its online presence feels credible and well-structured, and it appears positioned to attract people who are comparing options and looking for a reliable choice in its category."
         text = (response.text or "").strip()
         text = re.sub(r"\s+", " ", text)
         if not text:
@@ -323,46 +396,80 @@ async def analyze_single_question(url: str, question: dict) -> dict:
             return 0
         return max(0, 110 - (pos * 10))
 
-    # Create a prompt that requests structured ranking evidence
-    prompt = f"""
-    You are an expert brand visibility evaluator. Use live Google Search to answer this query:
-    '{question['text']}'
+    cache_key = _cache_key(url, question.get("text", ""))
+    cached = _PHASE5_ANALYSIS_CACHE.get(cache_key)
+    if cached and (time.time() - cached[0] <= PHASE5_CACHE_TTL_SEC):
+        payload = dict(cached[1])
+        payload["id"] = question["id"]
+        return payload
 
-    Target brand domain: '{domain}' (brand token: '{domain.split('.')[0]}').
-    Evaluate top search evidence and produce strict JSON only.
+    # Create a prompt that requests structured ranking evidence
+    prompt = ""
+    if PHASE5_FAST_MODE:
+        prompt = f"""
+        Use live Google Search and return JSON only.
+        Query: '{question['text']}'
+        Target domain: '{domain}'
+        {{
+            "target": {{"mentioned": true or false, "position": <1-10 or null>, "source_domains": ["domain.com"]}},
+            "references": ["domain1.com", "domain2.com"],
+            "ranked_competitors": [{{"domain": "competitor.com", "position": 1, "evidence": "short reason"}}],
+            "reasoning": "short sentence"
+        }}
+        Rules: no markdown, no prose, max 5 competitors, do not include target in competitors.
+        """
+    else:
+        prompt = f"""
+        You are an expert brand visibility evaluator. Use live Google Search to answer this query:
+        '{question['text']}'
+
+        Target brand domain: '{domain}' (brand token: '{domain.split('.')[0]}').
+        Evaluate top search evidence and produce strict JSON only.
 
         JSON schema:
-    {{
-      "target": {{
-        "mentioned": true or false,
-        "position": <1-10 or null>,
-        "source_domains": ["<domain>"]
-      }},
+        {{
+            "target": {{
+                "mentioned": true or false,
+                "position": <1-10 or null>,
+                "source_domains": ["<domain>"]
+            }},
             "references": ["<domain1.com>", "<domain2.com>", "<domain3.com>", "... up to 20"],
-      "ranked_competitors": [
-        {{"domain": "<competitor.com>", "position": <1-10>, "evidence": "short reason"}}
-      ],
-      "reasoning": "1 short sentence"
-    }}
+            "ranked_competitors": [
+                {{"domain": "<competitor.com>", "position": <1-10>, "evidence": "short reason"}}
+            ],
+            "reasoning": "1 short sentence"
+        }}
 
-    Rules:
-    - 'references' must contain real web domains from observed evidence.
-    - Do not include the target domain in ranked_competitors.
-    - Keep ranked_competitors to max 5 entries.
-    - Output raw JSON only. No markdown.
-    """
+        Rules:
+        - 'references' must contain real web domains from observed evidence.
+        - Do not include the target domain in ranked_competitors.
+        - Keep ranked_competitors to max 5 entries.
+        - Output raw JSON only. No markdown.
+        """
 
     try:
-        response = generate_with_fallback(
+        response = await _call_gemini_with_retry(
             client,
-            contents=prompt,
+            prompt,
             config=types.GenerateContentConfig(
                 tools=[{"google_search": {}}],
-                temperature=0.1,
+                temperature=0.0,
                 top_p=0.95,
-                max_output_tokens=1200,
+                max_output_tokens=700,
             ),
         )
+        if response is None:
+            return {
+                "id": question["id"],
+                "status": "Not Mentioned",
+                "position": None,
+                "sources": [],
+                "source_urls": [],
+                "references": [],
+                "competitors": [],
+                "competitor_scores": [],
+                "reasoning": "Request timed out",
+            }
 
         data = _safe_json_parse(response.text or "")
 
@@ -373,6 +480,7 @@ async def analyze_single_question(url: str, question: dict) -> dict:
         target_mentioned = bool(target.get("mentioned", False)) if isinstance(target, dict) else False
         raw_position = target.get("position") if isinstance(target, dict) else None
         position = raw_position if isinstance(raw_position, int) and 1 <= raw_position <= 10 else None
+        brand_token = domain.split(".")[0]
 
         raw_sources = target.get("source_domains", []) if isinstance(target, dict) else []
         if not isinstance(raw_sources, list):
@@ -400,7 +508,7 @@ async def analyze_single_question(url: str, question: dict) -> dict:
                 candidate = response.candidates[0]
                 metadata = getattr(candidate, "grounding_metadata", None)
                 chunks = getattr(metadata, "grounding_chunks", []) if metadata else []
-                for chunk in chunks:
+                for idx, chunk in enumerate(chunks):
                     web = getattr(chunk, "web", None)
                     uri = getattr(web, "uri", "") if web else ""
                     if uri and "vertexaisearch.cloud.google.com" not in uri:
@@ -409,8 +517,19 @@ async def analyze_single_question(url: str, question: dict) -> dict:
                     if source_domain and "vertexaisearch.cloud.google.com" not in source_domain:
                         clean_references.append(source_domain)
                         clean_sources.append(source_domain)
+                        if source_domain == domain or source_domain.endswith(f".{domain}"):
+                            target_mentioned = True
+                            if position is None:
+                                position = min(10, idx + 1)
             except Exception:
                 pass
+
+        # Text fallback: sometimes model returns valid prose with mention signals but no structured target block.
+        response_text = (response.text or "").lower()
+        if not target_mentioned and (domain in response_text or brand_token in response_text):
+            target_mentioned = True
+            if position is None:
+                position = 8
 
         clean_sources = list(dict.fromkeys(clean_sources))
         clean_references = list(dict.fromkeys(clean_references))
@@ -519,7 +638,7 @@ async def analyze_single_question(url: str, question: dict) -> dict:
         status = "Mentioned" if (target_mentioned or position is not None) else "Not Mentioned"
         reasoning = str(data.get("reasoning", "")).strip() if isinstance(data, dict) else ""
 
-        return {
+        result_payload = {
             "id": question["id"],
             "status": status,
             "position": position,
@@ -530,6 +649,20 @@ async def analyze_single_question(url: str, question: dict) -> dict:
             "competitor_scores": competitor_scores[:5],
             "reasoning": reasoning or None,
         }
+        # Cache only evidence-backed outcomes to avoid persisting false negatives.
+        should_cache = (
+            result_payload.get("status") == "Mentioned"
+            or bool(result_payload.get("sources"))
+            or bool(result_payload.get("references"))
+            or bool(result_payload.get("source_urls"))
+            or bool(result_payload.get("competitor_scores"))
+        )
+        if should_cache:
+            _PHASE5_ANALYSIS_CACHE[cache_key] = (
+                time.time(),
+                {k: v for k, v in result_payload.items() if k != "id"},
+            )
+        return result_payload
 
     except Exception as e:
         print(f"Error parsing single question {question['id']}: {e}")

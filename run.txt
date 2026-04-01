@@ -1,0 +1,5 @@
+git pull 
+source venv/bin/activate 
+sudo systemctl restart wonderai
+
+sudo journalctl -u wonderai -f
