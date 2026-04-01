@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 from google import genai
 from google.genai import types
 from phase3_models import ContentAnalysisResponse
+from gemini_utils import generate_with_fallback
 import scraper  # Reuse the fetch tools here
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -75,9 +76,15 @@ async def analyze_url_content(url: str) -> ContentAnalysisResponse:
 
         # Using asyncio for sync method using to_thread since `generate_content` is sync in standard usage
         response = await asyncio.to_thread(
-            client.models.generate_content,
-            model='gemini-2.5-flash',
+            generate_with_fallback,
+            client,
             contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.2,
+                top_p=0.95,
+                max_output_tokens=4096,
+            ),
         )
         
         result_text = response.text

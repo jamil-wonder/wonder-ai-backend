@@ -32,7 +32,11 @@ class Phase5AnalyzeSingleResponse(BaseModel):
     status: str
     position: Optional[int] = None
     sources: List[str]
-    competitors: List[str]
+    source_urls: List[str] = []
+    references: List[str] = []
+    competitors: List[str] = []
+    competitor_scores: List[dict] = []
+    reasoning: Optional[str] = None
 
 
 class Phase5StartJobRequest(BaseModel):
@@ -53,4 +57,5 @@ class Phase5JobStatusResponse(BaseModel):
     processed: int
     current_question_id: Optional[str] = None
     results: dict[str, Phase5AnalyzeSingleResponse]
+    brand_summary: Optional[str] = None
     error: Optional[str] = None

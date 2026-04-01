@@ -3,6 +3,7 @@ import json
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
+from gemini_utils import generate_with_fallback
 
 load_dotenv()
 
@@ -32,12 +33,16 @@ async def get_ai_insights(business_name: str, url: str) -> dict:
     """
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
+        response = generate_with_fallback(
+            client,
             contents=prompt,
             config=types.GenerateContentConfig(
+                tools=[{"google_search": {}}],
                 response_mime_type="application/json",
-            )
+                temperature=0.2,
+                top_p=0.95,
+                max_output_tokens=2048,
+            ),
         )
         if response and response.text:
             return json.loads(response.text)
@@ -77,8 +82,8 @@ async def get_vision_extraction(screenshot_bytes: bytes) -> dict:
     """
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
+        response = generate_with_fallback(
+            client,
             contents=[
                 prompt,
                 types.Part.from_bytes(
@@ -88,8 +93,10 @@ async def get_vision_extraction(screenshot_bytes: bytes) -> dict:
             ],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.1
-            )
+                temperature=0.1,
+                top_p=0.95,
+                max_output_tokens=2048,
+            ),
         )
         if response and response.text:
             return json.loads(response.text)

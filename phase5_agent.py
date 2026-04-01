@@ -4,6 +4,33 @@ import json
 import asyncio
 from google import genai
 from google.genai import types
+from gemini_utils import generate_with_fallback
+
+
+NON_COMPETITOR_DOMAINS = {
+    "google.com",
+    "bing.com",
+    "youtube.com",
+    "facebook.com",
+    "instagram.com",
+    "reddit.com",
+    "wikipedia.org",
+    "yelp.com",
+    "tripadvisor.com",
+    "opentable.com",
+    "booking.com",
+    "expedia.com",
+    "kayak.com",
+    "airbnb.com",
+    "maps.google.com",
+}
+
+PHASE5_VALIDATE_COMPETITORS = os.getenv("PHASE5_VALIDATE_COMPETITORS", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _normalize_domain(value: str) -> str:
@@ -15,6 +42,127 @@ def _normalize_domain(value: str) -> str:
     raw = raw.split("/")[0]
     return raw
 
+
+def _safe_json_parse(text: str) -> dict:
+    payload = (text or "").strip()
+    if payload.startswith("```json"):
+        payload = payload[7:]
+    if payload.endswith("```"):
+        payload = payload[:-3]
+    payload = payload.strip()
+    try:
+        return json.loads(payload)
+    except Exception:
+        start = payload.find("{")
+        end = payload.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(payload[start:end + 1])
+            except Exception:
+                return {}
+    return {}
+
+
+async def _validate_direct_competitors(
+    client: genai.Client,
+    query_text: str,
+    target_domain: str,
+    candidate_domains: list[str],
+) -> list[dict]:
+    if not candidate_domains:
+        return []
+
+    prompt = f"""
+    You are a market intelligence analyst.
+    Determine which candidate domains are DIRECT competitors to the target business for this exact search intent.
+
+    Query: '{query_text}'
+    Target domain: '{target_domain}'
+    Candidate domains: {json.dumps(candidate_domains)}
+
+    Direct competitor rules:
+    - Same primary business category/service as the target.
+    - Similar customer intent fit for this query.
+    - If query is local intent (near me/nearby/city/area), competitor should be in relevant nearby geography.
+    - Reject marketplaces/OTAs/directories/review or media platforms, unless they are the same primary business type as target.
+    - Never include the target domain.
+
+    Return JSON only:
+    {{
+      "validated": [
+        {{
+          "domain": "example.com",
+          "position": 1,
+          "category_overlap": 0,
+          "geo_overlap": 0,
+          "confidence": 0,
+          "reason": "short reason"
+        }}
+      ]
+    }}
+
+    Constraints:
+    - Max 5 items.
+    - position must be 1..10 or null.
+    - overlap/confidence must be integers 0..100.
+    - JSON only, no markdown.
+    """
+
+    try:
+        response = generate_with_fallback(
+            client,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=[{"google_search": {}}],
+                temperature=0.0,
+                top_p=0.9,
+                max_output_tokens=2048,
+            ),
+        )
+        parsed = _safe_json_parse(response.text or "")
+        validated = parsed.get("validated", []) if isinstance(parsed, dict) else []
+        if not isinstance(validated, list):
+            return []
+
+        output: list[dict] = []
+        seen = set()
+        for item in validated:
+            if not isinstance(item, dict):
+                continue
+            d = _normalize_domain(item.get("domain", ""))
+            if (
+                not d
+                or d == target_domain
+                or d in NON_COMPETITOR_DOMAINS
+                or d in seen
+            ):
+                continue
+
+            pos = item.get("position")
+            if not isinstance(pos, int) or pos < 1 or pos > 10:
+                pos = None
+
+            def _clamp_int(v):
+                return max(0, min(100, int(v))) if isinstance(v, int) else 0
+
+            output.append(
+                {
+                    "domain": d,
+                    "position": pos,
+                    "category_overlap": _clamp_int(item.get("category_overlap")),
+                    "geo_overlap": _clamp_int(item.get("geo_overlap")),
+                    "confidence": _clamp_int(item.get("confidence")),
+                    "reason": str(item.get("reason", "")).strip()[:180],
+                }
+            )
+            seen.add(d)
+            if len(output) >= 5:
+                break
+
+        return output
+    except Exception:
+        return []
+
 def get_client() -> genai.Client:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -23,47 +171,146 @@ def get_client() -> genai.Client:
 
 async def generate_brand_questions(url: str) -> list[str]:
     """
-    Sends a prompt to gemini-2.5-flash to analyze the domain and generate 20 
-    highly relevant, realistic search-intent questions.
+    Generate 20 realistic user-like search questions for a target domain.
     """
     client = get_client()
     prompt = f"""
-    You are an expert SEO and brand analyst. 
-    Analyze the domain '{url}' (infer their business and industry).
-    Generate exactly 20 highly relevant, realistic search-intent questions that potential 
-    customers might type into a search engine to find businesses like this one. 
-    Make sure they are natural, user-centric questions.
-    Return ONLY a JSON array of strings containing the 20 questions. Do not include markdown formatting or other text.
+    You are a senior search-intent strategist.
+    Target website: '{url}'. Infer business type, customer intent, and local/non-local purchase journeys.
+
+    Generate exactly 20 natural user search queries that real users would type.
+
+    Requirements:
+    - No generic boilerplate prompts.
+    - No internal/technical jargon.
+    - Include intent diversity: discovery, comparison, trust, pricing, service fit, urgency.
+    - Mix short and long-tail phrasing.
+    - Queries must be realistic and conversational.
+    - Do not repeat the same wording pattern.
+    - Avoid questions that directly include the exact domain unless natural.
+
+    Return ONLY valid JSON with this schema:
+    {{
+      "queries": ["query1", "query2", ... exactly 20 items]
+    }}
     """
-    
-    response = client.models.generate_content(
-        model='gemini-2.5-flash',
+
+    response = generate_with_fallback(
+        client,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-        )
+            temperature=0.3,
+            top_p=0.95,
+            max_output_tokens=4096,
+        ),
     )
-    
+
     try:
         cleaned_text = response.text.strip()
         if cleaned_text.startswith("```json"):
             cleaned_text = cleaned_text[7:]
         if cleaned_text.endswith("```"):
             cleaned_text = cleaned_text[:-3]
-        
-        questions = json.loads(cleaned_text.strip())
-        if not isinstance(questions, list):
-            return [str(q) for q in questions][:20]
-        return questions[:20]
+
+        parsed = json.loads(cleaned_text.strip())
+        if isinstance(parsed, dict) and isinstance(parsed.get("queries"), list):
+            questions = parsed.get("queries", [])
+        elif isinstance(parsed, list):
+            questions = parsed
+        else:
+            questions = [str(parsed)]
+
+        cleaned: list[str] = []
+        seen = set()
+        for q in questions:
+            text = re.sub(r"\s+", " ", str(q).strip())
+            if text and text[0].isalpha():
+                text = text[0].upper() + text[1:]
+            key = text.lower().rstrip("?.!")
+            if len(text) < 12 or key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(text if text.endswith("?") else f"{text}?")
+
+        return cleaned[:20]
     except Exception as e:
         print(f"Error parsing Gemini response: {e}, Response: {response.text}")
-        # Fallback to simple regex parsing if JSON fails
-        q_list = [line.strip("- *1234567890. ") for line in response.text.split("\n") if len(line) > 10 and "?" in line]
+        q_list = [
+            line.strip("- *1234567890. ")
+            for line in response.text.split("\n")
+            if len(line) > 10 and "?" in line
+        ]
         return q_list[:20]
+
+
+async def generate_brand_perception_summary(
+    url: str,
+    questions: list[dict],
+    results: dict,
+) -> str:
+    """
+    Generate a detailed business-style brand summary from completed Phase 5 analysis.
+    """
+    try:
+        client = get_client()
+        domain = _normalize_domain(url)
+
+        compact_items = []
+        for q in questions[:30]:
+            qid = q.get("id")
+            r = results.get(qid, {}) if isinstance(results, dict) else {}
+            compact_items.append(
+                {
+                    "question": q.get("text", ""),
+                    "status": r.get("status"),
+                    "position": r.get("position"),
+                    "references": (r.get("references") or [])[:5],
+                    "competitors": (r.get("competitors") or [])[:5],
+                    "reasoning": r.get("reasoning"),
+                }
+            )
+
+        prompt = f"""
+        You are a senior brand copywriter.
+        Write ONE clear, human-friendly paragraph that describes what this business feels like to a normal customer.
+
+        Target domain: {domain}
+        Analysis data: {json.dumps(compact_items)}
+
+        Requirements:
+        - 95 to 140 words.
+        - Plain English. Easy to understand. No technical language.
+        - Natural narrative paragraph (not bullets).
+        - Explain: what kind of business it appears to be, where it seems to operate, what style/tone it presents, and who it is likely for.
+        - Mention trust/value signals in simple words (for example: clear menu, modern feel, professional tone, local relevance).
+        - Make it sound like a concise profile someone can read in 10 seconds.
+        - Do not fabricate exact facts not implied by data; if uncertain, use cautious wording like "appears to".
+        - Do not mention internal fields, rankings, percentages, or prompt metrics.
+        - Output plain text only.
+        """
+
+        response = generate_with_fallback(
+            client,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.25,
+                top_p=0.95,
+                max_output_tokens=512,
+            ),
+        )
+        text = (response.text or "").strip()
+        text = re.sub(r"\s+", " ", text)
+        if not text:
+            return f"{domain} appears to present a clear and focused business identity. The brand comes across as professional and customer-oriented, with messaging that suggests quality service and a defined audience. Its online presence feels credible and well-structured, and it appears positioned to attract people who are comparing options and looking for a reliable choice in its category."
+        return text
+    except Exception:
+        domain = _normalize_domain(url)
+        return f"{domain} appears to present a clear and focused business identity. The brand comes across as professional and customer-oriented, with messaging that suggests quality service and a defined audience. Its online presence feels credible and well-structured, and it appears positioned to attract people who are comparing options and looking for a reliable choice in its category."
 
 async def analyze_single_question(url: str, question: dict) -> dict:
     """
-    Analyzes a single question using Gemini 2.5 Flash Google Search Grounding.
+    Analyzes a single question using Gemini with Google Search Grounding.
     Returns status, position, sources, and competitors dynamically.
     """
     client = get_client()
@@ -71,75 +318,84 @@ async def analyze_single_question(url: str, question: dict) -> dict:
     domain_match = re.search(r'(?:https?://)?(?:www\.)?([^/]+)', url)
     domain = domain_match.group(1).lower() if domain_match else url.lower()
 
-    # Create a prompt that requests a JSON output to cleanly extract real competitor/source data
+    def score_from_position(pos: int | None) -> int:
+        if not pos or pos < 1:
+            return 0
+        return max(0, 110 - (pos * 10))
+
+    # Create a prompt that requests structured ranking evidence
     prompt = f"""
-    You are an expert brand analyst. Use Google Search to answer this user question: '{question['text']}'.
-    Look at the top search results carefully.
-    
-    Then, provide ONLY a JSON object evaluating if the brand '{domain}' (or '{domain.split('.')[0]}') appears in the answers, and what domains are present.
-    
-    Strictly follow this JSON schematic:
+    You are an expert brand visibility evaluator. Use live Google Search to answer this query:
+    '{question['text']}'
+
+    Target brand domain: '{domain}' (brand token: '{domain.split('.')[0]}').
+    Evaluate top search evidence and produce strict JSON only.
+
+        JSON schema:
     {{
-      "was_mentioned": true or false,
-      "position": <integer between 1 and 10 of where it roughly ranks, or null if not mentioned>,
-      "sources": ["<domain1.com>", "<domain2.com>"],
-      "competitors": ["<comp1.com>", "<comp2.com>"]
+      "target": {{
+        "mentioned": true or false,
+        "position": <1-10 or null>,
+        "source_domains": ["<domain>"]
+      }},
+            "references": ["<domain1.com>", "<domain2.com>", "<domain3.com>", "... up to 20"],
+      "ranked_competitors": [
+        {{"domain": "<competitor.com>", "position": <1-10>, "evidence": "short reason"}}
+      ],
+      "reasoning": "1 short sentence"
     }}
-    
-    Guidelines:
-    - 'sources': List up to 3 domain names of the best actual sources/websites that answer this question (e.g., yelp.com, tripadvisor.com, business.com). DO NOT include "vertexaisearch.cloud.google.com". If it's the brand itself, include the brand's domain.
-    - 'competitors': List up to 2 domain names of competing businesses you found in the search results that are NOT '{domain}'. Do not use placeholder names, use the actual domain names you see, like 'hilton.com' or 'local-rival.net'.
-    - Do not output any markdown code blocks, just raw JSON.
+
+    Rules:
+    - 'references' must contain real web domains from observed evidence.
+    - Do not include the target domain in ranked_competitors.
+    - Keep ranked_competitors to max 5 entries.
+    - Output raw JSON only. No markdown.
     """
 
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
+        response = generate_with_fallback(
+            client,
             contents=prompt,
             config=types.GenerateContentConfig(
                 tools=[{"google_search": {}}],
-                temperature=0.1
-            )
+                temperature=0.1,
+                top_p=0.95,
+                max_output_tokens=1200,
+            ),
         )
 
-        text = (response.text or "").strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.endswith("```"):
-            text = text[:-3]
-
-        # Best-effort extraction: model may return prose with an embedded JSON block.
-        data = {}
-        try:
-            data = json.loads(text.strip())
-        except Exception:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                snippet = text[start:end + 1]
-                try:
-                    data = json.loads(snippet)
-                except Exception:
-                    data = {}
+        data = _safe_json_parse(response.text or "")
 
         if not isinstance(data, dict):
             data = {}
         
-        was_mentioned = data.get("was_mentioned", False)
-        status = "Mentioned" if was_mentioned else "Not Mentioned"
-        
-        raw_sources = data.get("sources", [])
+        target = data.get("target", {}) if isinstance(data, dict) else {}
+        target_mentioned = bool(target.get("mentioned", False)) if isinstance(target, dict) else False
+        raw_position = target.get("position") if isinstance(target, dict) else None
+        position = raw_position if isinstance(raw_position, int) and 1 <= raw_position <= 10 else None
+
+        raw_sources = target.get("source_domains", []) if isinstance(target, dict) else []
         if not isinstance(raw_sources, list):
             raw_sources = []
-            
+
         clean_sources = []
+        source_urls = []
         for s in raw_sources:
             s_str = _normalize_domain(s)
             if s_str and "vertexaisearch.cloud.google.com" not in s_str:
                 clean_sources.append(s_str)
 
-        # Grounding fallback: extract web domains from grounding metadata when model JSON is sparse.
-        if (not clean_sources) and response.candidates:
+        raw_references = data.get("references", []) if isinstance(data, dict) else []
+        if not isinstance(raw_references, list):
+            raw_references = []
+        clean_references = []
+        for r in raw_references:
+            r_str = _normalize_domain(r)
+            if r_str and "vertexaisearch.cloud.google.com" not in r_str:
+                clean_references.append(r_str)
+
+        # Grounding fallback: extract reference domains and raw URLs from metadata.
+        if response.candidates:
             try:
                 candidate = response.candidates[0]
                 metadata = getattr(candidate, "grounding_metadata", None)
@@ -147,61 +403,132 @@ async def analyze_single_question(url: str, question: dict) -> dict:
                 for chunk in chunks:
                     web = getattr(chunk, "web", None)
                     uri = getattr(web, "uri", "") if web else ""
+                    if uri and "vertexaisearch.cloud.google.com" not in uri:
+                        source_urls.append(uri)
                     source_domain = _normalize_domain(uri)
                     if source_domain and "vertexaisearch.cloud.google.com" not in source_domain:
+                        clean_references.append(source_domain)
                         clean_sources.append(source_domain)
             except Exception:
                 pass
 
         clean_sources = list(dict.fromkeys(clean_sources))
-                
-        if not clean_sources and was_mentioned:
+        clean_references = list(dict.fromkeys(clean_references))
+        source_urls = list(dict.fromkeys(source_urls))
+
+        if not clean_sources and position is not None:
             clean_sources = [domain]
 
-        raw_competitors = data.get("competitors", [])
-        if not isinstance(raw_competitors, list):
-            raw_competitors = []
-            
-        clean_competitors = []
-        for c in raw_competitors:
-            c_str = _normalize_domain(c)
-            if c_str and "vertex" not in c_str and c_str != domain:
-                clean_competitors.append(c_str)
+        raw_ranked = data.get("ranked_competitors", []) if isinstance(data, dict) else []
+        if not isinstance(raw_ranked, list):
+            raw_ranked = []
 
-        clean_competitors = list(dict.fromkeys(clean_competitors))
+        ranked_candidates = []
+        for item in raw_ranked[:10]:
+            if not isinstance(item, dict):
+                continue
+            c_domain = _normalize_domain(item.get("domain", ""))
+            c_pos = item.get("position")
+            if (
+                not c_domain
+                or c_domain == domain
+                or c_domain in NON_COMPETITOR_DOMAINS
+                or not isinstance(c_pos, int)
+                or c_pos < 1
+                or c_pos > 10
+            ):
+                continue
+            ranked_candidates.append(
+                {
+                    "domain": c_domain,
+                    "position": c_pos,
+                    "evidence": str(item.get("evidence", "")).strip()[:180],
+                }
+            )
 
-        # Fallback: infer likely competitors from sources if explicit competitors are missing.
-        if not clean_competitors:
-            generic_domains = {
-                "google.com",
-                "bing.com",
-                "youtube.com",
-                "facebook.com",
-                "instagram.com",
-                "reddit.com",
-                "wikipedia.org",
-            }
-            for src_domain in clean_sources:
-                if src_domain == domain or src_domain in generic_domains:
-                    continue
-                clean_competitors.append(src_domain)
+        candidate_domains = [c["domain"] for c in ranked_candidates]
+        for ref in clean_references:
+            if ref and ref != domain and ref not in NON_COMPETITOR_DOMAINS:
+                candidate_domains.append(ref)
+        for src in clean_sources:
+            if src and src != domain and src not in NON_COMPETITOR_DOMAINS:
+                candidate_domains.append(src)
 
-        clean_competitors = list(dict.fromkeys(clean_competitors))
+        dedup_candidates = []
+        seen_candidates = set()
+        for cd in candidate_domains:
+            if cd in seen_candidates:
+                continue
+            seen_candidates.add(cd)
+            dedup_candidates.append(cd)
 
-        raw_position = data.get("position")
-        position = raw_position if isinstance(raw_position, int) and 1 <= raw_position <= 10 else None
+        validated = []
+        if PHASE5_VALIDATE_COMPETITORS:
+            validated = await _validate_direct_competitors(
+                client=client,
+                query_text=question["text"],
+                target_domain=domain,
+                candidate_domains=dedup_candidates[:12],
+            )
 
-        if not was_mentioned and any(domain == src or domain in src for src in clean_sources):
-            was_mentioned = True
+        if not validated:
+            for idx, c in enumerate(ranked_candidates[:5]):
+                validated.append(
+                    {
+                        "domain": c["domain"],
+                        "position": c["position"],
+                        "category_overlap": 75,
+                        "geo_overlap": 70,
+                        "confidence": 75,
+                        "reason": c.get("evidence") or "Detected in grounded ranked competitor results.",
+                    }
+                )
 
-        status = "Mentioned" if was_mentioned else "Not Mentioned"
+        ranked_lookup = {c["domain"]: c for c in ranked_candidates}
+        competitor_scores = []
+        for idx, item in enumerate(validated[:5]):
+            c_domain = item["domain"]
+            c_position = item.get("position")
+            raw_pos = ranked_lookup.get(c_domain, {}).get("position")
+            position_value = c_position if isinstance(c_position, int) else raw_pos
+            if not isinstance(position_value, int):
+                position_value = min(10, idx + 3)
+
+            base_score = score_from_position(position_value)
+            quality = round(
+                (
+                    item.get("category_overlap", 0)
+                    + item.get("geo_overlap", 0)
+                    + item.get("confidence", 0)
+                ) / 3
+            )
+            blended_score = int(round((base_score * 0.7) + (quality * 0.3)))
+
+            evidence = item.get("reason") or ranked_lookup.get(c_domain, {}).get("evidence") or "Validated as direct competitor for this query."
+            competitor_scores.append(
+                {
+                    "domain": c_domain,
+                    "position": position_value,
+                    "score": max(0, min(100, blended_score)),
+                    "evidence": str(evidence)[:180],
+                }
+            )
+
+        competitors = [c["domain"] for c in competitor_scores]
+
+        status = "Mentioned" if (target_mentioned or position is not None) else "Not Mentioned"
+        reasoning = str(data.get("reasoning", "")).strip() if isinstance(data, dict) else ""
 
         return {
             "id": question["id"],
             "status": status,
             "position": position,
-            "sources": clean_sources[:3],
-            "competitors": clean_competitors[:2]
+            "sources": clean_sources[:30],
+            "source_urls": source_urls[:200],
+            "references": clean_references[:30],
+            "competitors": competitors[:5],
+            "competitor_scores": competitor_scores[:5],
+            "reasoning": reasoning or None,
         }
 
     except Exception as e:
@@ -211,12 +538,16 @@ async def analyze_single_question(url: str, question: dict) -> dict:
             "status": "Not Mentioned",
             "position": None,
             "sources": [],
-            "competitors": []
+            "source_urls": [],
+            "references": [],
+            "competitors": [],
+            "competitor_scores": [],
+            "reasoning": None,
         }
 
 async def rank_brand_in_ai(url: str, questions: list) -> dict:
     """
-    Uses Gemini 2.5 Flash with Google Search Grounding enabled.
+    Uses Gemini model chain with Google Search Grounding enabled.
     Loops through questions, asks Gemini to answer them using live search data,
     and explicitly grades whether the target url or brand name appeared in the 
     top 10 sources provided in the grounded response.
@@ -235,13 +566,14 @@ async def rank_brand_in_ai(url: str, questions: list) -> dict:
             prompt = f"Using Google Search, answer this question: '{q['text']}'. Provide a comprehensive answer with sources."
             
             # Grounding configuration
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
+            response = generate_with_fallback(
+                client,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     tools=[{"google_search": {}}],
-                    temperature=0.0
-                )
+                    temperature=0.0,
+                    max_output_tokens=2048,
+                ),
             )
             
             # Extract sources if search grounding was used

@@ -27,7 +27,12 @@ from phase5_models import (
     Phase5StartJobResponse,
     Phase5JobStatusResponse,
 )
-from phase5_agent import generate_brand_questions, rank_brand_in_ai, analyze_single_question
+from phase5_agent import (
+    generate_brand_questions,
+    rank_brand_in_ai,
+    analyze_single_question,
+    generate_brand_perception_summary,
+)
 from models import UserCreate, UserResponse, Token, LoginRequest
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
@@ -53,6 +58,7 @@ app = FastAPI(title="Wonder AI Backend")
 # Phase 5 persistent worker settings
 PHASE5_WORKER_CONCURRENCY = int(os.getenv("PHASE5_WORKER_CONCURRENCY", "2"))
 PHASE5_WORKER_POLL_INTERVAL = float(os.getenv("PHASE5_WORKER_POLL_INTERVAL", "0.5"))
+PHASE5_JOB_PARALLELISM = int(os.getenv("PHASE5_JOB_PARALLELISM", "5"))
 PHASE5_WORKER_ID = f"{os.getenv('HOSTNAME', 'local')}-{uuid.uuid4().hex[:8]}"
 PHASE5_REDIS_URL = os.getenv("REDIS_URL", "").strip()
 PHASE5_REDIS_QUEUE_KEY = os.getenv("PHASE5_REDIS_QUEUE_KEY", "phase5:jobs:queue")
@@ -578,29 +584,81 @@ async def api_phase5_analyze_single(req: Phase5AnalyzeSingleRequest):
 async def _process_phase5_job(job_doc: dict):
     job_id = job_doc["job_id"]
     try:
-        for q in job_doc.get("questions", []):
-            qid = q["id"]
+        async def _is_cancelled() -> bool:
+            latest = await phase5_jobs_col.find_one(
+                {"job_id": job_id},
+                {"status": 1, "_id": 0},
+            )
+            return not latest or latest.get("status") == "cancelled"
+
+        questions = list(job_doc.get("questions", []))
+        accumulated_results = {}
+        lock = asyncio.Lock()
+        queue: asyncio.Queue[dict] = asyncio.Queue()
+        for q in questions:
+            queue.put_nowait(q)
+
+        async def _worker_run():
+            while True:
+                if await _is_cancelled():
+                    break
+
+                try:
+                    q = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+                qid = q["id"]
+                await phase5_jobs_col.update_one(
+                    {"job_id": job_id, "status": {"$ne": "cancelled"}},
+                    {
+                        "$set": {
+                            "current_question_id": qid,
+                            "updated_at": datetime.utcnow().isoformat(),
+                        }
+                    },
+                )
+
+                result = await analyze_single_question(job_doc["url"], q)
+
+                async with lock:
+                    accumulated_results[qid] = result
+
+                await phase5_jobs_col.update_one(
+                    {"job_id": job_id, "status": {"$ne": "cancelled"}},
+                    {
+                        "$set": {
+                            f"results.{qid}": result,
+                            "updated_at": datetime.utcnow().isoformat(),
+                        },
+                        "$inc": {"processed": 1},
+                    },
+                )
+                queue.task_done()
+
+        workers = [
+            asyncio.create_task(_worker_run())
+            for _ in range(max(1, PHASE5_JOB_PARALLELISM))
+        ]
+        await asyncio.gather(*workers)
+
+        if await _is_cancelled():
             await phase5_jobs_col.update_one(
                 {"job_id": job_id},
                 {
                     "$set": {
-                        "current_question_id": qid,
+                        "current_question_id": None,
                         "updated_at": datetime.utcnow().isoformat(),
                     }
                 },
             )
+            return
 
-            result = await analyze_single_question(job_doc["url"], q)
-            await phase5_jobs_col.update_one(
-                {"job_id": job_id},
-                {
-                    "$set": {
-                        f"results.{qid}": result,
-                        "updated_at": datetime.utcnow().isoformat(),
-                    },
-                    "$inc": {"processed": 1},
-                },
-            )
+        brand_summary = await generate_brand_perception_summary(
+            url=job_doc["url"],
+            questions=questions,
+            results=accumulated_results,
+        )
 
         await phase5_jobs_col.update_one(
             {"job_id": job_id},
@@ -608,6 +666,7 @@ async def _process_phase5_job(job_doc: dict):
                 "$set": {
                     "status": "completed",
                     "current_question_id": None,
+                    "brand_summary": brand_summary,
                     "updated_at": datetime.utcnow().isoformat(),
                 }
             },
@@ -741,6 +800,7 @@ async def api_phase5_start_job(req: Phase5StartJobRequest):
             "processed": 0,
             "current_question_id": None,
             "results": {},
+            "brand_summary": None,
             "error": None,
             "created_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat(),
@@ -780,8 +840,34 @@ async def api_phase5_job_status(job_id: str):
         "processed": job["processed"],
         "current_question_id": job.get("current_question_id"),
         "results": job["results"],
+        "brand_summary": job.get("brand_summary"),
         "error": job.get("error"),
     }
+
+
+@app.post("/api/phase5/stop-job/{job_id}")
+async def api_phase5_stop_job(job_id: str):
+    if phase5_jobs_col is None:
+        raise HTTPException(status_code=503, detail="phase5 job storage unavailable")
+
+    job = await phase5_jobs_col.find_one({"job_id": job_id}, {"_id": 0, "status": 1})
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    if job.get("status") in {"completed", "failed", "cancelled"}:
+        return {"job_id": job_id, "status": job.get("status")}
+
+    await phase5_jobs_col.update_one(
+        {"job_id": job_id},
+        {
+            "$set": {
+                "status": "cancelled",
+                "current_question_id": None,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+        },
+    )
+    return {"job_id": job_id, "status": "cancelled"}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
