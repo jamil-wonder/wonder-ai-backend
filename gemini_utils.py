@@ -2,38 +2,61 @@ import os
 from typing import List
 
 
+def _is_rate_limited_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return (
+        "429" in msg
+        or "resource_exhausted" in msg
+        or "rate limit" in msg
+        or "too many requests" in msg
+        or "quota" in msg
+    )
+
+
 def get_model_chain() -> List[str]:
-    """Return ordered unique Gemini models from env with sane defaults."""
-    primary = (os.getenv("GEMINI_MODEL_PRIMARY") or os.getenv("GEMINI_MODEL") or "gemini-3.1-pro-preview").strip()
-    fallback = (os.getenv("GEMINI_MODEL_FALLBACK") or "gemini-3-flash-preview").strip()
+    """Return ordered paid-model chain used for automatic quota failover."""
+    defaults = [
+        "gemini-3.1-pro-preview",
+        "gemini-2.5-pro",
+        "gemini-3-flash-preview",
+        "gemini-2.5-flash",
+    ]
+
+    configured_pool = (os.getenv("GEMINI_MODEL_POOL") or "").strip()
+    from_pool = [m.strip() for m in configured_pool.split(",") if m.strip()]
+
+    primary = (os.getenv("GEMINI_MODEL_PRIMARY") or os.getenv("GEMINI_MODEL") or "").strip()
+    fallback = (os.getenv("GEMINI_MODEL_FALLBACK") or "").strip()
 
     chain: List[str] = []
-    for model in (primary, fallback):
-      if model and model not in chain:
-          chain.append(model)
-
-    if not chain:
-        chain = ["gemini-3.1-pro-preview", "gemini-3-flash-preview"]
-
+    for model in [primary, *from_pool, fallback, *defaults]:
+        if model and model not in chain:
+            chain.append(model)
     return chain
 
 
 def generate_with_fallback(client, *, contents, config=None):
-    """Try primary Gemini model first, then fallback model on failure."""
+    """Use the paid model chain and switch model when rate limit/quota is reached."""
     models = get_model_chain()
     last_error = None
 
     for idx, model in enumerate(models):
         try:
-            return client.models.generate_content(
+            response = client.models.generate_content(
                 model=model,
                 contents=contents,
                 config=config,
             )
+            setattr(response, "_model_used", model)
+            return response
         except Exception as exc:
             last_error = exc
+            if idx < len(models) - 1 and _is_rate_limited_error(exc):
+                print(f"[Gemini] Rate-limited on {model}. Switching to next paid model.")
+                continue
             if idx < len(models) - 1:
-                print(f"[Gemini] Primary model failed ({model}). Retrying with fallback...")
+                print(f"[Gemini] Model failed ({model}). Stopping failover (not a rate-limit error).")
+            raise
 
     if last_error:
         raise last_error

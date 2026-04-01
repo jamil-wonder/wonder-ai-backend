@@ -32,6 +32,8 @@ from phase5_agent import (
     rank_brand_in_ai,
     analyze_single_question,
     generate_brand_perception_summary,
+    generate_deep_competitor_scores,
+    Phase5RateLimitError,
 )
 from models import UserCreate, UserResponse, Token, LoginRequest
 from google.oauth2 import id_token
@@ -585,6 +587,9 @@ async def api_phase5_analyze_single(req: Phase5AnalyzeSingleRequest):
 
 async def _process_phase5_job(job_doc: dict):
     job_id = job_doc["job_id"]
+    job_type = job_doc.get("job_type", "core")
+    include_competitors = job_type == "deep"
+    print(f"[Phase5] worker start job_id={job_id} type={job_type}")
     try:
         async def _is_cancelled() -> bool:
             latest = await phase5_jobs_col.find_one(
@@ -594,7 +599,52 @@ async def _process_phase5_job(job_doc: dict):
             return not latest or latest.get("status") == "cancelled"
 
         questions = list(job_doc.get("questions", []))
+        seed_results = job_doc.get("seed_results", {}) or {}
         accumulated_results = {}
+
+        if include_competitors:
+            deep_competitors = await generate_deep_competitor_scores(
+                url=job_doc["url"],
+                questions=questions,
+                seed_results=seed_results,
+            )
+
+            await phase5_jobs_col.update_one(
+                {"job_id": job_id, "status": {"$ne": "cancelled"}},
+                {
+                    "$set": {
+                        "results": seed_results if isinstance(seed_results, dict) else {},
+                        "processed": len(questions),
+                        "deep_competitors": deep_competitors,
+                        "status": "completed",
+                        "current_question_id": None,
+                        "updated_at": datetime.utcnow().isoformat(),
+                    }
+                },
+            )
+
+            async def _finalize_brand_summary_async():
+                try:
+                    brand_summary = await generate_brand_perception_summary(
+                        url=job_doc["url"],
+                        questions=questions,
+                        results=seed_results if isinstance(seed_results, dict) else {},
+                    )
+                    await phase5_jobs_col.update_one(
+                        {"job_id": job_id, "status": "completed"},
+                        {
+                            "$set": {
+                                "brand_summary": brand_summary,
+                                "updated_at": datetime.utcnow().isoformat(),
+                            }
+                        },
+                    )
+                except Exception:
+                    traceback.print_exc()
+
+            asyncio.create_task(_finalize_brand_summary_async())
+            return
+
         lock = asyncio.Lock()
         queue: asyncio.Queue[dict] = asyncio.Queue()
         for q in questions:
@@ -621,7 +671,11 @@ async def _process_phase5_job(job_doc: dict):
                     },
                 )
 
-                result = await analyze_single_question(job_doc["url"], q)
+                result = await analyze_single_question(
+                    job_doc["url"],
+                    q,
+                    include_competitors=include_competitors,
+                )
 
                 async with lock:
                     accumulated_results[qid] = result
@@ -656,37 +710,74 @@ async def _process_phase5_job(job_doc: dict):
             )
             return
 
+        # Auto finalization: generate quick competitor score + brand summary
+        # so users do not need a second click/flow.
+        await phase5_jobs_col.update_one(
+            {"job_id": job_id},
+            {
+                "$set": {
+                    "status": "finalizing",
+                    "current_question_id": None,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            },
+        )
+        print(f"[Phase5] job_id={job_id} entering finalizing")
+
+        deep_competitors = []
+        try:
+            deep_competitors = await asyncio.wait_for(
+                generate_deep_competitor_scores(
+                    url=job_doc["url"],
+                    questions=questions,
+                    seed_results=accumulated_results,
+                ),
+                timeout=15,
+            )
+        except Exception as e:
+            print(f"[Phase5] deep competitor finalize fallback: {e}")
+            deep_competitors = []
+
+        brand_summary = None
+        try:
+            brand_summary = await asyncio.wait_for(
+                generate_brand_perception_summary(
+                    url=job_doc["url"],
+                    questions=questions,
+                    results=accumulated_results,
+                ),
+                timeout=10,
+            )
+        except Exception as e:
+            print(f"[Phase5] brand summary finalize fallback: {e}")
+            domain = str(job_doc.get("url", "")).replace("https://", "").replace("http://", "").split("/")[0]
+            brand_summary = f"{domain} appears to have a clear business identity and a visible presence across customer search intent."
+
         await phase5_jobs_col.update_one(
             {"job_id": job_id},
             {
                 "$set": {
                     "status": "completed",
                     "current_question_id": None,
+                    "deep_competitors": deep_competitors,
+                    "brand_summary": brand_summary,
                     "updated_at": datetime.utcnow().isoformat(),
                 }
             },
         )
-
-        async def _finalize_brand_summary_async():
-            try:
-                brand_summary = await generate_brand_perception_summary(
-                    url=job_doc["url"],
-                    questions=questions,
-                    results=accumulated_results,
-                )
-                await phase5_jobs_col.update_one(
-                    {"job_id": job_id, "status": "completed"},
-                    {
-                        "$set": {
-                            "brand_summary": brand_summary,
-                            "updated_at": datetime.utcnow().isoformat(),
-                        }
-                    },
-                )
-            except Exception:
-                traceback.print_exc()
-
-        asyncio.create_task(_finalize_brand_summary_async())
+        print(f"[Phase5] worker completed job_id={job_id} competitors={len(deep_competitors)}")
+    except Phase5RateLimitError as e:
+        await phase5_jobs_col.update_one(
+            {"job_id": job_id},
+            {
+                "$set": {
+                    "status": "failed",
+                    "current_question_id": None,
+                    "error": str(e),
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            },
+        )
     except Exception as e:
         traceback.print_exc()
         await phase5_jobs_col.update_one(
@@ -820,13 +911,63 @@ async def api_phase5_start_job(req: Phase5StartJobRequest):
         job_id = uuid.uuid4().hex
         await phase5_jobs_col.insert_one({
             "job_id": job_id,
+            "job_type": "core",
             "url": req.url,
             "questions": questions_dicts,
+            "seed_results": {},
             "status": "queued",
             "total": len(questions_dicts),
             "processed": 0,
             "current_question_id": None,
             "results": {},
+            "deep_competitors": [],
+            "brand_summary": None,
+            "error": None,
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+
+        redis_client = getattr(app.state, "phase5_redis", None)
+        if redis_client is not None:
+            try:
+                await redis_client.rpush(PHASE5_REDIS_QUEUE_KEY, job_id.encode("utf-8"))
+            except Exception:
+                print("[Phase5] Redis enqueue failed. Job remains queued in Mongo and will be picked by polling worker.")
+
+        return {
+            "job_id": job_id,
+            "status": "queued",
+            "total": len(questions_dicts),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/phase5/start-deep-job", response_model=Phase5StartJobResponse)
+async def api_phase5_start_deep_job(req: Phase5StartJobRequest):
+    try:
+        if phase5_jobs_col is None:
+            raise HTTPException(status_code=503, detail="phase5 job storage unavailable")
+        questions_dicts = [q.model_dump() for q in req.questions]
+        if not questions_dicts:
+            raise HTTPException(status_code=400, detail="questions cannot be empty")
+
+        job_id = uuid.uuid4().hex
+        await phase5_jobs_col.insert_one({
+            "job_id": job_id,
+            "job_type": "deep",
+            "url": req.url,
+            "questions": questions_dicts,
+            "seed_results": req.seed_results or {},
+            "status": "queued",
+            "total": len(questions_dicts),
+            "processed": 0,
+            "current_question_id": None,
+            "results": {},
+            "deep_competitors": [],
             "brand_summary": None,
             "error": None,
             "created_at": datetime.utcnow().isoformat(),
@@ -867,6 +1008,7 @@ async def api_phase5_job_status(job_id: str):
         "processed": job["processed"],
         "current_question_id": job.get("current_question_id"),
         "results": job["results"],
+        "deep_competitors": job.get("deep_competitors", []),
         "brand_summary": job.get("brand_summary"),
         "error": job.get("error"),
     }

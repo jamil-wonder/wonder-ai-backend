@@ -27,6 +27,22 @@ NON_COMPETITOR_DOMAINS = {
 
 PHASE5_VALIDATE_COMPETITORS = False
 PHASE5_FAST_MODE = False
+PHASE5_MODEL_CALL_TIMEOUT_SEC = int(os.getenv("PHASE5_MODEL_CALL_TIMEOUT_SEC", "35"))
+
+
+class Phase5RateLimitError(RuntimeError):
+    pass
+
+
+def _is_rate_limited_error(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return (
+        "429" in message
+        or "resource_exhausted" in message
+        or "rate limit" in message
+        or "too many requests" in message
+        or "quota" in message
+    )
 
 
 def _normalize_domain(value: str) -> str:
@@ -119,15 +135,29 @@ def _extract_grounding_signals(response, target_domain: str) -> tuple[list[str],
     )
 
 
-async def _call_gemini_with_timeout(client: genai.Client, contents: str, config: types.GenerateContentConfig):
+async def _call_gemini_with_timeout(
+    client: genai.Client,
+    contents: str,
+    config: types.GenerateContentConfig,
+    timeout_sec: int | None = None,
+):
+    effective_timeout = max(8, timeout_sec if isinstance(timeout_sec, int) else PHASE5_MODEL_CALL_TIMEOUT_SEC)
     try:
-        return await asyncio.to_thread(
-            generate_with_fallback,
-            client,
-            contents=contents,
-            config=config,
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                generate_with_fallback,
+                client,
+                contents=contents,
+                config=config,
+            ),
+            timeout=effective_timeout,
         )
+    except asyncio.TimeoutError:
+        print(f"[Phase5][Gemini] call timed out after {effective_timeout}s")
+        return None
     except Exception as e:
+        if _is_rate_limited_error(e):
+            raise Phase5RateLimitError("Gemini rate limit reached. Please retry shortly.") from e
         print(f"[Phase5][Gemini] call failed: {type(e).__name__}: {e}")
         return None
 
@@ -136,20 +166,33 @@ async def _call_gemini_with_retry(
     client: genai.Client,
     contents: str,
     config: types.GenerateContentConfig,
+    retry_once: bool = True,
+    timeout_sec: int | None = None,
 ):
-    response = await _call_gemini_with_timeout(client, contents, config)
+    response = await _call_gemini_with_timeout(client, contents, config, timeout_sec=timeout_sec)
     if response is not None:
         return response
 
+    if not retry_once:
+        return None
+
     # One retry to reduce transient provider failures under load.
     try:
-        return await asyncio.to_thread(
-            generate_with_fallback,
-            client,
-            contents=contents,
-            config=config,
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                generate_with_fallback,
+                client,
+                contents=contents,
+                config=config,
+            ),
+            timeout=max(8, timeout_sec if isinstance(timeout_sec, int) else PHASE5_MODEL_CALL_TIMEOUT_SEC),
         )
+    except asyncio.TimeoutError:
+        print(f"[Phase5][Gemini] retry timed out")
+        return None
     except Exception as e:
+        if _is_rate_limited_error(e):
+            raise Phase5RateLimitError("Gemini rate limit reached. Please retry shortly.") from e
         print(f"[Phase5][Gemini] retry failed: {type(e).__name__}: {e}")
         return None
 
@@ -358,6 +401,58 @@ async def generate_brand_perception_summary(
     """
     Generate a detailed business-style brand summary from completed Phase 5 analysis.
     """
+    def _build_quick_summary() -> str:
+        domain = _normalize_domain(url)
+        rows = []
+        for q in questions[:30]:
+            qid = q.get("id")
+            rows.append(results.get(qid, {}) if isinstance(results, dict) else {})
+
+        total = len(rows) if rows else 1
+        mentioned = 0
+        positions: list[int] = []
+        ref_counts: dict[str, int] = {}
+
+        for r in rows:
+            status = str(r.get("status", ""))
+            if status == "Mentioned":
+                mentioned += 1
+            pos = r.get("position")
+            if isinstance(pos, int) and 1 <= pos <= 10:
+                positions.append(pos)
+
+            refs = r.get("references", []) if isinstance(r, dict) else []
+            srcs = r.get("sources", []) if isinstance(r, dict) else []
+            urls = r.get("source_urls", []) if isinstance(r, dict) else []
+            for item in list(refs) + list(srcs) + list(urls):
+                d = _normalize_domain(item)
+                if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+                    ref_counts[d] = ref_counts.get(d, 0) + 1
+
+        mention_rate = int(round((mentioned / max(1, total)) * 100))
+        avg_rank = round(sum(positions) / len(positions), 1) if positions else None
+        top_refs = [d for d, _ in sorted(ref_counts.items(), key=lambda kv: kv[1], reverse=True)[:2]]
+
+        if mention_rate >= 65:
+            visibility_line = f"{domain} shows strong visibility across customer search intent, with mention coverage around {mention_rate}%"
+        elif mention_rate >= 35:
+            visibility_line = f"{domain} shows moderate visibility across customer search intent, with mention coverage around {mention_rate}%"
+        else:
+            visibility_line = f"{domain} currently has limited visibility across customer search intent, with mention coverage around {mention_rate}%"
+
+        rank_line = (
+            f" and an average appearance near rank {avg_rank}."
+            if avg_rank is not None
+            else "."
+        )
+
+        if top_refs:
+            ref_line = f" Frequent reference context came from {', '.join(top_refs)}, which indicates where comparison traffic is happening most."
+        else:
+            ref_line = " Reference spread is still narrow, so content clarity and stronger intent-matching pages should be prioritized."
+
+        return visibility_line + rank_line + ref_line
+
     try:
         client = get_client()
         domain = _normalize_domain(url)
@@ -402,21 +497,206 @@ async def generate_brand_perception_summary(
             config=types.GenerateContentConfig(
                 temperature=0.25,
                 top_p=0.95,
-                max_output_tokens=512,
+                max_output_tokens=320,
             ),
+            retry_once=False,
+            timeout_sec=8,
         )
         if response is None:
-            return f"{domain} appears to present a clear and focused business identity. The brand comes across as professional and customer-oriented, with messaging that suggests quality service and a defined audience. Its online presence feels credible and well-structured, and it appears positioned to attract people who are comparing options and looking for a reliable choice in its category."
+            return _build_quick_summary()
         text = (response.text or "").strip()
         text = re.sub(r"\s+", " ", text)
         if not text:
-            return f"{domain} appears to present a clear and focused business identity. The brand comes across as professional and customer-oriented, with messaging that suggests quality service and a defined audience. Its online presence feels credible and well-structured, and it appears positioned to attract people who are comparing options and looking for a reliable choice in its category."
+            return _build_quick_summary()
         return text
     except Exception:
-        domain = _normalize_domain(url)
-        return f"{domain} appears to present a clear and focused business identity. The brand comes across as professional and customer-oriented, with messaging that suggests quality service and a defined audience. Its online presence feels credible and well-structured, and it appears positioned to attract people who are comparing options and looking for a reliable choice in its category."
+        return _build_quick_summary()
 
-async def analyze_single_question(url: str, question: dict) -> dict:
+
+async def generate_deep_competitor_scores(
+    url: str,
+    questions: list[dict],
+    seed_results: dict,
+) -> list[dict]:
+    """Generate competitor scores in one aggregate pass using ideas collected during core analysis."""
+    client = get_client()
+    domain = _normalize_domain(url)
+
+    candidate_counts: dict[str, int] = {}
+    for q in questions:
+        qid = q.get("id")
+        r = seed_results.get(qid, {}) if isinstance(seed_results, dict) else {}
+
+        idea_candidates = r.get("idea_candidates", []) if isinstance(r, dict) else []
+        if isinstance(idea_candidates, list):
+            for item in idea_candidates:
+                if isinstance(item, dict):
+                    d = _normalize_domain(item.get("domain", ""))
+                else:
+                    d = _normalize_domain(str(item))
+                if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+                    candidate_counts[d] = candidate_counts.get(d, 0) + 2
+
+        refs = r.get("references", []) if isinstance(r, dict) else []
+        if isinstance(refs, list):
+            for ref in refs:
+                d = _normalize_domain(ref)
+                if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+                    candidate_counts[d] = candidate_counts.get(d, 0) + 1
+
+        srcs = r.get("sources", []) if isinstance(r, dict) else []
+        if isinstance(srcs, list):
+            for src in srcs:
+                d = _normalize_domain(src)
+                if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+                    candidate_counts[d] = candidate_counts.get(d, 0) + 1
+
+        source_urls = r.get("source_urls", []) if isinstance(r, dict) else []
+        if isinstance(source_urls, list):
+            for u in source_urls:
+                d = _normalize_domain(u)
+                if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+                    candidate_counts[d] = candidate_counts.get(d, 0) + 1
+
+    top_candidates = [d for d, _ in sorted(candidate_counts.items(), key=lambda kv: kv[1], reverse=True)[:12]]
+    if not top_candidates:
+        # Quick grounded probe fallback to avoid empty competitor lists.
+        probe_text = " ; ".join([q.get("text", "") for q in questions[:5]])
+        probe_prompt = (
+            f"Use Google Search and list domains that appear for these intents: {probe_text}. "
+            f"Target domain is {domain}. Return short text with domains only."
+        )
+        probe_response = await _call_gemini_with_retry(
+            client,
+            probe_prompt,
+            config=types.GenerateContentConfig(
+                tools=[{"google_search": {}}],
+                temperature=0.0,
+                top_p=0.9,
+                max_output_tokens=180,
+            ),
+            retry_once=False,
+            timeout_sec=8,
+        )
+        probe_domains = []
+        if probe_response is not None:
+            probe_domains.extend(_extract_domains_from_text(probe_response.text or ""))
+            refs, _, _, _ = _extract_grounding_signals(probe_response, domain)
+            probe_domains.extend(refs)
+        for d in probe_domains:
+            nd = _normalize_domain(d)
+            if nd and nd != domain and nd not in NON_COMPETITOR_DOMAINS:
+                candidate_counts[nd] = candidate_counts.get(nd, 0) + 1
+
+        top_candidates = [d for d, _ in sorted(candidate_counts.items(), key=lambda kv: kv[1], reverse=True)[:12]]
+        if not top_candidates:
+            return []
+
+    # Fast deterministic fallback from observed first-pass signals.
+    heuristic_scores: list[dict] = []
+    max_hits = max(candidate_counts.values()) if candidate_counts else 1
+    for d, hits in sorted(candidate_counts.items(), key=lambda kv: kv[1], reverse=True):
+        if d in NON_COMPETITOR_DOMAINS or d == domain:
+            continue
+        score = int(round((hits / max_hits) * 100)) if max_hits > 0 else 50
+        heuristic_scores.append(
+            {
+                "domain": d,
+                "position": None,
+                "score": max(35, min(95, score)),
+                "evidence": "Ranked from repeated first-pass competitor context and source overlap.",
+            }
+        )
+        if len(heuristic_scores) >= 5:
+            break
+
+    compact_questions = [q.get("text", "") for q in questions[:20]]
+    prompt = f"""
+    You are a market intelligence analyst.
+    Use live Google Search and these user-intent queries to identify direct competitors for the target.
+
+    Target domain: '{domain}'
+    Queries: {json.dumps(compact_questions)}
+    Candidate domains from first-pass visibility analysis: {json.dumps(top_candidates)}
+
+    Return JSON only:
+    {{
+      "competitors": [
+        {{
+          "domain": "example.com",
+          "position": 1,
+          "score": 0,
+          "evidence": "short reason"
+        }}
+      ]
+    }}
+
+    Rules:
+    - Max 5 competitors.
+    - Direct competitors only (same intent/category overlap).
+    - Exclude aggregator/listing/general platform sites.
+    - Exclude target domain.
+    - score must be integer 0..100.
+    - position must be 1..10 or null.
+    - JSON only.
+    """
+
+    response = await _call_gemini_with_retry(
+        client,
+        prompt,
+        config=types.GenerateContentConfig(
+            tools=[{"google_search": {}}],
+            temperature=0.0,
+            top_p=0.9,
+            max_output_tokens=420,
+        ),
+        retry_once=False,
+        timeout_sec=10,
+    )
+
+    if response is None:
+        return heuristic_scores
+
+    parsed = _safe_json_parse(response.text or "")
+    raw = parsed.get("competitors", []) if isinstance(parsed, dict) else []
+    if not isinstance(raw, list):
+        return heuristic_scores
+
+    out: list[dict] = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        d = _normalize_domain(item.get("domain", ""))
+        if (
+            not d
+            or d == domain
+            or d in NON_COMPETITOR_DOMAINS
+            or d in seen
+        ):
+            continue
+        seen.add(d)
+        pos = item.get("position")
+        if not isinstance(pos, int) or pos < 1 or pos > 10:
+            pos = None
+        score = item.get("score")
+        if not isinstance(score, int):
+            score = 55
+        score = max(0, min(100, score))
+        out.append(
+            {
+                "domain": d,
+                "position": pos,
+                "score": score,
+                "evidence": str(item.get("evidence", "")).strip()[:180],
+            }
+        )
+        if len(out) >= 5:
+            break
+
+    return out if out else heuristic_scores
+
+async def analyze_single_question(url: str, question: dict, include_competitors: bool = False) -> dict:
     """
     Analyzes a single question using Gemini with Google Search Grounding.
     Returns status, position, sources, and competitors dynamically.
@@ -596,7 +876,32 @@ async def analyze_single_question(url: str, question: dict) -> dict:
 
     # Create a prompt that requests structured ranking evidence
     prompt = ""
-    if PHASE5_FAST_MODE:
+    if not include_competitors:
+        prompt = f"""
+        You are an expert brand visibility evaluator. Use live Google Search for this query:
+        '{question['text']}'
+
+        Target brand domain: '{domain}'
+
+        Return strict JSON only:
+        {{
+            "target": {{
+                "mentioned": true or false,
+                "position": <1-10 or null>,
+                "source_domains": ["<domain>"]
+            }},
+            "references": ["<domain1.com>", "<domain2.com>", "... up to 20"],
+            "idea_candidates": ["<potential-competitor-domain.com>", "... up to 8"],
+            "reasoning": "1 short sentence"
+        }}
+
+        Rules:
+        - 'references' must contain real web domains from observed evidence.
+        - 'idea_candidates' should contain possible direct competitor domains inferred from this query context.
+        - Do not include target domain in idea_candidates.
+        - Output raw JSON only. No markdown.
+        """
+    elif PHASE5_FAST_MODE:
         prompt = f"""
         Use live Google Search and return JSON only.
         Query: '{question['text']}'
@@ -604,6 +909,7 @@ async def analyze_single_question(url: str, question: dict) -> dict:
         {{
             "target": {{"mentioned": true or false, "position": <1-10 or null>, "source_domains": ["domain.com"]}},
             "references": ["domain1.com", "domain2.com"],
+            "idea_candidates": ["competitor.com"],
             "ranked_competitors": [{{"domain": "competitor.com", "position": 1, "evidence": "short reason"}}],
             "reasoning": "short sentence"
         }}
@@ -625,6 +931,7 @@ async def analyze_single_question(url: str, question: dict) -> dict:
                 "source_domains": ["<domain>"]
             }},
             "references": ["<domain1.com>", "<domain2.com>", "<domain3.com>", "... up to 20"],
+            "idea_candidates": ["<potential-competitor-domain.com>", "... up to 8"],
             "ranked_competitors": [
                 {{"domain": "<competitor.com>", "position": <1-10>, "evidence": "short reason"}}
             ],
@@ -748,102 +1055,117 @@ async def analyze_single_question(url: str, question: dict) -> dict:
         if not clean_sources and position is not None:
             clean_sources = [domain]
 
-        raw_ranked = data.get("ranked_competitors", []) if isinstance(data, dict) else []
-        if not isinstance(raw_ranked, list):
-            raw_ranked = []
-
-        ranked_candidates = []
-        for item in raw_ranked[:10]:
-            if not isinstance(item, dict):
-                continue
-            c_domain = _normalize_domain(item.get("domain", ""))
-            c_pos = item.get("position")
-            if (
-                not c_domain
-                or c_domain == domain
-                or c_domain in NON_COMPETITOR_DOMAINS
-                or not isinstance(c_pos, int)
-                or c_pos < 1
-                or c_pos > 10
-            ):
-                continue
-            ranked_candidates.append(
-                {
-                    "domain": c_domain,
-                    "position": c_pos,
-                    "evidence": str(item.get("evidence", "")).strip()[:180],
-                }
-            )
-
-        candidate_domains = [c["domain"] for c in ranked_candidates]
+        raw_ideas = data.get("idea_candidates", []) if isinstance(data, dict) else []
+        idea_candidates: list[str] = []
+        if isinstance(raw_ideas, list):
+            for item in raw_ideas:
+                d = _normalize_domain(item)
+                if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+                    idea_candidates.append(d)
         for ref in clean_references:
-            if ref and ref != domain and ref not in NON_COMPETITOR_DOMAINS:
-                candidate_domains.append(ref)
-        for src in clean_sources:
-            if src and src != domain and src not in NON_COMPETITOR_DOMAINS:
-                candidate_domains.append(src)
+            d = _normalize_domain(ref)
+            if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+                idea_candidates.append(d)
+        idea_candidates = list(dict.fromkeys(idea_candidates))[:12]
 
-        dedup_candidates = []
-        seen_candidates = set()
-        for cd in candidate_domains:
-            if cd in seen_candidates:
-                continue
-            seen_candidates.add(cd)
-            dedup_candidates.append(cd)
+        competitor_scores = []
+        competitors = []
+        if include_competitors:
+            raw_ranked = data.get("ranked_competitors", []) if isinstance(data, dict) else []
+            if not isinstance(raw_ranked, list):
+                raw_ranked = []
 
-        validated = []
-        if PHASE5_VALIDATE_COMPETITORS:
-            validated = await _validate_direct_competitors(
-                client=client,
-                query_text=question["text"],
-                target_domain=domain,
-                candidate_domains=dedup_candidates[:12],
-            )
-
-        if not validated:
-            for idx, c in enumerate(ranked_candidates[:5]):
-                validated.append(
+            ranked_candidates = []
+            for item in raw_ranked[:10]:
+                if not isinstance(item, dict):
+                    continue
+                c_domain = _normalize_domain(item.get("domain", ""))
+                c_pos = item.get("position")
+                if (
+                    not c_domain
+                    or c_domain == domain
+                    or c_domain in NON_COMPETITOR_DOMAINS
+                    or not isinstance(c_pos, int)
+                    or c_pos < 1
+                    or c_pos > 10
+                ):
+                    continue
+                ranked_candidates.append(
                     {
-                        "domain": c["domain"],
-                        "position": c["position"],
-                        "category_overlap": 75,
-                        "geo_overlap": 70,
-                        "confidence": 75,
-                        "reason": c.get("evidence") or "Detected in grounded ranked competitor results.",
+                        "domain": c_domain,
+                        "position": c_pos,
+                        "evidence": str(item.get("evidence", "")).strip()[:180],
                     }
                 )
 
-        ranked_lookup = {c["domain"]: c for c in ranked_candidates}
-        competitor_scores = []
-        for idx, item in enumerate(validated[:5]):
-            c_domain = item["domain"]
-            c_position = item.get("position")
-            raw_pos = ranked_lookup.get(c_domain, {}).get("position")
-            position_value = c_position if isinstance(c_position, int) else raw_pos
-            if not isinstance(position_value, int):
-                position_value = min(10, idx + 3)
+            candidate_domains = [c["domain"] for c in ranked_candidates]
+            for ref in clean_references:
+                if ref and ref != domain and ref not in NON_COMPETITOR_DOMAINS:
+                    candidate_domains.append(ref)
+            for src in clean_sources:
+                if src and src != domain and src not in NON_COMPETITOR_DOMAINS:
+                    candidate_domains.append(src)
 
-            base_score = score_from_position(position_value)
-            quality = round(
-                (
-                    item.get("category_overlap", 0)
-                    + item.get("geo_overlap", 0)
-                    + item.get("confidence", 0)
-                ) / 3
-            )
-            blended_score = int(round((base_score * 0.7) + (quality * 0.3)))
+            dedup_candidates = []
+            seen_candidates = set()
+            for cd in candidate_domains:
+                if cd in seen_candidates:
+                    continue
+                seen_candidates.add(cd)
+                dedup_candidates.append(cd)
 
-            evidence = item.get("reason") or ranked_lookup.get(c_domain, {}).get("evidence") or "Validated as direct competitor for this query."
-            competitor_scores.append(
-                {
-                    "domain": c_domain,
-                    "position": position_value,
-                    "score": max(0, min(100, blended_score)),
-                    "evidence": str(evidence)[:180],
-                }
-            )
+            validated = []
+            if PHASE5_VALIDATE_COMPETITORS:
+                validated = await _validate_direct_competitors(
+                    client=client,
+                    query_text=question["text"],
+                    target_domain=domain,
+                    candidate_domains=dedup_candidates[:12],
+                )
 
-        competitors = [c["domain"] for c in competitor_scores]
+            if not validated:
+                for idx, c in enumerate(ranked_candidates[:5]):
+                    validated.append(
+                        {
+                            "domain": c["domain"],
+                            "position": c["position"],
+                            "category_overlap": 75,
+                            "geo_overlap": 70,
+                            "confidence": 75,
+                            "reason": c.get("evidence") or "Detected in grounded ranked competitor results.",
+                        }
+                    )
+
+            ranked_lookup = {c["domain"]: c for c in ranked_candidates}
+            for idx, item in enumerate(validated[:5]):
+                c_domain = item["domain"]
+                c_position = item.get("position")
+                raw_pos = ranked_lookup.get(c_domain, {}).get("position")
+                position_value = c_position if isinstance(c_position, int) else raw_pos
+                if not isinstance(position_value, int):
+                    position_value = min(10, idx + 3)
+
+                base_score = score_from_position(position_value)
+                quality = round(
+                    (
+                        item.get("category_overlap", 0)
+                        + item.get("geo_overlap", 0)
+                        + item.get("confidence", 0)
+                    ) / 3
+                )
+                blended_score = int(round((base_score * 0.7) + (quality * 0.3)))
+
+                evidence = item.get("reason") or ranked_lookup.get(c_domain, {}).get("evidence") or "Validated as direct competitor for this query."
+                competitor_scores.append(
+                    {
+                        "domain": c_domain,
+                        "position": position_value,
+                        "score": max(0, min(100, blended_score)),
+                        "evidence": str(evidence)[:180],
+                    }
+                )
+
+            competitors = [c["domain"] for c in competitor_scores]
 
         status = "Mentioned" if (target_mentioned or position is not None) else "Not Mentioned"
         reasoning = str(data.get("reasoning", "")).strip() if isinstance(data, dict) else ""
@@ -864,12 +1186,15 @@ async def analyze_single_question(url: str, question: dict) -> dict:
             "sources": clean_sources[:30],
             "source_urls": source_urls[:200],
             "references": clean_references[:30],
+            "idea_candidates": idea_candidates,
             "competitors": competitors[:5],
             "competitor_scores": competitor_scores[:5],
             "reasoning": reasoning or None,
         }
         return result_payload
 
+    except Phase5RateLimitError:
+        raise
     except Exception as e:
         print(f"Error parsing single question {question['id']}: {e}")
         return {

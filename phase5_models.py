@@ -42,6 +42,7 @@ class Phase5AnalyzeSingleResponse(BaseModel):
 class Phase5StartJobRequest(BaseModel):
     url: str
     questions: List[QuestionItem]
+    seed_results: Optional[dict] = None
 
 
 class Phase5StartJobResponse(BaseModel):
@@ -57,5 +58,6 @@ class Phase5JobStatusResponse(BaseModel):
     processed: int
     current_question_id: Optional[str] = None
     results: dict[str, Phase5AnalyzeSingleResponse]
+    deep_competitors: List[dict] = []
     brand_summary: Optional[str] = None
     error: Optional[str] = None
