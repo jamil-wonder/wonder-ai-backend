@@ -2,7 +2,6 @@ import os
 import re
 import json
 import asyncio
-import time
 from google import genai
 from google.genai import types
 from gemini_utils import generate_with_fallback
@@ -26,23 +25,8 @@ NON_COMPETITOR_DOMAINS = {
     "maps.google.com",
 }
 
-PHASE5_VALIDATE_COMPETITORS = os.getenv("PHASE5_VALIDATE_COMPETITORS", "0").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-
-PHASE5_FAST_MODE = os.getenv("PHASE5_FAST_MODE", "0").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-PHASE5_MODEL_TIMEOUT_SEC = int(os.getenv("PHASE5_MODEL_TIMEOUT_SEC", "70"))
-PHASE5_CACHE_TTL_SEC = int(os.getenv("PHASE5_CACHE_TTL_SEC", "900"))
-PHASE5_CACHE_VERSION = os.getenv("PHASE5_CACHE_VERSION", "v2")
-_PHASE5_ANALYSIS_CACHE: dict[str, tuple[float, dict]] = {}
+PHASE5_VALIDATE_COMPETITORS = False
+PHASE5_FAST_MODE = False
 
 
 def _normalize_domain(value: str) -> str:
@@ -75,22 +59,76 @@ def _safe_json_parse(text: str) -> dict:
     return {}
 
 
-def _cache_key(url: str, question_text: str) -> str:
-    return f"{PHASE5_CACHE_VERSION}::{_normalize_domain(url)}::{re.sub(r'\\s+', ' ', (question_text or '').strip().lower())}"
+def _is_target_domain_match(candidate: str, target_domain: str) -> bool:
+    c = _normalize_domain(candidate)
+    t = _normalize_domain(target_domain)
+    if not c or not t:
+        return False
+    return c == t or c.endswith(f".{t}")
+
+
+def _extract_domains_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    pattern = r"(?:https?://)?(?:www\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)"
+    found = re.findall(pattern, text.lower())
+    clean = []
+    for item in found:
+        d = _normalize_domain(item)
+        if d and "vertexaisearch.cloud.google.com" not in d:
+            clean.append(d)
+    return list(dict.fromkeys(clean))
+
+
+def _extract_grounding_signals(response, target_domain: str) -> tuple[list[str], list[str], bool, int | None]:
+    references: list[str] = []
+    source_urls: list[str] = []
+    target_mentioned = False
+    position: int | None = None
+
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return references, source_urls, target_mentioned, position
+
+        metadata = getattr(candidates[0], "grounding_metadata", None)
+        chunks = getattr(metadata, "grounding_chunks", []) if metadata else []
+
+        for idx, chunk in enumerate(chunks):
+            web = getattr(chunk, "web", None)
+            uri = getattr(web, "uri", "") if web else ""
+            if not uri or "vertexaisearch.cloud.google.com" in uri:
+                continue
+
+            source_urls.append(uri)
+            d = _normalize_domain(uri)
+            if d:
+                references.append(d)
+                if _is_target_domain_match(d, target_domain):
+                    target_mentioned = True
+                    if position is None:
+                        position = min(10, idx + 1)
+    except Exception:
+        pass
+
+    return (
+        list(dict.fromkeys(references)),
+        list(dict.fromkeys(source_urls)),
+        target_mentioned,
+        position,
+    )
 
 
 async def _call_gemini_with_timeout(client: genai.Client, contents: str, config: types.GenerateContentConfig):
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(
-                generate_with_fallback,
-                client,
-                contents=contents,
-                config=config,
-            ),
-            timeout=PHASE5_MODEL_TIMEOUT_SEC,
+        return await asyncio.to_thread(
+            generate_with_fallback,
+            client,
+            contents=contents,
+            config=config,
         )
-    except Exception:
+    except Exception as e:
+        print(f"[Phase5][Gemini] call failed: {type(e).__name__}: {e}")
         return None
 
 
@@ -103,19 +141,16 @@ async def _call_gemini_with_retry(
     if response is not None:
         return response
 
-    # One retry with a longer timeout to reduce false-negative fallbacks under load.
-    retry_timeout = max(PHASE5_MODEL_TIMEOUT_SEC + 20, 70)
+    # One retry to reduce transient provider failures under load.
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(
-                generate_with_fallback,
-                client,
-                contents=contents,
-                config=config,
-            ),
-            timeout=retry_timeout,
+        return await asyncio.to_thread(
+            generate_with_fallback,
+            client,
+            contents=contents,
+            config=config,
         )
-    except Exception:
+    except Exception as e:
+        print(f"[Phase5][Gemini] retry failed: {type(e).__name__}: {e}")
         return None
 
 
@@ -389,19 +424,175 @@ async def analyze_single_question(url: str, question: dict) -> dict:
     client = get_client()
 
     domain_match = re.search(r'(?:https?://)?(?:www\.)?([^/]+)', url)
-    domain = domain_match.group(1).lower() if domain_match else url.lower()
+    raw_domain = domain_match.group(1).lower() if domain_match else url.lower()
+    domain = _normalize_domain(raw_domain)
 
     def score_from_position(pos: int | None) -> int:
         if not pos or pos < 1:
             return 0
         return max(0, 110 - (pos * 10))
 
-    cache_key = _cache_key(url, question.get("text", ""))
-    cached = _PHASE5_ANALYSIS_CACHE.get(cache_key)
-    if cached and (time.time() - cached[0] <= PHASE5_CACHE_TTL_SEC):
-        payload = dict(cached[1])
-        payload["id"] = question["id"]
-        return payload
+    async def _run_grounded_probe() -> dict:
+        probe_prompt = f"Use live Google Search for this query and list top evidence domains only: '{question['text']}'."
+        probe_response = await _call_gemini_with_retry(
+            client,
+            probe_prompt,
+            config=types.GenerateContentConfig(
+                tools=[{"google_search": {}}],
+                temperature=0.0,
+                top_p=0.95,
+                max_output_tokens=450,
+            ),
+        )
+        if probe_response is None:
+            return {
+                "references": [],
+                "source_urls": [],
+                "target_mentioned": False,
+                "position": None,
+                "response_text": "",
+            }
+
+        probe_refs, probe_urls, probe_mentioned, probe_pos = _extract_grounding_signals(
+            probe_response,
+            domain,
+        )
+        probe_text = (getattr(probe_response, "text", "") or "").strip()
+        text_domains = _extract_domains_from_text(probe_text)
+        for d in text_domains:
+            if d not in probe_refs:
+                probe_refs.append(d)
+            if _is_target_domain_match(d, domain):
+                probe_mentioned = True
+                if probe_pos is None:
+                    probe_pos = 8
+
+        if not probe_mentioned and domain in probe_text.lower():
+            probe_mentioned = True
+            if probe_pos is None:
+                probe_pos = 8
+
+        return {
+            "references": list(dict.fromkeys(probe_refs)),
+            "source_urls": list(dict.fromkeys(probe_urls)),
+            "target_mentioned": probe_mentioned,
+            "position": probe_pos,
+            "response_text": probe_text,
+        }
+
+    async def _run_target_verification() -> tuple[bool, int | None, list[str], str]:
+        verify_prompt = f"""
+        Use live Google Search for this exact query and check if the target domain appears in top results.
+        Query: '{question['text']}'
+        Target domain: '{domain}'
+
+        Return strict JSON only:
+        {{
+          "mentioned": true or false,
+          "position": <1-10 or null>,
+          "sources": ["domain.com"]
+        }}
+        """
+        verify_response = await _call_gemini_with_retry(
+            client,
+            verify_prompt,
+            config=types.GenerateContentConfig(
+                tools=[{"google_search": {}}],
+                temperature=0.0,
+                top_p=0.95,
+                max_output_tokens=350,
+            ),
+        )
+        if verify_response is None:
+            return False, None, [], ""
+
+        parsed = _safe_json_parse(verify_response.text or "")
+        mentioned = bool(parsed.get("mentioned", False)) if isinstance(parsed, dict) else False
+        raw_pos = parsed.get("position") if isinstance(parsed, dict) else None
+        position_value = raw_pos if isinstance(raw_pos, int) and 1 <= raw_pos <= 10 else None
+        raw_sources = parsed.get("sources", []) if isinstance(parsed, dict) else []
+        verify_sources = []
+        if isinstance(raw_sources, list):
+            for item in raw_sources:
+                d = _normalize_domain(item)
+                if d:
+                    verify_sources.append(d)
+
+        grounded_refs, _, grounded_mentioned, grounded_pos = _extract_grounding_signals(
+            verify_response,
+            domain,
+        )
+        verify_sources.extend(grounded_refs)
+
+        text = (verify_response.text or "").lower()
+        if not mentioned and (domain in text or domain.split(".")[0] in text):
+            mentioned = True
+            if position_value is None:
+                position_value = 8
+
+        if grounded_mentioned:
+            mentioned = True
+            if position_value is None:
+                position_value = grounded_pos
+
+        return mentioned, position_value, list(dict.fromkeys(verify_sources)), (verify_response.text or "")
+
+    async def _run_chat_style_verification() -> tuple[bool, int | None, list[str], str]:
+        chat_prompt = f"""
+        Query: '{question['text']}'
+        Target domain: '{domain}'
+
+        Return JSON only:
+        {{
+          "mentioned": true or false,
+          "position": <1-10 or null>,
+          "references": ["domain.com"],
+          "reason": "short reason"
+        }}
+
+        Rules:
+        - Use plain reasoning like Gemini chat style.
+        - No markdown.
+        - If uncertain, set mentioned=false.
+        """
+        chat_response = await _call_gemini_with_retry(
+            client,
+            chat_prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                top_p=0.95,
+                max_output_tokens=300,
+            ),
+        )
+        if chat_response is None:
+            return False, None, [], ""
+
+        parsed = _safe_json_parse(chat_response.text or "")
+        mentioned = bool(parsed.get("mentioned", False)) if isinstance(parsed, dict) else False
+        raw_pos = parsed.get("position") if isinstance(parsed, dict) else None
+        position_value = raw_pos if isinstance(raw_pos, int) and 1 <= raw_pos <= 10 else None
+        refs = parsed.get("references", []) if isinstance(parsed, dict) else []
+        out_refs = []
+        if isinstance(refs, list):
+            for item in refs:
+                d = _normalize_domain(item)
+                if d:
+                    out_refs.append(d)
+
+        txt = (chat_response.text or "").lower()
+        if not mentioned and (domain in txt or domain.split(".")[0] in txt):
+            mentioned = True
+            if position_value is None:
+                position_value = 8
+
+        for d in out_refs:
+            if _is_target_domain_match(d, domain):
+                mentioned = True
+                if position_value is None:
+                    position_value = 8
+                break
+
+        return mentioned, position_value, list(dict.fromkeys(out_refs)), (chat_response.text or "")
 
     # Create a prompt that requests structured ranking evidence
     prompt = ""
@@ -458,20 +649,7 @@ async def analyze_single_question(url: str, question: dict) -> dict:
                 max_output_tokens=700,
             ),
         )
-        if response is None:
-            return {
-                "id": question["id"],
-                "status": "Not Mentioned",
-                "position": None,
-                "sources": [],
-                "source_urls": [],
-                "references": [],
-                "competitors": [],
-                "competitor_scores": [],
-                "reasoning": "Request timed out",
-            }
-
-        data = _safe_json_parse(response.text or "")
+        data = _safe_json_parse((response.text or "") if response is not None else "")
 
         if not isinstance(data, dict):
             data = {}
@@ -480,7 +658,8 @@ async def analyze_single_question(url: str, question: dict) -> dict:
         target_mentioned = bool(target.get("mentioned", False)) if isinstance(target, dict) else False
         raw_position = target.get("position") if isinstance(target, dict) else None
         position = raw_position if isinstance(raw_position, int) and 1 <= raw_position <= 10 else None
-        brand_token = domain.split(".")[0]
+        brand_parts = [p for p in domain.split(".") if p]
+        brand_token = brand_parts[0] if brand_parts else domain
 
         raw_sources = target.get("source_domains", []) if isinstance(target, dict) else []
         if not isinstance(raw_sources, list):
@@ -503,33 +682,64 @@ async def analyze_single_question(url: str, question: dict) -> dict:
                 clean_references.append(r_str)
 
         # Grounding fallback: extract reference domains and raw URLs from metadata.
-        if response.candidates:
-            try:
-                candidate = response.candidates[0]
-                metadata = getattr(candidate, "grounding_metadata", None)
-                chunks = getattr(metadata, "grounding_chunks", []) if metadata else []
-                for idx, chunk in enumerate(chunks):
-                    web = getattr(chunk, "web", None)
-                    uri = getattr(web, "uri", "") if web else ""
-                    if uri and "vertexaisearch.cloud.google.com" not in uri:
-                        source_urls.append(uri)
-                    source_domain = _normalize_domain(uri)
-                    if source_domain and "vertexaisearch.cloud.google.com" not in source_domain:
-                        clean_references.append(source_domain)
-                        clean_sources.append(source_domain)
-                        if source_domain == domain or source_domain.endswith(f".{domain}"):
-                            target_mentioned = True
-                            if position is None:
-                                position = min(10, idx + 1)
-            except Exception:
-                pass
+        grounded_refs, grounded_urls, grounded_mentioned, grounded_pos = _extract_grounding_signals(
+            response,
+            domain,
+        ) if response is not None else ([], [], False, None)
+        clean_references.extend(grounded_refs)
+        clean_sources.extend(grounded_refs)
+        source_urls.extend(grounded_urls)
+        if grounded_mentioned:
+            target_mentioned = True
+            if position is None:
+                position = grounded_pos
 
         # Text fallback: sometimes model returns valid prose with mention signals but no structured target block.
-        response_text = (response.text or "").lower()
+        response_text = ((response.text or "") if response is not None else "").lower()
         if not target_mentioned and (domain in response_text or brand_token in response_text):
             target_mentioned = True
             if position is None:
                 position = 8
+
+        # Reliability fallback: if structured parse failed or evidence is empty, run a second grounded probe
+        # before deciding this is Not Mentioned.
+        should_probe = (
+            response is None
+            or (not clean_references and not clean_sources and not target_mentioned and position is None)
+            or (not isinstance(data, dict) or not data)
+        )
+        if should_probe:
+            probe = await _run_grounded_probe()
+            clean_references.extend(probe["references"])
+            clean_sources.extend(probe["references"])
+            source_urls.extend(probe["source_urls"])
+
+            if probe["target_mentioned"]:
+                target_mentioned = True
+                if position is None:
+                    position = probe["position"]
+
+            probe_text = (probe.get("response_text") or "").lower()
+            if not target_mentioned and (domain in probe_text or brand_token in probe_text):
+                target_mentioned = True
+                if position is None:
+                    position = 8
+
+        if not target_mentioned and position is None:
+            verified, verified_position, verified_sources, _ = await _run_target_verification()
+            if verified:
+                target_mentioned = True
+                position = verified_position if isinstance(verified_position, int) else 8
+                clean_sources.extend(verified_sources)
+                clean_references.extend(verified_sources)
+
+        if not target_mentioned and position is None:
+            chat_verified, chat_position, chat_sources, _ = await _run_chat_style_verification()
+            if chat_verified:
+                target_mentioned = True
+                position = chat_position if isinstance(chat_position, int) else 8
+                clean_sources.extend(chat_sources)
+                clean_references.extend(chat_sources)
 
         clean_sources = list(dict.fromkeys(clean_sources))
         clean_references = list(dict.fromkeys(clean_references))
@@ -637,6 +847,15 @@ async def analyze_single_question(url: str, question: dict) -> dict:
 
         status = "Mentioned" if (target_mentioned or position is not None) else "Not Mentioned"
         reasoning = str(data.get("reasoning", "")).strip() if isinstance(data, dict) else ""
+        if not reasoning and response is None:
+            reasoning = "Primary structured request failed; fallback grounded probe used."
+
+        if status == "Not Mentioned":
+            print(
+                f"[Phase5] Not Mentioned qid={question.get('id')} domain={domain} "
+                f"refs={len(clean_references)} sources={len(clean_sources)} "
+                f"response_none={response is None} probed={should_probe}"
+            )
 
         result_payload = {
             "id": question["id"],
@@ -649,19 +868,6 @@ async def analyze_single_question(url: str, question: dict) -> dict:
             "competitor_scores": competitor_scores[:5],
             "reasoning": reasoning or None,
         }
-        # Cache only evidence-backed outcomes to avoid persisting false negatives.
-        should_cache = (
-            result_payload.get("status") == "Mentioned"
-            or bool(result_payload.get("sources"))
-            or bool(result_payload.get("references"))
-            or bool(result_payload.get("source_urls"))
-            or bool(result_payload.get("competitor_scores"))
-        )
-        if should_cache:
-            _PHASE5_ANALYSIS_CACHE[cache_key] = (
-                time.time(),
-                {k: v for k, v in result_payload.items() if k != "id"},
-            )
         return result_payload
 
     except Exception as e:

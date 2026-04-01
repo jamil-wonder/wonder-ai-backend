@@ -56,11 +56,11 @@ load_dotenv()
 
 app = FastAPI(title="Wonder AI Backend")
 
-# Phase 5 persistent worker settings
-PHASE5_WORKER_CONCURRENCY = int(os.getenv("PHASE5_WORKER_CONCURRENCY", "2"))
-PHASE5_WORKER_POLL_INTERVAL = float(os.getenv("PHASE5_WORKER_POLL_INTERVAL", "0.5"))
-PHASE5_JOB_PARALLELISM = int(os.getenv("PHASE5_JOB_PARALLELISM", "5"))
-PHASE5_MODEL_MAX_THREADS = int(os.getenv("PHASE5_MODEL_MAX_THREADS", "24"))
+# Phase 5 worker settings (intentionally fixed for reliability)
+PHASE5_WORKER_CONCURRENCY = 1
+PHASE5_WORKER_POLL_INTERVAL = 0.75
+PHASE5_JOB_PARALLELISM = 1
+PHASE5_MODEL_MAX_THREADS = 4
 PHASE5_WORKER_ID = f"{os.getenv('HOSTNAME', 'local')}-{uuid.uuid4().hex[:8]}"
 PHASE5_REDIS_URL = os.getenv("REDIS_URL", "").strip()
 PHASE5_REDIS_QUEUE_KEY = os.getenv("PHASE5_REDIS_QUEUE_KEY", "phase5:jobs:queue")
