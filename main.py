@@ -80,7 +80,9 @@ else:
     ]
 
 # Setup MongoDB
-MONGO_URL = os.getenv("MONGODB_URL", "mongodb+srv://jamil_db_user:qBfb3HtWmwvEEEkb@wonderai-db.qozs3tl.mongodb.net/?appName=wonderai-db")
+MONGO_URL = os.getenv("MONGODB_URL")
+if not MONGO_URL:
+    raise RuntimeError("CRITICAL ERROR: MONGODB_URL is missing from environment variables.")
 phase5_jobs_col = None
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
