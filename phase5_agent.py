@@ -310,15 +310,15 @@ async def generate_brand_questions(url: str) -> list[str]:
     Generate 20 realistic user-like search questions for a target domain.
     """
     client = get_client()
-    prompt = f"""
+    base_prompt = f"""
     You are a senior search-intent strategist.
-    Target website: '{url}'. Infer business type, customer intent, and local/non-local purchase journeys.
+    Target website: '{url}'. Infer business type, core services, and typical customer intent.
 
     Generate exactly 20 natural user search queries that real users would type.
 
     Requirements:
-    - No generic boilerplate prompts.
-    - No internal/technical jargon.
+    - Every query must be clearly about the target's business category and services inferred from the URL.
+    - Each query should be plausible for a customer who might reasonably be shown the target brand.
     - Include intent diversity: discovery, comparison, trust, pricing, service fit, urgency.
     - Mix short and long-tail phrasing.
     - Queries must be realistic and conversational.
@@ -331,29 +331,24 @@ async def generate_brand_questions(url: str) -> list[str]:
     }}
     """
 
-    response = await _call_gemini_with_retry(
-        client,
-        prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.2,
-            top_p=0.95,
-            max_output_tokens=2500,
-        ),
-    )
+    response = None
+    for _ in range(3):
+        response = await _call_gemini_with_retry(
+            client,
+            base_prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.2,
+                top_p=0.95,
+                max_output_tokens=2500,
+            ),
+        )
+        if response is not None:
+            break
+        await asyncio.sleep(0.5)
+
     if response is None:
-        return [
-            "What are the best options in this area?",
-            "Which place has the best reviews nearby?",
-            "Where should I go for quality service in this area?",
-            "What is the top-rated choice near me?",
-            "Which business offers the best value here?",
-            "Where can I find trusted local recommendations?",
-            "What is the most popular option in this city?",
-            "Which place is best for first-time visitors?",
-            "What option is best for price and quality?",
-            "Which local business is most recommended right now?",
-        ]
+        raise RuntimeError("Failed to generate brand questions from Gemini. Please retry.")
 
     try:
         cleaned_text = response.text.strip()
@@ -382,6 +377,9 @@ async def generate_brand_questions(url: str) -> list[str]:
             seen.add(key)
             cleaned.append(text if text.endswith("?") else f"{text}?")
 
+        if len(cleaned) < 12:
+            raise ValueError("Gemini returned too few valid, relevant queries.")
+
         return cleaned[:20]
     except Exception as e:
         print(f"Error parsing Gemini response: {e}, Response: {response.text}")
@@ -390,6 +388,8 @@ async def generate_brand_questions(url: str) -> list[str]:
             for line in response.text.split("\n")
             if len(line) > 10 and "?" in line
         ]
+        if len(q_list) < 12:
+            raise ValueError("Gemini response parsing failed; insufficient relevant queries.")
         return q_list[:20]
 
 

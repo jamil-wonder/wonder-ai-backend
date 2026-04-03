@@ -3,3 +3,9 @@ source venv/bin/activate
 sudo systemctl restart wonderai
 
 sudo journalctl -u wonderai -f
+
+git config user.name
+git config user.email
+
+git config --global user.name "jamil-wonder"
+git config --global user.email "jamil@thewonder.group"
