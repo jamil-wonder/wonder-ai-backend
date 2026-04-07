@@ -1230,14 +1230,18 @@ async def rank_brand_in_ai(url: str, questions: list) -> dict:
             prompt = f"Using Google Search, answer this question: '{q['text']}'. Provide a comprehensive answer with sources."
             
             # Grounding configuration
-            response = generate_with_fallback(
-                client,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    tools=[{"google_search": {}}],
-                    temperature=0.0,
-                    max_output_tokens=2048,
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    generate_with_fallback,
+                    client,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        tools=[{"google_search": {}}],
+                        temperature=0.0,
+                        max_output_tokens=2048,
+                    ),
                 ),
+                timeout=PHASE5_MODEL_CALL_TIMEOUT_SEC,
             )
             
             # Extract sources if search grounding was used

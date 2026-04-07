@@ -56,6 +56,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _run_scrape_worker(url: str):
+    # Run scrape in a dedicated worker thread so heavy parsing cannot block API responsiveness.
+    if sys.platform == "win32":
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        except Exception:
+            pass
+    return asyncio.run(scrape_website(url))
+
+
+def _run_scrape_worker_core(url: str):
+    # Reduced fallback: no AI enrichment, no deep crawl, faster response when full scrape times out.
+    if sys.platform == "win32":
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        except Exception:
+            pass
+    return asyncio.run(scrape_website(url, enable_ai=False, enable_deep_crawl=False))
+
 app = FastAPI(title="Wonder AI Backend")
 
 # Phase 5 worker settings (intentionally fixed for reliability)
@@ -84,6 +104,7 @@ MONGO_URL = os.getenv("MONGODB_URL")
 if not MONGO_URL:
     raise RuntimeError("CRITICAL ERROR: MONGODB_URL is missing from environment variables.")
 phase5_jobs_col = None
+ai_usage_col = None
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
     db = mongo_client.get_database("wonderai")
@@ -91,6 +112,7 @@ try:
     urls_col = db.get_collection("urls")
     users_col = db.get_collection("users")
     phase5_jobs_col = db.get_collection("phase5_jobs")
+    ai_usage_col = db.get_collection("ai_usage_events")
 except Exception as e:
     print(f"[API] Error connecting to MongoDB: {e}")
 
@@ -160,6 +182,26 @@ async def get_current_admin_user(current_user: dict = Depends(get_current_user))
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Insufficient privileges. Admin access required.")
     return current_user
+
+
+async def _log_ai_usage_event(event: dict):
+    """Best-effort logger for AI feature usage analytics."""
+    if ai_usage_col is None:
+        return
+    try:
+        now = datetime.utcnow()
+        model_name = (event or {}).get("model_name")
+        inferred_family = "gemini" if isinstance(model_name, str) and model_name.lower().startswith("gemini") else "unknown"
+        payload = {
+            "timestamp": now,
+            "timestamp_iso": now.isoformat(),
+            "provider": "google",
+            "model_family": inferred_family,
+            **(event or {}),
+        }
+        await ai_usage_col.insert_one(payload)
+    except Exception as e:
+        print(f"[AI Usage] log failed: {e}")
 
 # --- Auth Routes ---
 
@@ -332,6 +374,8 @@ async def api_login(request: LoginRequest):
 @app.post("/api/scrape", response_model=ScrapeResult)
 async def api_scrape(request: ScrapeRequest, current_user: dict = Depends(get_current_user_optional)):
     try:
+        started_at = datetime.utcnow()
+        print(f"[API] /api/scrape started: {request.url}")
         try:
             doc = {
                 "url": request.url, 
@@ -344,8 +388,54 @@ async def api_scrape(request: ScrapeRequest, current_user: dict = Depends(get_cu
             await urls_col.insert_one(doc)
         except:
             pass
-        result = await scrape_website(request.url)
+        scrape_timeout_seconds = int(os.getenv("PHASE1_SCRAPE_TIMEOUT_SECONDS", "420"))
+        print(f"[API] /api/scrape timeout budget: {scrape_timeout_seconds}s")
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_run_scrape_worker, request.url),
+            timeout=scrape_timeout_seconds,
+        )
+
+        ai_debug = result.get("aiDebug", {}) if isinstance(result, dict) else {}
+        ai_calls = ai_debug.get("calls", {}) if isinstance(ai_debug, dict) else {}
+        ai_models = ai_debug.get("models", {}) if isinstance(ai_debug, dict) else {}
+        for call_name in ["vision", "enrichment", "contact_fallback"]:
+            if bool(ai_calls.get(call_name)):
+                model_name = ai_models.get(call_name) if isinstance(ai_models, dict) else None
+                await _log_ai_usage_event({
+                    "feature": f"phase1_scrape_{call_name}",
+                    "endpoint": "/api/scrape",
+                    "url": request.url,
+                    "user_id": current_user.get("id") if current_user else None,
+                    "user_email": current_user.get("email") if current_user else None,
+                    "model_name": model_name,
+                    "model_family": "gemini" if isinstance(model_name, str) and model_name.lower().startswith("gemini") else "unknown",
+                    "ai_calls_estimate": 1,
+                    "details": {
+                        "call_name": call_name,
+                        "merged": ai_debug.get("merged", {}),
+                        "blocked": ai_debug.get("blocked", {}),
+                        "confidence": ai_debug.get("confidence", {}),
+                    },
+                })
+        elapsed = (datetime.utcnow() - started_at).total_seconds()
+        print(f"[API] /api/scrape completed in {elapsed:.1f}s: {request.url}")
         return result
+    except asyncio.TimeoutError:
+        print(f"[API] /api/scrape timeout: {request.url}")
+        try:
+            fallback = await asyncio.wait_for(
+                asyncio.to_thread(_run_scrape_worker_core, request.url),
+                timeout=120,
+            )
+            if isinstance(fallback, dict):
+                warnings = fallback.get("warnings") if isinstance(fallback.get("warnings"), list) else []
+                warnings.append("Returned reduced analysis after full scrape timeout. AI enrichment was skipped.")
+                fallback["warnings"] = warnings
+            print(f"[API] /api/scrape reduced fallback returned: {request.url}")
+            return fallback
+        except Exception as fallback_error:
+            print(f"[API] /api/scrape fallback failed: {fallback_error}")
+            raise HTTPException(status_code=504, detail="Scrape timed out and fallback also failed. Please retry.")
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -387,10 +477,32 @@ async def api_scan_compare(request: CompareRequest, current_user: dict = Depends
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/ai-insights", response_model=AiInsightsResult)
-async def api_ai_insights(request: AiInsightsRequest):
+async def api_ai_insights(request: AiInsightsRequest, current_user: dict = Depends(get_current_user_optional)):
     try:
-        insight = await get_ai_insights(request.businessName, request.url)
+        started_at = datetime.utcnow()
+        print(f"[API] /api/ai-insights started: {request.url}")
+        insight = await asyncio.wait_for(get_ai_insights(request.businessName, request.url), timeout=90)
+        model_name = insight.get("modelName") if isinstance(insight, dict) else None
+        await _log_ai_usage_event({
+            "feature": "phase1_ai_insights",
+            "endpoint": "/api/ai-insights",
+            "url": request.url,
+            "user_id": current_user.get("id") if current_user else None,
+            "user_email": current_user.get("email") if current_user else None,
+            "model_name": model_name,
+            "model_family": "gemini" if isinstance(model_name, str) and model_name.lower().startswith("gemini") else "unknown",
+            "ai_calls_estimate": 1,
+            "details": {
+                "isKnown": bool(insight.get("isKnown", False)) if isinstance(insight, dict) else None,
+                "platform_count": len(insight.get("platforms", [])) if isinstance(insight, dict) and isinstance(insight.get("platforms"), list) else 0,
+            },
+        })
+        elapsed = (datetime.utcnow() - started_at).total_seconds()
+        print(f"[API] /api/ai-insights completed in {elapsed:.1f}s: {request.url}")
         return AiInsightsResult(success=True, insights=[insight])
+    except asyncio.TimeoutError:
+        print(f"[API] /api/ai-insights timeout: {request.url}")
+        return AiInsightsResult(success=False, insights=[], error="AI insights timed out. Please retry.")
     except Exception as e:
         traceback.print_exc()
         return AiInsightsResult(success=False, insights=[], error=str(e))
@@ -539,6 +651,50 @@ async def admin_get_searches(admin: dict = Depends(get_current_admin_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.delete("/api/admin/searches")
+async def admin_delete_searches(
+    from_date: str | None = None,
+    to_date: str | None = None,
+    admin: dict = Depends(get_current_admin_user),
+):
+    try:
+        if not from_date and not to_date:
+            result = await urls_col.delete_many({})
+            return {"success": True, "deleted_count": int(result.deleted_count)}
+
+        from_dt = datetime.fromisoformat(from_date) if from_date else None
+        to_dt = (datetime.fromisoformat(to_date) + timedelta(days=1)) if to_date else None
+
+        def _parse_ts(value):
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, str):
+                try:
+                    return datetime.fromisoformat(value)
+                except Exception:
+                    return None
+            return None
+
+        ids_to_delete = []
+        async for doc in urls_col.find({}, {"_id": 1, "timestamp": 1}):
+            ts = _parse_ts(doc.get("timestamp"))
+            if ts is None:
+                continue
+            if from_dt and ts < from_dt:
+                continue
+            if to_dt and ts >= to_dt:
+                continue
+            ids_to_delete.append(doc.get("_id"))
+
+        if not ids_to_delete:
+            return {"success": True, "deleted_count": 0}
+
+        result = await urls_col.delete_many({"_id": {"$in": ids_to_delete}})
+        return {"success": True, "deleted_count": int(result.deleted_count)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/admin/wishlist-full")
 async def admin_get_wishlist_full(admin: dict = Depends(get_current_admin_user)):
     try:
@@ -554,33 +710,189 @@ async def admin_get_wishlist_full(admin: dict = Depends(get_current_admin_user))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/api/admin/ai-usage")
+async def admin_get_ai_usage(
+    limit: int = 200,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    admin: dict = Depends(get_current_admin_user),
+):
+    try:
+        if ai_usage_col is None:
+            return {
+                "success": True,
+                "summary": {
+                    "total_events": 0,
+                    "total_ai_calls_estimate": 0,
+                    "unique_users": 0,
+                    "by_feature": {},
+                    "by_model": {},
+                },
+                "recent": [],
+            }
+
+        bounded_limit = max(20, min(1000, int(limit)))
+        from_dt = datetime.fromisoformat(from_date) if from_date else None
+        to_dt = (datetime.fromisoformat(to_date) + timedelta(days=1)) if to_date else None
+
+        def _parse_ts(value):
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, str):
+                try:
+                    return datetime.fromisoformat(value)
+                except Exception:
+                    return None
+            return None
+
+        scan_limit = max(bounded_limit, 3000 if (from_dt or to_dt) else bounded_limit)
+
+        events = []
+        async for doc in ai_usage_col.find({}).sort("timestamp", -1).limit(scan_limit):
+            event_ts = _parse_ts(doc.get("timestamp"))
+            if from_dt and (event_ts is None or event_ts < from_dt):
+                continue
+            if to_dt and (event_ts is None or event_ts >= to_dt):
+                continue
+            events.append({
+                "id": str(doc.get("_id")),
+                "timestamp": (event_ts.isoformat() if event_ts else doc.get("timestamp_iso") or doc.get("timestamp")),
+                "feature": doc.get("feature"),
+                "endpoint": doc.get("endpoint"),
+                "provider": doc.get("provider", "google"),
+                "model_family": doc.get("model_family", "gemini"),
+                "model_name": doc.get("model_name"),
+                "user_id": doc.get("user_id"),
+                "user_email": doc.get("user_email"),
+                "url": doc.get("url"),
+                "ai_calls_estimate": doc.get("ai_calls_estimate", 0),
+                "details": doc.get("details", {}),
+            })
+            if len(events) >= bounded_limit:
+                break
+
+        total_events = len(events)
+        total_ai_calls = sum(int(e.get("ai_calls_estimate", 0) or 0) for e in events)
+        unique_users = len({e.get("user_email") for e in events if e.get("user_email")})
+
+        by_feature = {}
+        by_model = {}
+        by_model_family = {}
+        by_user = {}
+        for e in events:
+            feature = e.get("feature") or "unknown"
+            model = e.get("model_name") or "unknown"
+            model_family = e.get("model_family") or "unknown"
+            user = e.get("user_email") or "anonymous"
+            calls = int(e.get("ai_calls_estimate", 0) or 0)
+
+            by_feature[feature] = by_feature.get(feature, 0) + calls
+            by_model[model] = by_model.get(model, 0) + calls
+            by_model_family[model_family] = by_model_family.get(model_family, 0) + calls
+            by_user[user] = by_user.get(user, 0) + calls
+
+        top_users = [
+            {"user_email": k, "ai_calls_estimate": v}
+            for k, v in sorted(by_user.items(), key=lambda kv: kv[1], reverse=True)[:20]
+        ]
+
+        return {
+            "success": True,
+            "summary": {
+                "total_events": total_events,
+                "total_ai_calls_estimate": total_ai_calls,
+                "unique_users": unique_users,
+                "by_feature": by_feature,
+                "by_model": by_model,
+                "by_model_family": by_model_family,
+                "top_users": top_users,
+            },
+            "recent": events,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/admin/ai-usage")
+async def admin_clear_ai_usage(admin: dict = Depends(get_current_admin_user)):
+    try:
+        if ai_usage_col is None:
+            return {"success": True, "deleted_count": 0}
+        result = await ai_usage_col.delete_many({})
+        return {"success": True, "deleted_count": int(result.deleted_count)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ==============================================================================
 # PHASE 5 ROUTES
 # ==============================================================================
 @app.post("/api/phase5/generate-questions", response_model=Phase5QuestionsResponse)
-async def api_phase5_generate_questions(req: Phase5QuestionsRequest):
+async def api_phase5_generate_questions(req: Phase5QuestionsRequest, current_user: dict = Depends(get_current_user_optional)):
     try:
         questions = await generate_brand_questions(req.url)
+        configured_model = (os.getenv("GEMINI_MODEL_PRIMARY") or os.getenv("GEMINI_MODEL") or "").strip() or None
+        await _log_ai_usage_event({
+            "feature": "phase5_generate_questions",
+            "endpoint": "/api/phase5/generate-questions",
+            "url": req.url,
+            "user_id": current_user.get("id") if current_user else None,
+            "user_email": current_user.get("email") if current_user else None,
+            "model_name": configured_model,
+            "model_family": "gemini" if isinstance(configured_model, str) and configured_model.lower().startswith("gemini") else "unknown",
+            "ai_calls_estimate": 1,
+            "details": {
+                "questions_count": len(questions or []),
+            },
+        })
         return {"questions": questions}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/phase5/analyze", response_model=Phase5AnalyzeResponse)
-async def api_phase5_analyze(req: Phase5AnalyzeRequest):
+async def api_phase5_analyze(req: Phase5AnalyzeRequest, current_user: dict = Depends(get_current_user_optional)):
     try:
         # q.model_dump() turns the pydantic model into a dictionary
         questions_dicts = [q.model_dump() for q in req.questions]
         results = await rank_brand_in_ai(req.url, questions_dicts)
+        configured_model = (os.getenv("GEMINI_MODEL_PRIMARY") or os.getenv("GEMINI_MODEL") or "").strip() or None
+        await _log_ai_usage_event({
+            "feature": "phase5_analyze_direct",
+            "endpoint": "/api/phase5/analyze",
+            "url": req.url,
+            "user_id": current_user.get("id") if current_user else None,
+            "user_email": current_user.get("email") if current_user else None,
+            "model_name": configured_model,
+            "model_family": "gemini" if isinstance(configured_model, str) and configured_model.lower().startswith("gemini") else "unknown",
+            "ai_calls_estimate": max(1, len(questions_dicts)),
+            "details": {
+                "questions_count": len(questions_dicts),
+            },
+        })
         return {"results": results}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/phase5/analyze-single", response_model=Phase5AnalyzeSingleResponse)
-async def api_phase5_analyze_single(req: Phase5AnalyzeSingleRequest):
+async def api_phase5_analyze_single(req: Phase5AnalyzeSingleRequest, current_user: dict = Depends(get_current_user_optional)):
     try:
         result = await analyze_single_question(req.url, req.question.model_dump())
+        configured_model = (os.getenv("GEMINI_MODEL_PRIMARY") or os.getenv("GEMINI_MODEL") or "").strip() or None
+        await _log_ai_usage_event({
+            "feature": "phase5_analyze_single",
+            "endpoint": "/api/phase5/analyze-single",
+            "url": req.url,
+            "user_id": current_user.get("id") if current_user else None,
+            "user_email": current_user.get("email") if current_user else None,
+            "model_name": configured_model,
+            "model_family": "gemini" if isinstance(configured_model, str) and configured_model.lower().startswith("gemini") else "unknown",
+            "ai_calls_estimate": 1,
+            "details": {
+                "question_id": req.question.id,
+            },
+        })
         return result
     except Exception as e:
         traceback.print_exc()
@@ -768,7 +1080,35 @@ async def _process_phase5_job(job_doc: dict):
             },
         )
         print(f"[Phase5] worker completed job_id={job_id} competitors={len(deep_competitors)}")
+        await _log_ai_usage_event({
+            "feature": "phase5_job_completed",
+            "endpoint": "/api/phase5/start-job",
+            "url": job_doc.get("url"),
+            "user_id": job_doc.get("user_id"),
+            "user_email": job_doc.get("user_email"),
+            "ai_calls_estimate": int(job_doc.get("processed", 0) or 0) + 2,
+            "details": {
+                "job_id": job_id,
+                "job_type": job_type,
+                "processed": job_doc.get("processed", 0),
+                "total": len(questions),
+                "competitors_count": len(deep_competitors or []),
+            },
+        })
     except Phase5RateLimitError as e:
+        await _log_ai_usage_event({
+            "feature": "phase5_job_failed_rate_limit",
+            "endpoint": "/api/phase5/start-job",
+            "url": job_doc.get("url"),
+            "user_id": job_doc.get("user_id"),
+            "user_email": job_doc.get("user_email"),
+            "ai_calls_estimate": int(job_doc.get("processed", 0) or 0),
+            "details": {
+                "job_id": job_id,
+                "job_type": job_type,
+                "error": str(e),
+            },
+        })
         await phase5_jobs_col.update_one(
             {"job_id": job_id},
             {
@@ -781,6 +1121,19 @@ async def _process_phase5_job(job_doc: dict):
             },
         )
     except Exception as e:
+        await _log_ai_usage_event({
+            "feature": "phase5_job_failed",
+            "endpoint": "/api/phase5/start-job",
+            "url": job_doc.get("url"),
+            "user_id": job_doc.get("user_id"),
+            "user_email": job_doc.get("user_email"),
+            "ai_calls_estimate": int(job_doc.get("processed", 0) or 0),
+            "details": {
+                "job_id": job_id,
+                "job_type": job_type,
+                "error": str(e),
+            },
+        })
         traceback.print_exc()
         await phase5_jobs_col.update_one(
             {"job_id": job_id},
@@ -902,7 +1255,7 @@ async def _phase5_worker_shutdown():
 
 
 @app.post("/api/phase5/start-job", response_model=Phase5StartJobResponse)
-async def api_phase5_start_job(req: Phase5StartJobRequest):
+async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = Depends(get_current_user_optional)):
     try:
         if phase5_jobs_col is None:
             raise HTTPException(status_code=503, detail="phase5 job storage unavailable")
@@ -915,6 +1268,8 @@ async def api_phase5_start_job(req: Phase5StartJobRequest):
             "job_id": job_id,
             "job_type": "core",
             "url": req.url,
+            "user_id": current_user.get("id") if current_user else None,
+            "user_email": current_user.get("email") if current_user else None,
             "questions": questions_dicts,
             "seed_results": {},
             "status": "queued",
@@ -936,6 +1291,16 @@ async def api_phase5_start_job(req: Phase5StartJobRequest):
             except Exception:
                 print("[Phase5] Redis enqueue failed. Job remains queued in Mongo and will be picked by polling worker.")
 
+        await _log_ai_usage_event({
+            "feature": "phase5_job_started",
+            "endpoint": "/api/phase5/start-job",
+            "url": req.url,
+            "user_id": current_user.get("id") if current_user else None,
+            "user_email": current_user.get("email") if current_user else None,
+            "ai_calls_estimate": 0,
+            "details": {"job_id": job_id, "job_type": "core", "question_count": len(questions_dicts)},
+        })
+
         return {
             "job_id": job_id,
             "status": "queued",
@@ -949,7 +1314,7 @@ async def api_phase5_start_job(req: Phase5StartJobRequest):
 
 
 @app.post("/api/phase5/start-deep-job", response_model=Phase5StartJobResponse)
-async def api_phase5_start_deep_job(req: Phase5StartJobRequest):
+async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: dict = Depends(get_current_user_optional)):
     try:
         if phase5_jobs_col is None:
             raise HTTPException(status_code=503, detail="phase5 job storage unavailable")
@@ -962,6 +1327,8 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest):
             "job_id": job_id,
             "job_type": "deep",
             "url": req.url,
+            "user_id": current_user.get("id") if current_user else None,
+            "user_email": current_user.get("email") if current_user else None,
             "questions": questions_dicts,
             "seed_results": req.seed_results or {},
             "status": "queued",
@@ -982,6 +1349,16 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest):
                 await redis_client.rpush(PHASE5_REDIS_QUEUE_KEY, job_id.encode("utf-8"))
             except Exception:
                 print("[Phase5] Redis enqueue failed. Job remains queued in Mongo and will be picked by polling worker.")
+
+        await _log_ai_usage_event({
+            "feature": "phase5_deep_job_started",
+            "endpoint": "/api/phase5/start-deep-job",
+            "url": req.url,
+            "user_id": current_user.get("id") if current_user else None,
+            "user_email": current_user.get("email") if current_user else None,
+            "ai_calls_estimate": 0,
+            "details": {"job_id": job_id, "job_type": "deep", "question_count": len(questions_dicts)},
+        })
 
         return {
             "job_id": job_id,

@@ -1,4 +1,5 @@
 import os
+import time
 from typing import List
 
 
@@ -42,14 +43,20 @@ def generate_with_fallback(client, *, contents, config=None):
 
     for idx, model in enumerate(models):
         try:
+            started = time.perf_counter()
+            print(f"[Gemini] model={model} request started")
             response = client.models.generate_content(
                 model=model,
                 contents=contents,
                 config=config,
             )
+            elapsed = time.perf_counter() - started
+            print(f"[Gemini] model={model} success in {elapsed:.2f}s")
             setattr(response, "_model_used", model)
             return response
         except Exception as exc:
+            elapsed = time.perf_counter() - started if 'started' in locals() else 0.0
+            print(f"[Gemini] model={model} failed in {elapsed:.2f}s error={exc.__class__.__name__}")
             last_error = exc
             if idx < len(models) - 1 and _is_rate_limited_error(exc):
                 print(f"[Gemini] Rate-limited on {model}. Switching to next paid model.")

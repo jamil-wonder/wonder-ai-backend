@@ -61,6 +61,8 @@ class ScrapeResult(BaseModel):
     warnings: List[str]
     seoInfo: Optional[Dict[str, Any]] = None
     technologies: List[str] = Field(default_factory=list)
+    aiSuggestions: Dict[str, str] = Field(default_factory=dict)
+    aiDebug: Optional[Dict[str, Any]] = None
 
 class ScrapeRequest(BaseModel):
     url: str

@@ -2,6 +2,7 @@ import json
 import re
 import asyncio
 import sys
+import os
 from typing import Dict, List, Set, Any, Tuple
 from urllib.parse import urlparse, unquote, urljoin, parse_qs
 from bs4 import BeautifulSoup
@@ -27,8 +28,36 @@ SOCIAL_PATTERNS = {
     'pinterest': re.compile(r'pinterest\.com/([\w.%-]+)', re.I),
 }
 
+AI_ENRICHMENT_CONFIDENCE_THRESHOLDS = {
+    "emails": 72,
+    "phones": 72,
+    "addresses": 70,
+    "openingHours": 70,
+    "socialLinks": 68,
+    "bookingPath": 68,
+}
+
+PHASE1_AI_VISION_TIMEOUT_SECONDS = int(os.getenv("PHASE1_AI_VISION_TIMEOUT_SECONDS", "45"))
+PHASE1_AI_CONTACT_TIMEOUT_SECONDS = int(os.getenv("PHASE1_AI_CONTACT_TIMEOUT_SECONDS", "90"))
+PHASE1_AI_ENRICH_TIMEOUT_SECONDS = int(os.getenv("PHASE1_AI_ENRICH_TIMEOUT_SECONDS", "180"))
+PHASE1_ENABLE_CONTACT_FALLBACK = os.getenv("PHASE1_ENABLE_CONTACT_FALLBACK", "0").strip() == "1"
+
+PHASE1_AI_DEBUG = True
+
 PHONE_REGEX = re.compile(r'(?:\+?\d{1,3}[\s\-.]?)?(?:\(?\d{2,4}\)?[\s\-.]?)?\d{3,4}[\s\-.]?\d{3,4}(?:[\s\-.]?\d{2,4})?')
 EMAIL_REGEX = re.compile(r'([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})')
+
+
+def extract_emails_from_text(text: str) -> List[str]:
+    if not text:
+        return []
+    normalized = str(text)
+    # Handle common obfuscations like name [at] domain [dot] com
+    normalized = re.sub(r'\s*\(at\)\s*|\s*\[at\]\s*|\s+at\s+', '@', normalized, flags=re.I)
+    normalized = re.sub(r'\s*\(dot\)\s*|\s*\[dot\]\s*|\s+dot\s+', '.', normalized, flags=re.I)
+    normalized = normalized.replace('mailto:', ' ')
+    matches = EMAIL_REGEX.findall(normalized)
+    return [m.strip().lower() for m in matches if m and m.strip()]
 
 def clean_set(s: Set[str]) -> List[str]:
     return [x.strip() for x in s if x and x.strip()]
@@ -122,10 +151,8 @@ async def _fetch_with_playwright(target_url: str) -> Dict[str, Any]:
         else:
             result["final_url"] = page.url
             result["used_playwright"] = True
-            try:
-                result["screenshot_bytes"] = await page.screenshot(type='jpeg', quality=50, full_page=True)
-            except Exception:
-                result["screenshot_bytes"] = None
+            # Screenshot capture disabled because vision extraction is not used.
+            result["screenshot_bytes"] = None
             if result["final_url"] != target_url:
                 result["warnings"].append(f"Redirected to {result['final_url']}")
 
@@ -164,7 +191,7 @@ async def fetch_with_httpx(url: str) -> Tuple[str, str]:
             response = await client.get(url)
         return response.text, str(response.url)
 
-async def scrape_website(url: str) -> dict:
+async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bool = True) -> dict:
     warnings = []
 
     target_url = url.strip()
@@ -220,6 +247,13 @@ async def scrape_website(url: str) -> dict:
         except Exception as e:
             raise Exception(f"Failed to fetch {target_url}: {str(e)}")
 
+    is_protected_site = any("Cloudflare / 403 block detected" in str(w) for w in warnings)
+    force_full_ai = os.getenv("PHASE1_FORCE_FULL_AI", "1").strip() == "1"
+    if timed_out:
+        warnings.append("Primary page fetch timed out; running reduced analysis mode.")
+    if is_protected_site:
+        warnings.append("Protected/WAF site detected; skipping deep crawl and AI enrichment to avoid long timeout.")
+
     soup = BeautifulSoup(content, 'html.parser')
 
     # Shallow Crawl for Contact/About Subpages
@@ -238,7 +272,7 @@ async def scrape_website(url: str) -> dict:
             except: pass
             
     crawl_queue = crawl_queue[:3]
-    if crawl_queue:
+    if crawl_queue and enable_deep_crawl and not is_protected_site and not timed_out:
         async def fetch_sub(u):
             try:
                 # First attempt with httpx (fast)
@@ -361,6 +395,18 @@ async def scrape_website(url: str) -> dict:
                 matches = EMAIL_REGEX.findall(text)
                 for m in matches:
                     emails.add(m.strip().lower())
+
+    # Global fallback scan: some sites place email in overlays/menus that are outside contact blocks.
+    if len(emails) == 0:
+        for s_doc in all_soups:
+            all_text = s_doc.get_text(" ", strip=True)
+            for m in extract_emails_from_text(all_text):
+                emails.add(m)
+
+            for a in s_doc.find_all('a', href=True):
+                href = a.get('href') or ''
+                for m in extract_emails_from_text(href):
+                    emails.add(m)
 
     addresses = set()
     for s in schemas:
@@ -538,19 +584,178 @@ async def scrape_website(url: str) -> dict:
         head_check(f"{origin}/robots.txt")
     )
 
-    # ----- AI VISION FALLBACK -----
-    if screenshot_bytes and (not phones or not opening_hours or not addresses):
-        warnings.append('Triggering AI Vision Agent onto screenshot to locate missing visual data.')
-        vision_data = await ai_agent.get_vision_extraction(screenshot_bytes)
-        
-        if not phones and vision_data.get('phones'):
-            for p in vision_data['phones']: phones.add(normalise_phone(p))
-        if not emails and vision_data.get('emails'):
-            for e in vision_data['emails']: emails.add(e.lower())
-        if not addresses and vision_data.get('addresses'):
-            for a in vision_data['addresses']: addresses.add(a)
-        if not opening_hours and vision_data.get('hours'):
-            opening_hours.extend(vision_data['hours'])
+    ai_debug: Dict[str, Any] = {
+        "ran": False,
+        "calls": {
+            "vision": False,
+            "enrichment": False,
+            "contact_fallback": False,
+        },
+        "models": {
+            "vision": None,
+            "enrichment": None,
+            "contact_fallback": None,
+        },
+        "confidence": {},
+        "thresholds": AI_ENRICHMENT_CONFIDENCE_THRESHOLDS,
+        "merged": {"emails": 0, "phones": 0, "addresses": 0, "openingHours": 0, "socialLinks": 0, "bookingPath": False},
+        "blocked": {"emails": 0, "phones": 0, "addresses": 0, "openingHours": 0, "socialLinks": 0, "bookingPath": False},
+        "reason": None,
+    }
+
+    allow_ai_enrichment = enable_ai and (force_full_ai or (not is_protected_site and not timed_out))
+    if force_full_ai and (is_protected_site or timed_out):
+        warnings.append("Full AI enrichment forced despite protected/slow page mode.")
+
+    # Vision extraction removed by product decision.
+
+    # Focused grounded fallback for missing contact details.
+    if PHASE1_ENABLE_CONTACT_FALLBACK and allow_ai_enrichment and (not emails or not phones or not opening_hours):
+        ai_debug["calls"]["contact_fallback"] = True
+        print("[AI] Phase1 contact fallback started")
+        try:
+            contact_fallback = await asyncio.wait_for(
+                ai_agent.get_phase1_contact_fallback(target_url, business_name),
+                timeout=PHASE1_AI_CONTACT_TIMEOUT_SECONDS,
+            )
+            print("[AI] Phase1 contact fallback completed")
+        except asyncio.TimeoutError:
+            contact_fallback = {"emails": [], "phones": [], "addresses": [], "openingHours": [], "confidence": {}}
+            warnings.append(f"AI contact fallback timed out after {PHASE1_AI_CONTACT_TIMEOUT_SECONDS}s; continuing with available extracted data.")
+        except Exception as cf_err:
+            contact_fallback = {"emails": [], "phones": [], "addresses": [], "openingHours": [], "confidence": {}}
+            warnings.append(f"AI contact fallback failed: {str(cf_err)[:80]}")
+        if isinstance(contact_fallback, dict):
+            ai_debug["models"]["contact_fallback"] = contact_fallback.get("modelUsed")
+        cf_conf = contact_fallback.get("confidence", {}) if isinstance(contact_fallback.get("confidence"), dict) else {}
+
+        def cf_ok(key: str, threshold: int = 65) -> bool:
+            raw = cf_conf.get(key, 0)
+            return raw >= threshold if isinstance(raw, int) else False
+
+        for e in contact_fallback.get("emails", []):
+            e_str = str(e).strip().lower()
+            if EMAIL_REGEX.match(e_str) and (cf_ok("emails") or e_str in content.lower()):
+                emails.add(e_str)
+
+        for p in contact_fallback.get("phones", []):
+            p_str = normalise_phone(str(p))
+            if len(re.sub(r'\D', '', p_str)) >= 7 and cf_ok("phones"):
+                phones.add(p_str)
+
+        for h in contact_fallback.get("openingHours", []):
+            h_str = str(h).strip()
+            if h_str and cf_ok("openingHours", 60):
+                opening_hours.append(h_str)
+
+        for a in contact_fallback.get("addresses", []):
+            a_str = str(a).strip()
+            if len(a_str) >= 10 and cf_ok("addresses", 60):
+                addresses.add(a_str)
+
+    # ----- AI TEXT ENRICHMENT (PHASE 1) -----
+    ai_suggestions: Dict[str, str] = {}
+    ai_booking_path = False
+    try:
+        if not allow_ai_enrichment:
+            raise RuntimeError("AI enrichment skipped for reduced analysis mode")
+        print("[AI] Phase1 enrichment started")
+        text_blocks = []
+        for s_doc in all_soups:
+            text_blocks.append(s_doc.get_text(" ", strip=True))
+        text_excerpt = re.sub(r'\s+', ' ', " ".join(text_blocks)).strip()[:16000]
+
+        enrichment = await asyncio.wait_for(
+            ai_agent.get_phase1_enrichment(
+                url=target_url,
+                business_name=business_name,
+                page_text_excerpt=text_excerpt,
+                current_data={
+                    "emails": clean_set(emails),
+                    "phones": clean_set(phones),
+                    "addresses": [x for x in addresses if x],
+                    "openingHours": [str(x) for x in opening_hours],
+                    "socialLinks": social_links,
+                },
+            ),
+            timeout=PHASE1_AI_ENRICH_TIMEOUT_SECONDS,
+        )
+
+        ai_debug["ran"] = True
+        ai_debug["calls"]["enrichment"] = True
+        if isinstance(enrichment, dict):
+            ai_debug["models"]["enrichment"] = enrichment.get("modelUsed")
+        confidence = enrichment.get("confidence", {}) if isinstance(enrichment.get("confidence"), dict) else {}
+        ai_debug["confidence"] = confidence
+        text_excerpt_lower = text_excerpt.lower()
+
+        def conf_ok(key: str) -> bool:
+            raw = confidence.get(key, 0)
+            value = raw if isinstance(raw, int) else 0
+            return value >= AI_ENRICHMENT_CONFIDENCE_THRESHOLDS[key]
+
+        if conf_ok("phones"):
+            for p in enrichment.get("phones", []):
+                p_str = normalise_phone(str(p))
+                if len(re.sub(r'\D', '', p_str)) >= 7:
+                    phones.add(p_str)
+                    ai_debug["merged"]["phones"] += 1
+        else:
+            ai_debug["blocked"]["phones"] = len(enrichment.get("phones", []))
+
+        # Email fallback: if confidence metadata is missing/low, still accept emails that literally exist on page text.
+        for e in enrichment.get("emails", []):
+            e_str = str(e).strip().lower()
+            if not EMAIL_REGEX.match(e_str):
+                continue
+            if conf_ok("emails") or (e_str in text_excerpt_lower):
+                before = len(emails)
+                emails.add(e_str)
+                if len(emails) > before:
+                    ai_debug["merged"]["emails"] += 1
+            else:
+                ai_debug["blocked"]["emails"] += 1
+
+        if conf_ok("addresses"):
+            for a in enrichment.get("addresses", []):
+                a_str = str(a).strip()
+                if len(a_str) >= 10:
+                    addresses.add(a_str)
+                    ai_debug["merged"]["addresses"] += 1
+        else:
+            ai_debug["blocked"]["addresses"] = len(enrichment.get("addresses", []))
+
+        if conf_ok("openingHours"):
+            for h in enrichment.get("openingHours", []):
+                h_str = str(h).strip()
+                if h_str:
+                    opening_hours.append(h_str)
+                    ai_debug["merged"]["openingHours"] += 1
+        else:
+            ai_debug["blocked"]["openingHours"] = len(enrichment.get("openingHours", []))
+
+        if conf_ok("socialLinks"):
+            ai_social_links = enrichment.get("socialLinks", {}) if isinstance(enrichment.get("socialLinks"), dict) else {}
+            for platform, link in ai_social_links.items():
+                if platform not in social_links and isinstance(link, str) and link.strip():
+                    social_links[platform] = link.strip()
+                    ai_debug["merged"]["socialLinks"] += 1
+        else:
+            ai_social_links = enrichment.get("socialLinks", {}) if isinstance(enrichment.get("socialLinks"), dict) else {}
+            ai_debug["blocked"]["socialLinks"] = len(ai_social_links)
+
+        ai_booking_path = bool(enrichment.get("hasBookingPath", False)) if conf_ok("bookingPath") else False
+        ai_debug["merged"]["bookingPath"] = ai_booking_path
+        ai_debug["blocked"]["bookingPath"] = bool(enrichment.get("hasBookingPath", False)) and not ai_booking_path
+        ai_suggestions = enrichment.get("suggestions", {}) if isinstance(enrichment.get("suggestions"), dict) else {}
+        print("[AI] Phase1 enrichment completed")
+    except asyncio.TimeoutError:
+        print(f"Phase1 enrichment error: timeout while waiting for AI enrichment response ({PHASE1_AI_ENRICH_TIMEOUT_SECONDS}s)")
+        ai_debug["reason"] = "AI enrichment timed out"
+        warnings.append(f"AI enrichment timed out after {PHASE1_AI_ENRICH_TIMEOUT_SECONDS}s; returning core analysis data.")
+    except Exception as enrich_error:
+        print(f"Phase1 enrichment error: {enrich_error.__class__.__name__}: {str(enrich_error)}")
+        ai_debug["reason"] = str(enrich_error)[:220]
 
     b_name_score = 8 if business_name else 0
     desc_score = 9 if description else 0
@@ -571,7 +776,7 @@ async def scrape_website(url: str) -> dict:
     operating_score = hours_visible + hours_structured
 
     social_score = min(len(social_links) * 2, 8) if social_links else 0
-    has_booking = bool(soup.find_all('a', href=re.compile(r'book|appoint|reserv|calendly|acuity', re.I)))
+    has_booking = bool(soup.find_all('a', href=re.compile(r'book|appoint|reserv|calendly|acuity', re.I))) or ai_booking_path
     booking_score = 7 if has_booking else 0
     trust_score = social_score + booking_score
 
@@ -636,5 +841,7 @@ async def scrape_website(url: str) -> dict:
         "rawMeta": raw_meta,
         "warnings": warnings,
         "seoInfo": seo_info,
-        "technologies": technologies
+        "technologies": technologies,
+        "aiSuggestions": {str(k): str(v)[:180] for k, v in ai_suggestions.items() if str(k).strip() and str(v).strip()},
+        "aiDebug": ai_debug if PHASE1_AI_DEBUG else None,
     }
