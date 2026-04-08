@@ -43,6 +43,7 @@ class Phase5StartJobRequest(BaseModel):
     url: str
     questions: List[QuestionItem]
     seed_results: Optional[dict] = None
+    model: Optional[str] = "gemini"
 
 
 class Phase5StartJobResponse(BaseModel):

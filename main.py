@@ -11,7 +11,7 @@ from fastapi.security import OAuth2PasswordBearer
 from bson import ObjectId
 from models import ScrapeRequest, ScrapeResult, AiInsightsRequest, AiInsightsResult, WishlistRequest, TrackUrlRequest
 from scraper import scrape_website
-from ai_agent import get_ai_insights
+from ai_agent import get_ai_insights_multi
 from phase2_models import CompareRequest, CompareResult
 from competitor_engine import run_competitor_analysis
 from phase3_models import ContentAnalysisRequest, ContentAnalysisResponse
@@ -31,6 +31,7 @@ from phase5_agent import (
     generate_brand_questions,
     rank_brand_in_ai,
     analyze_single_question,
+    _run_with_backoff,
     generate_brand_perception_summary,
     generate_deep_competitor_scores,
     Phase5RateLimitError,
@@ -43,14 +44,19 @@ import secrets
 import bcrypt
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
 import traceback
 import uvicorn
 import os
 import uuid
+import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
+
+load_dotenv()
 from redis import asyncio as aioredis
 from dotenv import load_dotenv
 
@@ -78,14 +84,21 @@ def _run_scrape_worker_core(url: str):
 
 app = FastAPI(title="Wonder AI Backend")
 
-# Phase 5 worker settings (intentionally fixed for reliability)
-PHASE5_WORKER_CONCURRENCY = 1
-PHASE5_WORKER_POLL_INTERVAL = 0.75
-PHASE5_JOB_PARALLELISM = 1
-PHASE5_MODEL_MAX_THREADS = 4
+# Phase 5 worker settings
+PHASE5_WORKER_CONCURRENCY = max(1, min(2, int(os.getenv("PHASE5_WORKER_CONCURRENCY", "2"))))
+PHASE5_WORKER_POLL_INTERVAL = float(os.getenv("PHASE5_WORKER_POLL_INTERVAL", "0.5"))
+PHASE5_JOB_PARALLELISM = max(1, min(8, int(os.getenv("PHASE5_JOB_PARALLELISM", "4"))))
+PHASE5_MODEL_MAX_THREADS = max(4, min(16, int(os.getenv("PHASE5_MODEL_MAX_THREADS", "8"))))
+PHASE5_QUESTION_TIMEOUT_GEMINI_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_GEMINI_SEC", "140"))
+PHASE5_QUESTION_TIMEOUT_OPENAI_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_OPENAI_SEC", "40"))
+PHASE5_STALE_RUNNING_SECONDS = int(os.getenv("PHASE5_STALE_RUNNING_SECONDS", "120"))
+PHASE5_RECOVER_STALE_RUNNING = str(os.getenv("PHASE5_RECOVER_STALE_RUNNING", "false")).strip().lower() == "true"
+PHASE5_STALE_QUEUED_SECONDS = int(os.getenv("PHASE5_STALE_QUEUED_SECONDS", "1800"))
+PHASE5_RESUME_QUEUED_ON_STARTUP = str(os.getenv("PHASE5_RESUME_QUEUED_ON_STARTUP", "false")).strip().lower() == "true"
 PHASE5_WORKER_ID = f"{os.getenv('HOSTNAME', 'local')}-{uuid.uuid4().hex[:8]}"
 PHASE5_REDIS_URL = os.getenv("REDIS_URL", "").strip()
 PHASE5_REDIS_QUEUE_KEY = os.getenv("PHASE5_REDIS_QUEUE_KEY", "phase5:jobs:queue")
+PHASE5_CACHE_REUSE_SECONDS = int(os.getenv("PHASE5_CACHE_REUSE_SECONDS", "21600"))
 
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
 if allowed_origins_env.strip():
@@ -190,14 +203,65 @@ async def _log_ai_usage_event(event: dict):
         return
     try:
         now = datetime.utcnow()
-        model_name = (event or {}).get("model_name")
-        inferred_family = "gemini" if isinstance(model_name, str) and model_name.lower().startswith("gemini") else "unknown"
         payload = {
             "timestamp": now,
             "timestamp_iso": now.isoformat(),
-            "provider": "google",
-            "model_family": inferred_family,
             **(event or {}),
+        }
+
+        model_provider = str(payload.get("model_provider") or "").strip().lower()
+        if model_provider == "chatgpt":
+            model_provider = "openai"
+        elif model_provider == "google":
+            model_provider = "gemini"
+        model_name = payload.get("model_name")
+        if not model_name and model_provider == "gemini":
+            model_name = (os.getenv("GEMINI_MODEL_PRIMARY") or os.getenv("GEMINI_MODEL") or "").strip() or None
+        if not model_name and model_provider == "openai":
+            model_name = (
+                os.getenv("OPENAI_MODEL_PHASE5")
+                or os.getenv("OPENAI_MODEL_PHASE1")
+                or os.getenv("OPENAI_MODEL")
+                or "gpt-4o-mini"
+            ).strip()
+
+        model_family = payload.get("model_family")
+        lowered_model = str(model_name or "").lower()
+        if not model_family:
+            if model_provider == "gemini":
+                model_family = "gemini"
+            elif model_provider == "openai":
+                model_family = "gpt"
+            elif "gemini" in lowered_model:
+                model_family = "gemini"
+            elif any(tag in lowered_model for tag in ["gpt", "o1", "o3", "o4"]):
+                model_family = "gpt"
+            elif "claude" in lowered_model:
+                model_family = "claude"
+            elif "perplexity" in lowered_model:
+                model_family = "perplexity"
+            else:
+                model_family = "unknown"
+
+        provider = payload.get("provider")
+        if not provider:
+            if model_family == "gemini":
+                provider = "google"
+            elif model_family == "gpt" or model_provider == "openai":
+                provider = "openai"
+            elif model_family == "claude":
+                provider = "anthropic"
+            elif model_family == "perplexity":
+                provider = "perplexity"
+            else:
+                provider = "unknown"
+
+        payload["model_name"] = model_name
+        payload["model_family"] = model_family
+        payload["provider"] = provider
+
+        payload = {
+            **payload,
         }
         await ai_usage_col.insert_one(payload)
     except Exception as e:
@@ -481,25 +545,30 @@ async def api_ai_insights(request: AiInsightsRequest, current_user: dict = Depen
     try:
         started_at = datetime.utcnow()
         print(f"[API] /api/ai-insights started: {request.url}")
-        insight = await asyncio.wait_for(get_ai_insights(request.businessName, request.url), timeout=90)
-        model_name = insight.get("modelName") if isinstance(insight, dict) else None
-        await _log_ai_usage_event({
-            "feature": "phase1_ai_insights",
-            "endpoint": "/api/ai-insights",
-            "url": request.url,
-            "user_id": current_user.get("id") if current_user else None,
-            "user_email": current_user.get("email") if current_user else None,
-            "model_name": model_name,
-            "model_family": "gemini" if isinstance(model_name, str) and model_name.lower().startswith("gemini") else "unknown",
-            "ai_calls_estimate": 1,
-            "details": {
-                "isKnown": bool(insight.get("isKnown", False)) if isinstance(insight, dict) else None,
-                "platform_count": len(insight.get("platforms", [])) if isinstance(insight, dict) and isinstance(insight.get("platforms"), list) else 0,
-            },
-        })
+        insights = await asyncio.wait_for(get_ai_insights_multi(request.businessName, request.url), timeout=120)
+        if not isinstance(insights, list):
+            insights = []
+
+        for insight in insights:
+            model_name = insight.get("modelName") if isinstance(insight, dict) else None
+            provider_hint = "openai" if isinstance(model_name, str) and any(k in model_name.lower() for k in ["gpt", "o1", "o3", "o4"]) else "gemini"
+            await _log_ai_usage_event({
+                "feature": "phase1_ai_insights",
+                "endpoint": "/api/ai-insights",
+                "url": request.url,
+                "user_id": current_user.get("id") if current_user else None,
+                "user_email": current_user.get("email") if current_user else None,
+                "model_name": model_name,
+                "model_provider": provider_hint,
+                "ai_calls_estimate": 1,
+                "details": {
+                    "isKnown": bool(insight.get("isKnown", False)) if isinstance(insight, dict) else None,
+                    "platform_count": len(insight.get("platforms", [])) if isinstance(insight, dict) and isinstance(insight.get("platforms"), list) else 0,
+                },
+            })
         elapsed = (datetime.utcnow() - started_at).total_seconds()
         print(f"[API] /api/ai-insights completed in {elapsed:.1f}s: {request.url}")
-        return AiInsightsResult(success=True, insights=[insight])
+        return AiInsightsResult(success=True, insights=insights)
     except asyncio.TimeoutError:
         print(f"[API] /api/ai-insights timeout: {request.url}")
         return AiInsightsResult(success=False, insights=[], error="AI insights timed out. Please retry.")
@@ -839,7 +908,7 @@ async def api_phase5_generate_questions(req: Phase5QuestionsRequest, current_use
             "user_id": current_user.get("id") if current_user else None,
             "user_email": current_user.get("email") if current_user else None,
             "model_name": configured_model,
-            "model_family": "gemini" if isinstance(configured_model, str) and configured_model.lower().startswith("gemini") else "unknown",
+            "model_provider": "gemini",
             "ai_calls_estimate": 1,
             "details": {
                 "questions_count": len(questions or []),
@@ -864,7 +933,7 @@ async def api_phase5_analyze(req: Phase5AnalyzeRequest, current_user: dict = Dep
             "user_id": current_user.get("id") if current_user else None,
             "user_email": current_user.get("email") if current_user else None,
             "model_name": configured_model,
-            "model_family": "gemini" if isinstance(configured_model, str) and configured_model.lower().startswith("gemini") else "unknown",
+            "model_provider": "gemini",
             "ai_calls_estimate": max(1, len(questions_dicts)),
             "details": {
                 "questions_count": len(questions_dicts),
@@ -887,7 +956,7 @@ async def api_phase5_analyze_single(req: Phase5AnalyzeSingleRequest, current_use
             "user_id": current_user.get("id") if current_user else None,
             "user_email": current_user.get("email") if current_user else None,
             "model_name": configured_model,
-            "model_family": "gemini" if isinstance(configured_model, str) and configured_model.lower().startswith("gemini") else "unknown",
+            "model_provider": "gemini",
             "ai_calls_estimate": 1,
             "details": {
                 "question_id": req.question.id,
@@ -902,8 +971,9 @@ async def api_phase5_analyze_single(req: Phase5AnalyzeSingleRequest, current_use
 async def _process_phase5_job(job_doc: dict):
     job_id = job_doc["job_id"]
     job_type = job_doc.get("job_type", "core")
+    model_provider = str(job_doc.get("model", "gemini") or "gemini").strip().lower()
     include_competitors = job_type == "deep"
-    print(f"[Phase5] worker start job_id={job_id} type={job_type}")
+    print(f"[Phase5] worker start job_id={job_id} type={job_type} provider={model_provider}")
     try:
         async def _is_cancelled() -> bool:
             latest = await phase5_jobs_col.find_one(
@@ -975,6 +1045,7 @@ async def _process_phase5_job(job_doc: dict):
                     break
 
                 qid = q["id"]
+                print(f"[Phase5] run qid={qid} job_id={job_id} provider={model_provider}")
                 await phase5_jobs_col.update_one(
                     {"job_id": job_id, "status": {"$ne": "cancelled"}},
                     {
@@ -985,14 +1056,47 @@ async def _process_phase5_job(job_doc: dict):
                     },
                 )
 
-                result = await analyze_single_question(
-                    job_doc["url"],
-                    q,
-                    include_competitors=include_competitors,
+                provider_for_q = str(job_doc.get("model", "gemini") or "gemini").strip().lower()
+                per_question_timeout = (
+                    PHASE5_QUESTION_TIMEOUT_OPENAI_SEC
+                    if provider_for_q == "openai"
+                    else PHASE5_QUESTION_TIMEOUT_GEMINI_SEC
                 )
+
+                try:
+                    result = await asyncio.wait_for(
+                        _run_with_backoff(
+                            job_doc["url"],
+                            q,
+                            model_provider=provider_for_q,
+                            include_competitors=include_competitors,
+                        ),
+                        timeout=max(10, per_question_timeout),
+                    )
+                except asyncio.TimeoutError:
+                    print(
+                        f"[Phase5] qid={qid} job_id={job_id} provider={provider_for_q} "
+                        f"hard-timeout after {per_question_timeout}s"
+                    )
+                    result = {
+                        "id": qid,
+                        "status": "Not Mentioned",
+                        "position": None,
+                        "sources": [],
+                        "source_urls": [],
+                        "references": [],
+                        "competitors": [],
+                        "competitor_scores": [],
+                        "reasoning": f"Timed out after {per_question_timeout}s",
+                    }
 
                 async with lock:
                     accumulated_results[qid] = result
+
+                print(
+                    f"[Phase5] done qid={qid} job_id={job_id} provider={model_provider} "
+                    f"status={result.get('status')} pos={result.get('position')}"
+                )
 
                 await phase5_jobs_col.update_one(
                     {"job_id": job_id, "status": {"$ne": "cancelled"}},
@@ -1011,6 +1115,7 @@ async def _process_phase5_job(job_doc: dict):
             for _ in range(max(1, PHASE5_JOB_PARALLELISM))
         ]
         await asyncio.gather(*workers)
+        processed_count = len(accumulated_results)
 
         if await _is_cancelled():
             await phase5_jobs_col.update_one(
@@ -1024,8 +1129,41 @@ async def _process_phase5_job(job_doc: dict):
             )
             return
 
-        # Auto finalization: generate quick competitor score + brand summary
-        # so users do not need a second click/flow.
+        # Gemini-only finalization: deep competitor scoring + brand narrative.
+        # OpenAI jobs complete immediately after question analysis to keep them fast.
+        if model_provider != "gemini":
+            await phase5_jobs_col.update_one(
+                {"job_id": job_id},
+                {
+                    "$set": {
+                        "status": "completed",
+                        "current_question_id": None,
+                        "deep_competitors": [],
+                        "brand_summary": None,
+                        "updated_at": datetime.utcnow().isoformat(),
+                    }
+                },
+            )
+            print(f"[Phase5] worker completed job_id={job_id} provider={model_provider} without finalizing")
+            await _log_ai_usage_event({
+                "feature": "phase5_job_completed",
+                "endpoint": "/api/phase5/start-job",
+                "url": job_doc.get("url"),
+                "user_id": job_doc.get("user_id"),
+                "user_email": job_doc.get("user_email"),
+                "model_provider": model_provider,
+                "ai_calls_estimate": int(processed_count),
+                "details": {
+                    "job_id": job_id,
+                    "job_type": job_type,
+                    "model_provider": model_provider,
+                    "processed": processed_count,
+                    "total": len(questions),
+                    "finalization": "skipped_non_gemini",
+                },
+            })
+            return
+
         await phase5_jobs_col.update_one(
             {"job_id": job_id},
             {
@@ -1086,26 +1224,32 @@ async def _process_phase5_job(job_doc: dict):
             "url": job_doc.get("url"),
             "user_id": job_doc.get("user_id"),
             "user_email": job_doc.get("user_email"),
-            "ai_calls_estimate": int(job_doc.get("processed", 0) or 0) + 2,
+            "model_provider": model_provider,
+            "ai_calls_estimate": int(processed_count) + 2,
             "details": {
                 "job_id": job_id,
                 "job_type": job_type,
-                "processed": job_doc.get("processed", 0),
+                "model_provider": model_provider,
+                "processed": processed_count,
                 "total": len(questions),
                 "competitors_count": len(deep_competitors or []),
             },
         })
     except Phase5RateLimitError as e:
+        processed_count = len(locals().get("accumulated_results", {}) or {})
         await _log_ai_usage_event({
             "feature": "phase5_job_failed_rate_limit",
             "endpoint": "/api/phase5/start-job",
             "url": job_doc.get("url"),
             "user_id": job_doc.get("user_id"),
             "user_email": job_doc.get("user_email"),
-            "ai_calls_estimate": int(job_doc.get("processed", 0) or 0),
+            "model_provider": model_provider,
+            "ai_calls_estimate": int(processed_count),
             "details": {
                 "job_id": job_id,
                 "job_type": job_type,
+                "model_provider": model_provider,
+                "processed": processed_count,
                 "error": str(e),
             },
         })
@@ -1121,16 +1265,20 @@ async def _process_phase5_job(job_doc: dict):
             },
         )
     except Exception as e:
+        processed_count = len(locals().get("accumulated_results", {}) or {})
         await _log_ai_usage_event({
             "feature": "phase5_job_failed",
             "endpoint": "/api/phase5/start-job",
             "url": job_doc.get("url"),
             "user_id": job_doc.get("user_id"),
             "user_email": job_doc.get("user_email"),
-            "ai_calls_estimate": int(job_doc.get("processed", 0) or 0),
+            "model_provider": model_provider,
+            "ai_calls_estimate": int(processed_count),
             "details": {
                 "job_id": job_id,
                 "job_type": job_type,
+                "model_provider": model_provider,
+                "processed": processed_count,
                 "error": str(e),
             },
         })
@@ -1180,7 +1328,7 @@ async def _phase5_worker_loop():
                             "updated_at": datetime.utcnow().isoformat(),
                         }
                     },
-                    sort=[("created_at", 1)],
+                    sort=[("queue_priority", 1), ("created_at", 1)],
                     return_document=ReturnDocument.AFTER,
                 )
 
@@ -1194,6 +1342,112 @@ async def _phase5_worker_loop():
         except Exception:
             traceback.print_exc()
             await asyncio.sleep(PHASE5_WORKER_POLL_INTERVAL)
+
+
+def _phase5_request_hash(
+    url: str,
+    questions: list[dict],
+    job_type: str,
+    model: str,
+    seed_results: dict | None = None,
+) -> str:
+    normalized_questions = []
+    for q in questions:
+        qid = str((q or {}).get("id", "")).strip()
+        text = str((q or {}).get("text", "")).strip()
+        if not text:
+            continue
+        normalized_questions.append({"id": qid, "text": text})
+
+    normalized_questions.sort(key=lambda item: (item.get("id", ""), item.get("text", "")))
+
+    payload = {
+        "url": str(url or "").strip().lower(),
+        "job_type": str(job_type or "core").strip().lower(),
+        "model": str(model or "gemini").strip().lower(),
+        "questions": normalized_questions,
+    }
+
+    if payload["job_type"] == "deep":
+        payload["seed_results"] = seed_results or {}
+
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _ts_within_cache_window(ts_value: str | None) -> bool:
+    if not ts_value:
+        return False
+    try:
+        updated_at = datetime.fromisoformat(ts_value)
+    except Exception:
+        return False
+    age_seconds = (datetime.utcnow() - updated_at).total_seconds()
+    return age_seconds <= max(60, PHASE5_CACHE_REUSE_SECONDS)
+
+
+async def _find_reusable_phase5_job(request_hash: str, job_type: str) -> dict | None:
+    if phase5_jobs_col is None:
+        return None
+
+    cursor = phase5_jobs_col.find(
+        {
+            "request_hash": request_hash,
+            "job_type": job_type,
+            "status": {"$in": ["queued", "running", "finalizing", "completed"]},
+        },
+        {"_id": 0},
+    ).sort("updated_at", -1).limit(5)
+
+    reusable_completed = None
+    async for job in cursor:
+        status = (job or {}).get("status")
+        if status in {"queued", "finalizing"}:
+            return job
+        if status == "running":
+            if _ts_within_cache_window(job.get("updated_at")):
+                return job
+            stale_job_id = job.get("job_id")
+            if PHASE5_RECOVER_STALE_RUNNING:
+                # Optional mode: recover stale running jobs by re-queueing them.
+                await phase5_jobs_col.update_one(
+                    {"job_id": stale_job_id, "status": "running"},
+                    {
+                        "$set": {
+                            "status": "queued",
+                            "worker_id": None,
+                            "current_question_id": None,
+                            "updated_at": datetime.utcnow().isoformat(),
+                        }
+                    },
+                )
+                refreshed = await phase5_jobs_col.find_one(
+                    {"job_id": stale_job_id},
+                    {"_id": 0},
+                )
+                if refreshed:
+                    print(f"[Phase5] requeued stale running job_id={refreshed.get('job_id')}")
+                    return refreshed
+            else:
+                # Default mode: mark stale running jobs failed so they don't flood workers after restart.
+                await phase5_jobs_col.update_one(
+                    {"job_id": stale_job_id, "status": "running"},
+                    {
+                        "$set": {
+                            "status": "failed",
+                            "current_question_id": None,
+                            "error": "stale_running_job_recovered_as_failed",
+                            "updated_at": datetime.utcnow().isoformat(),
+                        }
+                    },
+                )
+                print(f"[Phase5] marked stale running job_id={stale_job_id} as failed")
+            continue
+        if status == "completed" and _ts_within_cache_window(job.get("updated_at")):
+            reusable_completed = job
+            break
+
+    return reusable_completed
 
 
 @app.on_event("startup")
@@ -1220,6 +1474,82 @@ async def _phase5_worker_startup():
 
     await phase5_jobs_col.create_index("job_id", unique=True)
     await phase5_jobs_col.create_index("status")
+    await phase5_jobs_col.create_index("request_hash")
+
+    # Cost-safety default: do not auto-resume previously queued/in-progress jobs after restart
+    # unless explicitly enabled via env.
+    if not PHASE5_RESUME_QUEUED_ON_STARTUP:
+        try:
+            startup_failed = await phase5_jobs_col.update_many(
+                {"status": {"$in": ["queued", "running", "finalizing"]}},
+                {
+                    "$set": {
+                        "status": "failed",
+                        "worker_id": None,
+                        "current_question_id": None,
+                        "error": "startup_queue_reset",
+                        "updated_at": datetime.utcnow().isoformat(),
+                    }
+                },
+            )
+            if int(startup_failed.modified_count or 0) > 0:
+                print(f"[Phase5] startup reset previous queued/running jobs={startup_failed.modified_count}")
+        except Exception:
+            traceback.print_exc()
+
+    stale_running_cutoff_iso = (datetime.utcnow() - timedelta(seconds=max(30, PHASE5_STALE_RUNNING_SECONDS))).isoformat()
+    stale_queued_cutoff_iso = (datetime.utcnow() - timedelta(seconds=max(120, PHASE5_STALE_QUEUED_SECONDS))).isoformat()
+    try:
+        if PHASE5_RECOVER_STALE_RUNNING:
+            stale_reset = await phase5_jobs_col.update_many(
+                {"status": "running", "updated_at": {"$lt": stale_running_cutoff_iso}},
+                {
+                    "$set": {
+                        "status": "queued",
+                        "worker_id": None,
+                        "current_question_id": None,
+                        "updated_at": datetime.utcnow().isoformat(),
+                    }
+                },
+            )
+            if int(stale_reset.modified_count or 0) > 0:
+                print(f"[Phase5] recovered stale running jobs={stale_reset.modified_count}")
+        else:
+            stale_failed = await phase5_jobs_col.update_many(
+                {"status": "running", "updated_at": {"$lt": stale_running_cutoff_iso}},
+                {
+                    "$set": {
+                        "status": "failed",
+                        "worker_id": None,
+                        "current_question_id": None,
+                        "error": "stale_running_job_recovered_as_failed",
+                        "updated_at": datetime.utcnow().isoformat(),
+                    }
+                },
+            )
+            if int(stale_failed.modified_count or 0) > 0:
+                print(f"[Phase5] marked stale running jobs as failed={stale_failed.modified_count}")
+
+        stale_queued_failed = await phase5_jobs_col.update_many(
+            {"status": "queued", "updated_at": {"$lt": stale_queued_cutoff_iso}},
+            {
+                "$set": {
+                    "status": "failed",
+                    "error": "stale_queued_job_recovered_as_failed",
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            },
+        )
+        if int(stale_queued_failed.modified_count or 0) > 0:
+            print(f"[Phase5] marked stale queued jobs as failed={stale_queued_failed.modified_count}")
+    except Exception:
+        traceback.print_exc()
+
+    print(
+        f"[Phase5] startup workers={max(1, PHASE5_WORKER_CONCURRENCY)} "
+        f"parallelism={PHASE5_JOB_PARALLELISM} timeout_gemini={PHASE5_QUESTION_TIMEOUT_GEMINI_SEC}s "
+        f"timeout_openai={PHASE5_QUESTION_TIMEOUT_OPENAI_SEC}s"
+    )
     app.state.phase5_worker_tasks = [
         asyncio.create_task(_phase5_worker_loop())
         for _ in range(max(1, PHASE5_WORKER_CONCURRENCY))
@@ -1262,11 +1592,31 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
         questions_dicts = [q.model_dump() for q in req.questions]
         if not questions_dicts:
             raise HTTPException(status_code=400, detail="questions cannot be empty")
+        model_provider = str(req.model or "gemini").strip().lower()
+        if model_provider not in {"gemini", "openai"}:
+            raise HTTPException(status_code=400, detail="unsupported model provider")
+
+        request_hash = _phase5_request_hash(
+            url=req.url,
+            questions=questions_dicts,
+            job_type="core",
+            model=model_provider,
+        )
+        reusable = await _find_reusable_phase5_job(request_hash, "core")
+        if reusable:
+            return {
+                "job_id": reusable["job_id"],
+                "status": reusable.get("status", "queued"),
+                "total": reusable.get("total", len(questions_dicts)),
+            }
 
         job_id = uuid.uuid4().hex
         await phase5_jobs_col.insert_one({
             "job_id": job_id,
+            "request_hash": request_hash,
             "job_type": "core",
+            "model": model_provider,
+            "queue_priority": 0 if model_provider == "openai" else 1,
             "url": req.url,
             "user_id": current_user.get("id") if current_user else None,
             "user_email": current_user.get("email") if current_user else None,
@@ -1297,8 +1647,14 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
             "url": req.url,
             "user_id": current_user.get("id") if current_user else None,
             "user_email": current_user.get("email") if current_user else None,
+            "model_provider": model_provider,
             "ai_calls_estimate": 0,
-            "details": {"job_id": job_id, "job_type": "core", "question_count": len(questions_dicts)},
+            "details": {
+                "job_id": job_id,
+                "job_type": "core",
+                "model_provider": model_provider,
+                "question_count": len(questions_dicts),
+            },
         })
 
         return {
@@ -1321,11 +1677,32 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
         questions_dicts = [q.model_dump() for q in req.questions]
         if not questions_dicts:
             raise HTTPException(status_code=400, detail="questions cannot be empty")
+        model_provider = str(req.model or "gemini").strip().lower()
+        if model_provider not in {"gemini", "openai"}:
+            raise HTTPException(status_code=400, detail="unsupported model provider")
+
+        request_hash = _phase5_request_hash(
+            url=req.url,
+            questions=questions_dicts,
+            job_type="deep",
+            model=model_provider,
+            seed_results=req.seed_results or {},
+        )
+        reusable = await _find_reusable_phase5_job(request_hash, "deep")
+        if reusable:
+            return {
+                "job_id": reusable["job_id"],
+                "status": reusable.get("status", "queued"),
+                "total": reusable.get("total", len(questions_dicts)),
+            }
 
         job_id = uuid.uuid4().hex
         await phase5_jobs_col.insert_one({
             "job_id": job_id,
+            "request_hash": request_hash,
             "job_type": "deep",
+            "model": model_provider,
+            "queue_priority": 0 if model_provider == "openai" else 1,
             "url": req.url,
             "user_id": current_user.get("id") if current_user else None,
             "user_email": current_user.get("email") if current_user else None,
@@ -1356,8 +1733,14 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
             "url": req.url,
             "user_id": current_user.get("id") if current_user else None,
             "user_email": current_user.get("email") if current_user else None,
+            "model_provider": model_provider,
             "ai_calls_estimate": 0,
-            "details": {"job_id": job_id, "job_type": "deep", "question_count": len(questions_dicts)},
+            "details": {
+                "job_id": job_id,
+                "job_type": "deep",
+                "model_provider": model_provider,
+                "question_count": len(questions_dicts),
+            },
         })
 
         return {

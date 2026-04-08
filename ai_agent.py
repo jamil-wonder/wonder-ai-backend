@@ -2,6 +2,8 @@ import os
 import json
 import re
 import asyncio
+import base64
+import httpx
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -10,6 +12,96 @@ from gemini_utils import generate_with_fallback
 load_dotenv()
 
 client = genai.Client()
+
+
+def _openai_model_name() -> str:
+    return (os.getenv("OPENAI_MODEL_PHASE1") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+
+
+def _openai_api_key() -> str:
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+    return api_key
+
+
+async def _openai_chat_json(
+    *,
+    prompt: str,
+    timeout_seconds: int = 60,
+    temperature: float = 0.1,
+    max_tokens: int = 2500,
+) -> tuple[dict, str]:
+    api_key = _openai_api_key()
+    model = _openai_model_name()
+    payload = {
+        "model": model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": "Return valid JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    async with httpx.AsyncClient(timeout=timeout_seconds) as http:
+        res = await http.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        res.raise_for_status()
+        data = res.json()
+    content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+    parsed = _safe_json_parse(content)
+    return (parsed if isinstance(parsed, dict) else {}), model
+
+
+async def _openai_vision_json(
+    *,
+    prompt: str,
+    image_bytes: bytes,
+    timeout_seconds: int = 60,
+    max_tokens: int = 1800,
+) -> tuple[dict, str]:
+    api_key = _openai_api_key()
+    model = _openai_model_name()
+    image_b64 = base64.b64encode(image_bytes).decode("ascii")
+    payload = {
+        "model": model,
+        "temperature": 0.0,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+                    },
+                ],
+            }
+        ],
+    }
+    async with httpx.AsyncClient(timeout=timeout_seconds) as http:
+        res = await http.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        res.raise_for_status()
+        data = res.json()
+    content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+    parsed = _safe_json_parse(content)
+    return (parsed if isinstance(parsed, dict) else {}), model
 
 
 async def _generate_with_fallback_async(*, contents, config=None):
@@ -26,6 +118,41 @@ def _model_used(response) -> str:
     model = getattr(response, "_model_used", None) if response is not None else None
     return model if isinstance(model, str) and model.strip() else "unknown"
 
+
+def _normalize_insight_payload(payload: dict, model_name: str) -> dict:
+    summary_raw = str(payload.get("summary") or "No data returned.").strip()
+    summary = re.sub(r"\s+", " ", summary_raw)
+    if len(summary) > 900:
+        summary = summary[:897].rstrip() + "..."
+
+    platforms = payload.get("platforms", [])
+    if not isinstance(platforms, list):
+        platforms = []
+    platforms = [str(p).strip() for p in platforms if str(p).strip()][:8]
+
+    evidence = payload.get("evidence", [])
+    if not isinstance(evidence, list):
+        evidence = []
+    cleaned_evidence = []
+    for item in evidence:
+        text = re.sub(r"\s+", " ", str(item or "")).strip()
+        if not text:
+            continue
+        if len(text) > 240:
+            text = text[:237].rstrip() + "..."
+        cleaned_evidence.append(text)
+        if len(cleaned_evidence) >= 8:
+            break
+
+    return {
+        "modelName": model_name,
+        "isKnown": bool(payload.get("isKnown", False)),
+        "summary": summary,
+        "sentiment": str(payload.get("sentiment") or "Unknown"),
+        "platforms": cleaned_platforms if (cleaned_platforms := platforms) else [],
+        "evidence": cleaned_evidence,
+    }
+
 async def get_ai_insights(business_name: str, url: str) -> dict:
     """
     Given a business name and url (extracted from scraping),
@@ -36,17 +163,23 @@ async def get_ai_insights(business_name: str, url: str) -> dict:
     You are an AI research assistant. A user has a local business or website and wants to know what you and the internet know about it.
     The business name is "{business_name}" and its website is "{url}".
 
-    Please provide a concise but comprehensive summary of what is known about this business from major platforms like Google, Reddit, YouTube, Wikipedia, Google News, or other public sources based on your training data.
+    Please provide a balanced, medium-detail summary of what is known about this business from major platforms like Google, Reddit, YouTube, Wikipedia, Google News, or other public sources based on your training data.
 
     You MUST respond in valid JSON format matching exactly this structure:
     {{
         "modelName": "Gemini",
         "isKnown": true or false,
-        "summary": "2-3 sentences summarizing what is known.",
+        "summary": "3-4 sentences summarizing what is known.",
         "sentiment": "Positive" | "Neutral" | "Negative" | "Mixed" | "Unknown",
         "platforms": ["Google", "Reddit", "Facebook", "Wikipedia"],
-        "evidence": ["Bullet point 1 detailing a specific fact or mention", "Bullet point 2"]
+        "evidence": ["4-8 bullet points with specific external facts or mentions"]
     }}
+
+    Rules:
+    - Keep summary and evidence similar depth to a professional analyst brief.
+    - Prefer externally verifiable mentions over vague statements.
+    - Return exactly 4-8 evidence bullets.
+    - JSON only.
     """
 
     try:
@@ -54,32 +187,92 @@ async def get_ai_insights(business_name: str, url: str) -> dict:
             contents=prompt,
             config=types.GenerateContentConfig(
                 tools=[{"google_search": {}}],
-                response_mime_type="application/json",
                 temperature=0.2,
                 top_p=0.95,
                 max_output_tokens=2048,
             ),
         )
         if response and response.text:
-            parsed = json.loads(response.text)
+            parsed = _safe_json_parse(response.text)
             if isinstance(parsed, dict):
-                parsed["modelName"] = _model_used(response)
-                return parsed
-            return {
-                "modelName": _model_used(response), "isKnown": False, "summary": "Invalid data returned.",
-                "sentiment": "Unknown", "platforms": [], "evidence": []
-            }
+                return _normalize_insight_payload(parsed, _model_used(response))
+            return _normalize_insight_payload({
+                "isKnown": False,
+                "summary": "Invalid data returned.",
+                "sentiment": "Unknown",
+                "platforms": [],
+                "evidence": [],
+            }, _model_used(response))
         else:
-            return {
-                "modelName": "Gemini", "isKnown": False, "summary": "No data returned.",
-                "sentiment": "Unknown", "platforms": [], "evidence": []
-            }
+            return _normalize_insight_payload({
+                "isKnown": False,
+                "summary": "No data returned.",
+                "sentiment": "Unknown",
+                "platforms": [],
+                "evidence": [],
+            }, "Gemini")
     except Exception as e:
         print(f"Error fetching AI insights: {e}")
-        return {
-            "modelName": "Gemini", "isKnown": False, "summary": "Failed to fetch AI insights.",
-            "sentiment": "Unknown", "platforms": [], "evidence": []
-        }
+        return _normalize_insight_payload({
+            "isKnown": False,
+            "summary": "Failed to fetch AI insights.",
+            "sentiment": "Unknown",
+            "platforms": [],
+            "evidence": [],
+        }, "Gemini")
+
+
+async def get_ai_insights_openai(business_name: str, url: str) -> dict:
+    prompt = f"""
+    You are an AI research assistant. A user has a local business or website and wants to know what is known online.
+    The business name is "{business_name}" and website is "{url}".
+
+        Respond in valid JSON with this exact shape:
+    {{
+      "modelName": "ChatGPT",
+      "isKnown": true or false,
+            "summary": "3-4 sentences summarizing what is known.",
+      "sentiment": "Positive" | "Neutral" | "Negative" | "Mixed" | "Unknown",
+      "platforms": ["Google", "Reddit", "YouTube", "Wikipedia"],
+            "evidence": ["4-8 bullet points with specific external facts or mentions"]
+    }}
+
+        Rules:
+        - Keep summary and evidence at medium detail, matching a concise analyst brief.
+        - Prefer externally verifiable mentions over generic claims.
+        - Return exactly 4-8 evidence bullets.
+        - JSON only.
+    """
+    try:
+        parsed, model = await _openai_chat_json(
+            prompt=prompt,
+            timeout_seconds=90,
+            temperature=0.2,
+            max_tokens=1800,
+        )
+        if not isinstance(parsed, dict):
+            parsed = {}
+        return _normalize_insight_payload(parsed, model)
+    except Exception as e:
+        print(f"Error fetching OpenAI insights: {e}")
+        return _normalize_insight_payload({
+            "isKnown": False,
+            "summary": "Failed to fetch AI insights.",
+            "sentiment": "Unknown",
+            "platforms": [],
+            "evidence": [],
+        }, "gpt-4o-mini")
+
+
+async def get_ai_insights_multi(business_name: str, url: str) -> list[dict]:
+    gemini_task = get_ai_insights(business_name, url)
+    gpt_task = get_ai_insights_openai(business_name, url)
+    results = await asyncio.gather(gemini_task, gpt_task, return_exceptions=True)
+    insights: list[dict] = []
+    for r in results:
+        if isinstance(r, dict):
+            insights.append(r)
+    return insights
 
 async def get_vision_extraction(screenshot_bytes: bytes) -> dict:
     """
@@ -105,26 +298,15 @@ async def get_vision_extraction(screenshot_bytes: bytes) -> dict:
     """
 
     try:
-        response = await _generate_with_fallback_async(
-            contents=[
-                prompt,
-                types.Part.from_bytes(
-                    data=screenshot_bytes,
-                    mime_type="image/jpeg"
-                )
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.1,
-                top_p=0.95,
-                max_output_tokens=2048,
-            ),
+        parsed, model = await _openai_vision_json(
+            prompt=prompt,
+            image_bytes=screenshot_bytes,
+            timeout_seconds=75,
+            max_tokens=1800,
         )
-        if response and response.text:
-            parsed = json.loads(response.text)
-            if isinstance(parsed, dict):
-                parsed["modelUsed"] = _model_used(response)
-                return parsed
+        if isinstance(parsed, dict) and parsed:
+            parsed["modelUsed"] = model
+            return parsed
         return {"phones": [], "emails": [], "addresses": [], "hours": []}
     except Exception as e:
         print(f"Error extracting vision data: {e}")
@@ -233,16 +415,12 @@ async def get_phase1_enrichment(
     """
 
     try:
-        response = await _generate_with_fallback_async(
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.1,
-                top_p=0.9,
-                max_output_tokens=3500,
-            ),
+        parsed, model = await _openai_chat_json(
+            prompt=prompt,
+            timeout_seconds=180,
+            temperature=0.1,
+            max_tokens=3500,
         )
-        parsed = _safe_json_parse(response.text if response else "")
         if not isinstance(parsed, dict):
             return {
                 "emails": [],
@@ -252,7 +430,7 @@ async def get_phase1_enrichment(
                 "socialLinks": {},
                 "hasBookingPath": False,
                 "suggestions": {},
-                "modelUsed": _model_used(response),
+                "modelUsed": model,
             }
         return {
             "emails": parsed.get("emails", []) if isinstance(parsed.get("emails"), list) else [],
@@ -263,7 +441,7 @@ async def get_phase1_enrichment(
             "hasBookingPath": bool(parsed.get("hasBookingPath", False)),
             "confidence": parsed.get("confidence", {}) if isinstance(parsed.get("confidence"), dict) else {},
             "suggestions": parsed.get("suggestions", {}) if isinstance(parsed.get("suggestions"), dict) else {},
-            "modelUsed": _model_used(response),
+            "modelUsed": model,
         }
     except Exception as e:
         print(f"Error in phase1 enrichment: {e}")
@@ -312,26 +490,21 @@ async def get_phase1_contact_fallback(url: str, business_name: str) -> dict:
     """
 
     try:
-        response = await _generate_with_fallback_async(
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                tools=[{"google_search": {}}],
-                response_mime_type="application/json",
-                temperature=0.0,
-                top_p=0.9,
-                max_output_tokens=1800,
-            ),
+        parsed, model = await _openai_chat_json(
+            prompt=prompt,
+            timeout_seconds=90,
+            temperature=0.0,
+            max_tokens=1800,
         )
-        parsed = _safe_json_parse(response.text if response else "")
         if not isinstance(parsed, dict):
-            return {"emails": [], "phones": [], "addresses": [], "openingHours": [], "confidence": {}, "modelUsed": _model_used(response)}
+            return {"emails": [], "phones": [], "addresses": [], "openingHours": [], "confidence": {}, "modelUsed": model}
         return {
             "emails": parsed.get("emails", []) if isinstance(parsed.get("emails"), list) else [],
             "phones": parsed.get("phones", []) if isinstance(parsed.get("phones"), list) else [],
             "addresses": parsed.get("addresses", []) if isinstance(parsed.get("addresses"), list) else [],
             "openingHours": parsed.get("openingHours", []) if isinstance(parsed.get("openingHours"), list) else [],
             "confidence": parsed.get("confidence", {}) if isinstance(parsed.get("confidence"), dict) else {},
-            "modelUsed": _model_used(response),
+            "modelUsed": model,
         }
     except Exception as e:
         print(f"Error in phase1 contact fallback: {e}")

@@ -9,3 +9,8 @@ git config user.email
 
 git config --global user.name "jamil-wonder"
 git config --global user.email "jamil@thewonder.group"
+
+git config --global user.name "kallolx"
+git config --global user.email "kallol.business.ds@gmail.com"
+
+git commit --amend --reset-author --no-edit

@@ -2,9 +2,13 @@ import os
 import re
 import json
 import asyncio
+import httpx
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from gemini_utils import generate_with_fallback
+
+load_dotenv()
 
 
 NON_COMPETITOR_DOMAINS = {
@@ -27,7 +31,10 @@ NON_COMPETITOR_DOMAINS = {
 
 PHASE5_VALIDATE_COMPETITORS = False
 PHASE5_FAST_MODE = False
-PHASE5_MODEL_CALL_TIMEOUT_SEC = int(os.getenv("PHASE5_MODEL_CALL_TIMEOUT_SEC", "35"))
+PHASE5_MODEL_CALL_TIMEOUT_SEC = int(os.getenv("PHASE5_MODEL_CALL_TIMEOUT_SEC", "90"))
+MAX_RETRIES = int(os.getenv("PHASE5_RATE_LIMIT_MAX_RETRIES", "3"))
+OPENAI_PHASE5_TIMEOUT_SEC = int(os.getenv("OPENAI_PHASE5_TIMEOUT_SEC", "18"))
+OPENAI_PHASE5_MAX_RETRIES = int(os.getenv("PHASE5_RATE_LIMIT_MAX_RETRIES_OPENAI", "2"))
 
 
 class Phase5RateLimitError(RuntimeError):
@@ -166,7 +173,7 @@ async def _call_gemini_with_retry(
     client: genai.Client,
     contents: str,
     config: types.GenerateContentConfig,
-    retry_once: bool = True,
+    retry_once: bool = False,
     timeout_sec: int | None = None,
 ):
     response = await _call_gemini_with_timeout(client, contents, config, timeout_sec=timeout_sec)
@@ -304,6 +311,82 @@ def get_client() -> genai.Client:
     if not api_key:
         raise ValueError("GEMINI_API_KEY environment variable not set")
     return genai.Client(api_key=api_key)
+
+
+def get_openai_api_key() -> str:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY environment variable not set")
+    return api_key
+
+
+async def _call_openai_chat_json(prompt: str, timeout_sec: int | None = None) -> dict | None:
+    api_key = get_openai_api_key()
+    model = (os.getenv("OPENAI_MODEL_PHASE5") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+    effective_timeout = max(8, timeout_sec if isinstance(timeout_sec, int) else PHASE5_MODEL_CALL_TIMEOUT_SEC)
+
+    payload = {
+        "model": model,
+        "temperature": 0.0,
+        "max_tokens": 700,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a strict JSON assistant. Return only valid JSON.",
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+    }
+
+    try:
+        started = asyncio.get_running_loop().time()
+        print(f"[Phase5][OpenAI] model={model} request started")
+        async with httpx.AsyncClient(timeout=effective_timeout) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        if response.status_code == 429:
+            raise Phase5RateLimitError("OpenAI rate limit reached. Please retry shortly.")
+        response.raise_for_status()
+        body = response.json()
+        text = (
+            ((body.get("choices") or [{}])[0].get("message") or {}).get("content")
+            or ""
+        )
+        parsed = _safe_json_parse(text)
+        elapsed = asyncio.get_running_loop().time() - started
+        print(f"[Phase5][OpenAI] model={model} success in {elapsed:.2f}s")
+        return parsed if isinstance(parsed, dict) else {}
+    except Phase5RateLimitError:
+        raise
+    except Exception as e:
+        if _is_rate_limited_error(e):
+            raise Phase5RateLimitError("OpenAI rate limit reached. Please retry shortly.") from e
+        try:
+            elapsed = asyncio.get_running_loop().time() - started
+            print(f"[Phase5][OpenAI] model={model} failed in {elapsed:.2f}s error={type(e).__name__}")
+        except Exception:
+            pass
+        print(f"[Phase5][OpenAI] call failed: {type(e).__name__}: {e}")
+        return None
+
+
+async def _call_openai_with_retry(prompt: str, retry_once: bool = True, timeout_sec: int | None = None) -> dict | None:
+    first = await _call_openai_chat_json(prompt, timeout_sec=timeout_sec)
+    if first is not None:
+        return first
+    if not retry_once:
+        return None
+    return await _call_openai_chat_json(prompt, timeout_sec=timeout_sec)
 
 async def generate_brand_questions(url: str) -> list[str]:
     """
@@ -696,11 +779,155 @@ async def generate_deep_competitor_scores(
 
     return out if out else heuristic_scores
 
-async def analyze_single_question(url: str, question: dict, include_competitors: bool = False) -> dict:
+async def _analyze_single_question_openai(url: str, question: dict, include_competitors: bool = False) -> dict:
+    domain_match = re.search(r'(?:https?://)?(?:www\.)?([^/]+)', url)
+    raw_domain = domain_match.group(1).lower() if domain_match else url.lower()
+    domain = _normalize_domain(raw_domain)
+
+    prompt = f"""
+    Analyze this user-intent query for brand visibility using your general web/search understanding.
+
+    Query: '{question['text']}'
+    Target domain: '{domain}'
+
+    Return strict JSON only with this schema:
+    {{
+      "target": {{
+        "mentioned": true or false,
+        "position": <1-10 or null>,
+        "source_domains": ["domain.com"]
+      }},
+      "references": ["domain1.com", "domain2.com"],
+      "idea_candidates": ["competitor.com"],
+      "ranked_competitors": [
+        {{"domain": "competitor.com", "position": 1, "evidence": "short reason"}}
+      ],
+      "reasoning": "1 short sentence"
+    }}
+
+    Rules:
+    - Keep lists short and realistic.
+    - Never use the target domain as a source or reference.
+    - Sources/references must be third-party domains only.
+    - Do not include target domain in competitors.
+    - position must be 1..10 or null.
+    - JSON only.
+    """
+
+    data = await _call_openai_with_retry(
+        prompt,
+        retry_once=True,
+        timeout_sec=OPENAI_PHASE5_TIMEOUT_SEC,
+    )
+    if not isinstance(data, dict):
+        data = {}
+
+    target = data.get("target", {}) if isinstance(data, dict) else {}
+    target_mentioned = bool(target.get("mentioned", False)) if isinstance(target, dict) else False
+    raw_position = target.get("position") if isinstance(target, dict) else None
+    position = raw_position if isinstance(raw_position, int) and 1 <= raw_position <= 10 else None
+
+    raw_sources = target.get("source_domains", []) if isinstance(target, dict) else []
+    if not isinstance(raw_sources, list):
+        raw_sources = []
+    clean_sources = []
+    for s in raw_sources:
+        d = _normalize_domain(s)
+        if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+            clean_sources.append(d)
+
+    raw_references = data.get("references", []) if isinstance(data, dict) else []
+    if not isinstance(raw_references, list):
+        raw_references = []
+    clean_references = []
+    for r in raw_references:
+        d = _normalize_domain(r)
+        if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+            clean_references.append(d)
+
+    idea_candidates: list[str] = []
+    raw_ideas = data.get("idea_candidates", []) if isinstance(data, dict) else []
+    if isinstance(raw_ideas, list):
+        for item in raw_ideas:
+            d = _normalize_domain(item)
+            if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+                idea_candidates.append(d)
+
+    competitor_scores = []
+    competitors = []
+    if include_competitors:
+        raw_ranked = data.get("ranked_competitors", []) if isinstance(data, dict) else []
+        if isinstance(raw_ranked, list):
+            for item in raw_ranked[:5]:
+                if not isinstance(item, dict):
+                    continue
+                c_domain = _normalize_domain(item.get("domain", ""))
+                c_pos = item.get("position")
+                if (
+                    not c_domain
+                    or c_domain == domain
+                    or c_domain in NON_COMPETITOR_DOMAINS
+                    or not isinstance(c_pos, int)
+                    or c_pos < 1
+                    or c_pos > 10
+                ):
+                    continue
+                score = max(0, min(100, 110 - (c_pos * 10)))
+                competitor_scores.append(
+                    {
+                        "domain": c_domain,
+                        "position": c_pos,
+                        "score": score,
+                        "evidence": str(item.get("evidence", "")).strip()[:180],
+                    }
+                )
+        competitors = [c["domain"] for c in competitor_scores]
+
+    clean_sources = list(dict.fromkeys(clean_sources))
+    clean_references = list(dict.fromkeys(clean_references))
+    idea_candidates = list(dict.fromkeys(idea_candidates))[:12]
+
+    # Guardrail: require third-party evidence before we mark Mentioned.
+    has_external_evidence = len(clean_sources) > 0 or len(clean_references) > 0
+    if not has_external_evidence:
+        target_mentioned = False
+        position = None
+
+    status = "Mentioned" if (target_mentioned or position is not None) else "Not Mentioned"
+    reasoning = str(data.get("reasoning", "")).strip() if isinstance(data, dict) else ""
+
+    return {
+        "id": question["id"],
+        "status": status,
+        "position": position,
+        "sources": clean_sources[:30],
+        "source_urls": [],
+        "references": clean_references[:30],
+        "idea_candidates": idea_candidates,
+        "competitors": competitors[:5],
+        "competitor_scores": competitor_scores[:5],
+        "reasoning": reasoning or None,
+    }
+
+
+async def analyze_single_question(
+    url: str,
+    question: dict,
+    model_provider: str = "gemini",
+    include_competitors: bool = False,
+) -> dict:
     """
     Analyzes a single question using Gemini with Google Search Grounding.
     Returns status, position, sources, and competitors dynamically.
     """
+    normalized_provider = str(model_provider or "gemini").strip().lower()
+    if normalized_provider == "openai":
+        return await _analyze_single_question_openai(
+            url=url,
+            question=question,
+            include_competitors=include_competitors,
+        )
+
     client = get_client()
 
     domain_match = re.search(r'(?:https?://)?(?:www\.)?([^/]+)', url)
@@ -1208,6 +1435,34 @@ async def analyze_single_question(url: str, question: dict, include_competitors:
             "competitor_scores": [],
             "reasoning": None,
         }
+
+
+async def _run_with_backoff(
+    url: str,
+    question: dict,
+    model_provider: str = "gemini",
+    include_competitors: bool = False,
+) -> dict:
+    """Wrap analyze_single_question with exponential backoff for provider rate limits."""
+    provider = str(model_provider or "gemini").strip().lower()
+    retries = max(1, OPENAI_PHASE5_MAX_RETRIES if provider == "openai" else MAX_RETRIES)
+    for attempt in range(retries):
+        try:
+            return await analyze_single_question(
+                url=url,
+                question=question,
+                model_provider=model_provider,
+                include_competitors=include_competitors,
+            )
+        except Phase5RateLimitError:
+            if attempt == retries - 1:
+                raise
+            wait = 2 ** (attempt + 1)
+            print(
+                f"[Phase5] rate limit for qid={question.get('id')} provider={provider} "
+                f"attempt={attempt + 1}/{retries}; retrying in {wait}s"
+            )
+            await asyncio.sleep(wait)
 
 async def rank_brand_in_ai(url: str, questions: list) -> dict:
     """
