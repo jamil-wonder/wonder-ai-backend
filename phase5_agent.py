@@ -3,6 +3,7 @@ import re
 import json
 import asyncio
 import httpx
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -35,6 +36,28 @@ PHASE5_MODEL_CALL_TIMEOUT_SEC = int(os.getenv("PHASE5_MODEL_CALL_TIMEOUT_SEC", "
 MAX_RETRIES = int(os.getenv("PHASE5_RATE_LIMIT_MAX_RETRIES", "3"))
 OPENAI_PHASE5_TIMEOUT_SEC = int(os.getenv("OPENAI_PHASE5_TIMEOUT_SEC", "18"))
 OPENAI_PHASE5_MAX_RETRIES = int(os.getenv("PHASE5_RATE_LIMIT_MAX_RETRIES_OPENAI", "2"))
+PERPLEXITY_PHASE5_TIMEOUT_SEC = int(os.getenv("PERPLEXITY_PHASE5_TIMEOUT_SEC", "22"))
+PERPLEXITY_PHASE5_MAX_RETRIES = int(os.getenv("PHASE5_RATE_LIMIT_MAX_RETRIES_PERPLEXITY", "2"))
+
+PHASE5_CONTEXT_FETCH_TIMEOUT_SEC = float(os.getenv("PHASE5_CONTEXT_FETCH_TIMEOUT_SEC", "8"))
+PHASE5_CONTEXT_CACHE_TTL_SEC = int(os.getenv("PHASE5_CONTEXT_CACHE_TTL_SEC", "900"))
+_PAGE_CONTEXT_CACHE: dict[str, dict] = {}
+_PROVIDER_STARTED_ONCE: set[str] = set()
+_PROVIDER_HEALTHY_ONCE: set[str] = set()
+
+
+def _log_provider_started_once(provider: str, model: str) -> None:
+    key = f"{provider}:{model}"
+    if key not in _PROVIDER_STARTED_ONCE:
+        print(f"[Phase5][{provider}] model={model} started")
+        _PROVIDER_STARTED_ONCE.add(key)
+
+
+def _log_provider_healthy_once(provider: str, model: str, elapsed_sec: float) -> None:
+    key = f"{provider}:{model}"
+    if key not in _PROVIDER_HEALTHY_ONCE:
+        print(f"[Phase5][{provider}] model={model} healthy (first success in {elapsed_sec:.2f}s)")
+        _PROVIDER_HEALTHY_ONCE.add(key)
 
 
 class Phase5RateLimitError(RuntimeError):
@@ -101,6 +124,166 @@ def _extract_domains_from_text(text: str) -> list[str]:
         if d and "vertexaisearch.cloud.google.com" not in d:
             clean.append(d)
     return list(dict.fromkeys(clean))
+
+
+def _normalize_url(url: str) -> str:
+    value = str(url or "").strip()
+    if not value:
+        return ""
+    if not re.match(r"^https?://", value, re.I):
+        value = f"https://{value}"
+    return value
+
+
+def _extract_text_value(node) -> str:
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node.strip()
+    if isinstance(node, list):
+        for item in node:
+            text = _extract_text_value(item)
+            if text:
+                return text
+    if isinstance(node, dict):
+        for key in ["name", "text", "value", "description"]:
+            text = _extract_text_value(node.get(key))
+            if text:
+                return text
+    return ""
+
+
+async def _fetch_page_context(url: str) -> dict:
+    """Fast lightweight HTTP fetch to extract business context for question generation."""
+    normalized_url = _normalize_url(url)
+    empty = {
+        "name": "",
+        "description": "",
+        "category": "",
+        "location": "",
+        "services": [],
+    }
+    if not normalized_url:
+        return empty
+
+    now = asyncio.get_running_loop().time()
+    cached = _PAGE_CONTEXT_CACHE.get(normalized_url)
+    if cached and isinstance(cached.get("expires_at"), (int, float)) and cached["expires_at"] > now:
+        return dict(cached.get("ctx") or empty)
+
+    ctx = dict(empty)
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; WonderBot/1.0)"}
+        timeout = max(3.0, PHASE5_CONTEXT_FETCH_TIMEOUT_SEC)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            resp = await client.get(normalized_url, headers=headers)
+            if resp.status_code >= 400:
+                _PAGE_CONTEXT_CACHE[normalized_url] = {
+                    "ctx": ctx,
+                    "expires_at": now + PHASE5_CONTEXT_CACHE_TTL_SEC,
+                }
+                return ctx
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        title = soup.find("title")
+        if title:
+            ctx["name"] = title.get_text(strip=True)[:100]
+
+        og_site = soup.find("meta", property="og:site_name")
+        if og_site and og_site.get("content"):
+            ctx["name"] = str(og_site.get("content", "")).strip()[:100]
+
+        meta_desc = soup.find("meta", attrs={"name": "description"})
+        if meta_desc and meta_desc.get("content"):
+            ctx["description"] = str(meta_desc.get("content", "")).strip()[:300]
+
+        for script in soup.find_all("script", type="application/ld+json"):
+            raw = (script.string or script.get_text() or "").strip()
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+
+            json_objects = data if isinstance(data, list) else [data]
+            for item in json_objects:
+                if not isinstance(item, dict):
+                    continue
+
+                if not ctx["name"]:
+                    ctx["name"] = _extract_text_value(item.get("name"))[:100]
+                if not ctx["description"]:
+                    ctx["description"] = _extract_text_value(item.get("description"))[:300]
+                if not ctx["category"]:
+                    ctx["category"] = _extract_text_value(item.get("@type"))[:60]
+
+                if not ctx["location"]:
+                    address = item.get("address", {})
+                    if isinstance(address, dict):
+                        locality = _extract_text_value(address.get("addressLocality"))
+                        region = _extract_text_value(address.get("addressRegion"))
+                        ctx["location"] = (locality or region)[:60]
+
+                if not ctx["services"]:
+                    services: list[str] = []
+                    offer_catalog = item.get("hasOfferCatalog", {})
+                    if isinstance(offer_catalog, dict):
+                        elems = offer_catalog.get("itemListElement", [])
+                        if isinstance(elems, list):
+                            for elem in elems[:12]:
+                                if isinstance(elem, dict):
+                                    service_name = _extract_text_value(elem.get("name"))
+                                    if service_name:
+                                        services.append(service_name)
+
+                    makes_offer = item.get("makesOffer", [])
+                    if isinstance(makes_offer, list):
+                        for offer in makes_offer[:12]:
+                            if isinstance(offer, dict):
+                                offered = offer.get("itemOffered")
+                                name = _extract_text_value(offered if isinstance(offered, dict) else offer)
+                                if name:
+                                    services.append(name)
+
+                    seen = set()
+                    clean_services = []
+                    for service in services:
+                        token = service.strip()
+                        key = token.lower()
+                        if token and key not in seen:
+                            seen.add(key)
+                            clean_services.append(token[:60])
+                    ctx["services"] = clean_services[:8]
+
+        # Fallback signals when JSON-LD is sparse or missing.
+        if not ctx["name"]:
+            h1 = soup.find("h1")
+            if h1:
+                ctx["name"] = h1.get_text(" ", strip=True)[:100]
+
+        if not ctx["description"]:
+            p = soup.find("p")
+            if p:
+                ctx["description"] = p.get_text(" ", strip=True)[:300]
+
+        if not ctx["services"]:
+            headings = []
+            for tag in soup.find_all(["h2", "h3"], limit=20):
+                text = tag.get_text(" ", strip=True)
+                if text and 3 <= len(text) <= 60:
+                    headings.append(text)
+            ctx["services"] = list(dict.fromkeys(headings))[:6]
+
+    except Exception as e:
+        print(f"[Phase5] context fetch failed for {normalized_url}: {e}")
+
+    _PAGE_CONTEXT_CACHE[normalized_url] = {
+        "ctx": ctx,
+        "expires_at": now + PHASE5_CONTEXT_CACHE_TTL_SEC,
+    }
+    return ctx
 
 
 def _extract_grounding_signals(response, target_domain: str) -> tuple[list[str], list[str], bool, int | None]:
@@ -320,6 +503,13 @@ def get_openai_api_key() -> str:
     return api_key
 
 
+def get_perplexity_api_key() -> str:
+    api_key = os.getenv("PERPLEXITY_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("PERPLEXITY_API_KEY environment variable not set")
+    return api_key
+
+
 async def _call_openai_chat_json(prompt: str, timeout_sec: int | None = None) -> dict | None:
     api_key = get_openai_api_key()
     model = (os.getenv("OPENAI_MODEL_PHASE5") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
@@ -344,7 +534,7 @@ async def _call_openai_chat_json(prompt: str, timeout_sec: int | None = None) ->
 
     try:
         started = asyncio.get_running_loop().time()
-        print(f"[Phase5][OpenAI] model={model} request started")
+        _log_provider_started_once("OpenAI", model)
         async with httpx.AsyncClient(timeout=effective_timeout) as client:
             response = await client.post(
                 "https://api.openai.com/v1/chat/completions",
@@ -364,7 +554,7 @@ async def _call_openai_chat_json(prompt: str, timeout_sec: int | None = None) ->
         )
         parsed = _safe_json_parse(text)
         elapsed = asyncio.get_running_loop().time() - started
-        print(f"[Phase5][OpenAI] model={model} success in {elapsed:.2f}s")
+        _log_provider_healthy_once("OpenAI", model, elapsed)
         return parsed if isinstance(parsed, dict) else {}
     except Phase5RateLimitError:
         raise
@@ -373,10 +563,80 @@ async def _call_openai_chat_json(prompt: str, timeout_sec: int | None = None) ->
             raise Phase5RateLimitError("OpenAI rate limit reached. Please retry shortly.") from e
         try:
             elapsed = asyncio.get_running_loop().time() - started
-            print(f"[Phase5][OpenAI] model={model} failed in {elapsed:.2f}s error={type(e).__name__}")
+            print(f"[Phase5][OpenAI] model={model} failed in {elapsed:.2f}s: {type(e).__name__}")
         except Exception:
             pass
-        print(f"[Phase5][OpenAI] call failed: {type(e).__name__}: {e}")
+        print(f"[Phase5][OpenAI] call failed: {e}")
+        return None
+
+
+async def _call_perplexity_chat_json(prompt: str, timeout_sec: int | None = None) -> dict | None:
+    api_key = get_perplexity_api_key()
+    model = (os.getenv("PERPLEXITY_MODEL_PHASE5") or "sonar-pro").strip()
+    preset = (os.getenv("PERPLEXITY_PRESET_PHASE5") or "fast-search").strip()
+    effective_timeout = max(8, timeout_sec if isinstance(timeout_sec, int) else PERPLEXITY_PHASE5_TIMEOUT_SEC)
+
+    payload = {
+        "model": model,
+        "preset": preset,
+        "input": prompt,
+    }
+
+    try:
+        started = asyncio.get_running_loop().time()
+        _log_provider_started_once("Perplexity", model)
+        async with httpx.AsyncClient(timeout=effective_timeout) as client:
+            response = await client.post(
+                "https://api.perplexity.ai/v1/responses",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        if response.status_code == 429:
+            raise Phase5RateLimitError("Perplexity rate limit reached. Please retry shortly.")
+        response.raise_for_status()
+        body = response.json()
+
+        text = ""
+        if isinstance(body, dict):
+            text = str(body.get("output_text") or "")
+            if not text:
+                output = body.get("output")
+                if isinstance(output, list):
+                    parts = []
+                    for item in output:
+                        if isinstance(item, dict):
+                            content = item.get("content")
+                            if isinstance(content, list):
+                                for c in content:
+                                    if isinstance(c, dict) and c.get("type") == "output_text":
+                                        t = c.get("text")
+                                        if isinstance(t, str) and t.strip():
+                                            parts.append(t)
+                            elif isinstance(content, str) and content.strip():
+                                parts.append(content)
+                    text = "\n".join(parts).strip()
+
+            if not text:
+                text = str(body.get("text") or "")
+
+        parsed = _safe_json_parse(text)
+        elapsed = asyncio.get_running_loop().time() - started
+        _log_provider_healthy_once("Perplexity", model, elapsed)
+        return parsed if isinstance(parsed, dict) else {}
+    except Phase5RateLimitError:
+        raise
+    except Exception as e:
+        if _is_rate_limited_error(e):
+            raise Phase5RateLimitError("Perplexity rate limit reached. Please retry shortly.") from e
+        try:
+            elapsed = asyncio.get_running_loop().time() - started
+            print(f"[Phase5][Perplexity] model={model} failed in {elapsed:.2f}s: {type(e).__name__}")
+        except Exception:
+            pass
+        print(f"[Phase5][Perplexity] call failed: {e}")
         return None
 
 
@@ -388,25 +648,51 @@ async def _call_openai_with_retry(prompt: str, retry_once: bool = True, timeout_
         return None
     return await _call_openai_chat_json(prompt, timeout_sec=timeout_sec)
 
+
+async def _call_perplexity_with_retry(prompt: str, retry_once: bool = True, timeout_sec: int | None = None) -> dict | None:
+    first = await _call_perplexity_chat_json(prompt, timeout_sec=timeout_sec)
+    if first is not None:
+        return first
+    if not retry_once:
+        return None
+    return await _call_perplexity_chat_json(prompt, timeout_sec=timeout_sec)
+
 async def generate_brand_questions(url: str) -> list[str]:
     """
     Generate 20 realistic user-like search questions for a target domain.
     """
     client = get_client()
+    ctx = await _fetch_page_context(url)
+    lines = []
+    if ctx.get("name"):
+        lines.append(f"Business name: {ctx['name']}")
+    if ctx.get("category"):
+        lines.append(f"Business type: {ctx['category']}")
+    if ctx.get("location"):
+        lines.append(f"Location: {ctx['location']}")
+    if ctx.get("description"):
+        lines.append(f"Description: {str(ctx['description'])[:200]}")
+    services = ctx.get("services") or []
+    if isinstance(services, list) and services:
+        lines.append(f"Services: {', '.join([str(s) for s in services[:8]])}")
+    lines.append(f"Website: {_normalize_url(url) or url}")
+    context_block = "\n".join(lines)
+
     base_prompt = f"""
     You are a senior search-intent strategist.
-    Target website: '{url}'. Infer business type, core services, and typical customer intent.
+    Business context:
+    {context_block}
 
-    Generate exactly 20 natural user search queries that real users would type.
+    Generate exactly 20 natural search queries real customers would type.
 
     Requirements:
-    - Every query must be clearly about the target's business category and services inferred from the URL.
-    - Each query should be plausible for a customer who might reasonably be shown the target brand.
-    - Include intent diversity: discovery, comparison, trust, pricing, service fit, urgency.
-    - Mix short and long-tail phrasing.
-    - Queries must be realistic and conversational.
-    - Do not repeat the same wording pattern.
-    - Avoid questions that directly include the exact domain unless natural.
+    - Cover intent diversity: discovery, comparison, trust, pricing, urgency, and location.
+    - Mix branded queries (business name) and non-branded queries.
+    - Include local intent queries when location context exists.
+    - Keep queries conversational and realistic.
+    - Ensure queries are specific to the business category and services in the context.
+    - Avoid repetitive wording patterns.
+    - Avoid directly including the raw domain unless naturally phrased.
 
     Return ONLY valid JSON with this schema:
     {{
@@ -910,6 +1196,136 @@ async def _analyze_single_question_openai(url: str, question: dict, include_comp
     }
 
 
+async def _analyze_single_question_perplexity(url: str, question: dict, include_competitors: bool = False) -> dict:
+    domain_match = re.search(r'(?:https?://)?(?:www\.)?([^/]+)', url)
+    raw_domain = domain_match.group(1).lower() if domain_match else url.lower()
+    domain = _normalize_domain(raw_domain)
+
+    prompt = f"""
+    Analyze this user-intent query for brand visibility using web-aware reasoning.
+
+    Query: '{question['text']}'
+    Target domain: '{domain}'
+
+    Return strict JSON only with this schema:
+    {{
+      "target": {{
+        "mentioned": true or false,
+        "position": <1-10 or null>,
+        "source_domains": ["domain.com"]
+      }},
+      "references": ["domain1.com", "domain2.com"],
+      "idea_candidates": ["competitor.com"],
+      "ranked_competitors": [
+        {{"domain": "competitor.com", "position": 1, "evidence": "short reason"}}
+      ],
+      "reasoning": "1 short sentence"
+    }}
+
+    Rules:
+    - Keep lists short and realistic.
+    - Never use the target domain as a source or reference.
+    - Sources/references must be third-party domains only.
+    - Do not include target domain in competitors.
+    - position must be 1..10 or null.
+    - JSON only.
+    """
+
+    data = await _call_perplexity_with_retry(
+        prompt,
+        retry_once=True,
+        timeout_sec=PERPLEXITY_PHASE5_TIMEOUT_SEC,
+    )
+    if not isinstance(data, dict):
+        data = {}
+
+    target = data.get("target", {}) if isinstance(data, dict) else {}
+    target_mentioned = bool(target.get("mentioned", False)) if isinstance(target, dict) else False
+    raw_position = target.get("position") if isinstance(target, dict) else None
+    position = raw_position if isinstance(raw_position, int) and 1 <= raw_position <= 10 else None
+
+    raw_sources = target.get("source_domains", []) if isinstance(target, dict) else []
+    if not isinstance(raw_sources, list):
+        raw_sources = []
+    clean_sources = []
+    for s in raw_sources:
+        d = _normalize_domain(s)
+        if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+            clean_sources.append(d)
+
+    raw_references = data.get("references", []) if isinstance(data, dict) else []
+    if not isinstance(raw_references, list):
+        raw_references = []
+    clean_references = []
+    for r in raw_references:
+        d = _normalize_domain(r)
+        if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+            clean_references.append(d)
+
+    idea_candidates: list[str] = []
+    raw_ideas = data.get("idea_candidates", []) if isinstance(data, dict) else []
+    if isinstance(raw_ideas, list):
+        for item in raw_ideas:
+            d = _normalize_domain(item)
+            if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+                idea_candidates.append(d)
+
+    competitor_scores = []
+    competitors = []
+    if include_competitors:
+        raw_ranked = data.get("ranked_competitors", []) if isinstance(data, dict) else []
+        if isinstance(raw_ranked, list):
+            for item in raw_ranked[:5]:
+                if not isinstance(item, dict):
+                    continue
+                c_domain = _normalize_domain(item.get("domain", ""))
+                c_pos = item.get("position")
+                if (
+                    not c_domain
+                    or c_domain == domain
+                    or c_domain in NON_COMPETITOR_DOMAINS
+                    or not isinstance(c_pos, int)
+                    or c_pos < 1
+                    or c_pos > 10
+                ):
+                    continue
+                score = max(0, min(100, 110 - (c_pos * 10)))
+                competitor_scores.append(
+                    {
+                        "domain": c_domain,
+                        "position": c_pos,
+                        "score": score,
+                        "evidence": str(item.get("evidence", "")).strip()[:180],
+                    }
+                )
+        competitors = [c["domain"] for c in competitor_scores]
+
+    clean_sources = list(dict.fromkeys(clean_sources))
+    clean_references = list(dict.fromkeys(clean_references))
+    idea_candidates = list(dict.fromkeys(idea_candidates))[:12]
+
+    has_external_evidence = len(clean_sources) > 0 or len(clean_references) > 0
+    if not has_external_evidence:
+        target_mentioned = False
+        position = None
+
+    status = "Mentioned" if (target_mentioned or position is not None) else "Not Mentioned"
+    reasoning = str(data.get("reasoning", "")).strip() if isinstance(data, dict) else ""
+
+    return {
+        "id": question["id"],
+        "status": status,
+        "position": position,
+        "sources": clean_sources[:30],
+        "source_urls": [],
+        "references": clean_references[:30],
+        "idea_candidates": idea_candidates,
+        "competitors": competitors[:5],
+        "competitor_scores": competitor_scores[:5],
+        "reasoning": reasoning or None,
+    }
+
+
 async def analyze_single_question(
     url: str,
     question: dict,
@@ -923,6 +1339,12 @@ async def analyze_single_question(
     normalized_provider = str(model_provider or "gemini").strip().lower()
     if normalized_provider == "openai":
         return await _analyze_single_question_openai(
+            url=url,
+            question=question,
+            include_competitors=include_competitors,
+        )
+    if normalized_provider == "perplexity":
+        return await _analyze_single_question_perplexity(
             url=url,
             question=question,
             include_competitors=include_competitors,
@@ -1445,7 +1867,12 @@ async def _run_with_backoff(
 ) -> dict:
     """Wrap analyze_single_question with exponential backoff for provider rate limits."""
     provider = str(model_provider or "gemini").strip().lower()
-    retries = max(1, OPENAI_PHASE5_MAX_RETRIES if provider == "openai" else MAX_RETRIES)
+    if provider == "openai":
+        retries = max(1, OPENAI_PHASE5_MAX_RETRIES)
+    elif provider == "perplexity":
+        retries = max(1, PERPLEXITY_PHASE5_MAX_RETRIES)
+    else:
+        retries = max(1, MAX_RETRIES)
     for attempt in range(retries):
         try:
             return await analyze_single_question(

@@ -5,8 +5,9 @@ import sys
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordBearer
 from bson import ObjectId
 from models import ScrapeRequest, ScrapeResult, AiInsightsRequest, AiInsightsResult, WishlistRequest, TrackUrlRequest
@@ -91,6 +92,7 @@ PHASE5_JOB_PARALLELISM = max(1, min(8, int(os.getenv("PHASE5_JOB_PARALLELISM", "
 PHASE5_MODEL_MAX_THREADS = max(4, min(16, int(os.getenv("PHASE5_MODEL_MAX_THREADS", "8"))))
 PHASE5_QUESTION_TIMEOUT_GEMINI_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_GEMINI_SEC", "140"))
 PHASE5_QUESTION_TIMEOUT_OPENAI_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_OPENAI_SEC", "40"))
+PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC", "45"))
 PHASE5_STALE_RUNNING_SECONDS = int(os.getenv("PHASE5_STALE_RUNNING_SECONDS", "120"))
 PHASE5_RECOVER_STALE_RUNNING = str(os.getenv("PHASE5_RECOVER_STALE_RUNNING", "false")).strip().lower() == "true"
 PHASE5_STALE_QUEUED_SECONDS = int(os.getenv("PHASE5_STALE_QUEUED_SECONDS", "1800"))
@@ -99,6 +101,7 @@ PHASE5_WORKER_ID = f"{os.getenv('HOSTNAME', 'local')}-{uuid.uuid4().hex[:8]}"
 PHASE5_REDIS_URL = os.getenv("REDIS_URL", "").strip()
 PHASE5_REDIS_QUEUE_KEY = os.getenv("PHASE5_REDIS_QUEUE_KEY", "phase5:jobs:queue")
 PHASE5_CACHE_REUSE_SECONDS = int(os.getenv("PHASE5_CACHE_REUSE_SECONDS", "21600"))
+PHASE5_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
 if allowed_origins_env.strip():
@@ -224,6 +227,8 @@ async def _log_ai_usage_event(event: dict):
                 or os.getenv("OPENAI_MODEL")
                 or "gpt-4o-mini"
             ).strip()
+        if not model_name and model_provider == "perplexity":
+            model_name = (os.getenv("PERPLEXITY_MODEL_PHASE5") or "sonar-pro").strip()
 
         model_family = payload.get("model_family")
         lowered_model = str(model_name or "").lower()
@@ -232,6 +237,8 @@ async def _log_ai_usage_event(event: dict):
                 model_family = "gemini"
             elif model_provider == "openai":
                 model_family = "gpt"
+            elif model_provider == "perplexity":
+                model_family = "perplexity"
             elif "gemini" in lowered_model:
                 model_family = "gemini"
             elif any(tag in lowered_model for tag in ["gpt", "o1", "o3", "o4"]):
@@ -1057,11 +1064,12 @@ async def _process_phase5_job(job_doc: dict):
                 )
 
                 provider_for_q = str(job_doc.get("model", "gemini") or "gemini").strip().lower()
-                per_question_timeout = (
-                    PHASE5_QUESTION_TIMEOUT_OPENAI_SEC
-                    if provider_for_q == "openai"
-                    else PHASE5_QUESTION_TIMEOUT_GEMINI_SEC
-                )
+                if provider_for_q == "openai":
+                    per_question_timeout = PHASE5_QUESTION_TIMEOUT_OPENAI_SEC
+                elif provider_for_q == "perplexity":
+                    per_question_timeout = PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC
+                else:
+                    per_question_timeout = PHASE5_QUESTION_TIMEOUT_GEMINI_SEC
 
                 try:
                     result = await asyncio.wait_for(
@@ -1548,7 +1556,8 @@ async def _phase5_worker_startup():
     print(
         f"[Phase5] startup workers={max(1, PHASE5_WORKER_CONCURRENCY)} "
         f"parallelism={PHASE5_JOB_PARALLELISM} timeout_gemini={PHASE5_QUESTION_TIMEOUT_GEMINI_SEC}s "
-        f"timeout_openai={PHASE5_QUESTION_TIMEOUT_OPENAI_SEC}s"
+        f"timeout_openai={PHASE5_QUESTION_TIMEOUT_OPENAI_SEC}s "
+        f"timeout_perplexity={PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC}s"
     )
     app.state.phase5_worker_tasks = [
         asyncio.create_task(_phase5_worker_loop())
@@ -1593,7 +1602,7 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
         if not questions_dicts:
             raise HTTPException(status_code=400, detail="questions cannot be empty")
         model_provider = str(req.model or "gemini").strip().lower()
-        if model_provider not in {"gemini", "openai"}:
+        if model_provider not in {"gemini", "openai", "perplexity"}:
             raise HTTPException(status_code=400, detail="unsupported model provider")
 
         request_hash = _phase5_request_hash(
@@ -1616,7 +1625,7 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
             "request_hash": request_hash,
             "job_type": "core",
             "model": model_provider,
-            "queue_priority": 0 if model_provider == "openai" else 1,
+            "queue_priority": 0 if model_provider in {"openai", "perplexity"} else 1,
             "url": req.url,
             "user_id": current_user.get("id") if current_user else None,
             "user_email": current_user.get("email") if current_user else None,
@@ -1678,7 +1687,7 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
         if not questions_dicts:
             raise HTTPException(status_code=400, detail="questions cannot be empty")
         model_provider = str(req.model or "gemini").strip().lower()
-        if model_provider not in {"gemini", "openai"}:
+        if model_provider not in {"gemini", "openai", "perplexity"}:
             raise HTTPException(status_code=400, detail="unsupported model provider")
 
         request_hash = _phase5_request_hash(
@@ -1702,7 +1711,7 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
             "request_hash": request_hash,
             "job_type": "deep",
             "model": model_provider,
-            "queue_priority": 0 if model_provider == "openai" else 1,
+            "queue_priority": 0 if model_provider in {"openai", "perplexity"} else 1,
             "url": req.url,
             "user_id": current_user.get("id") if current_user else None,
             "user_email": current_user.get("email") if current_user else None,
@@ -1774,6 +1783,91 @@ async def api_phase5_job_status(job_id: str):
         "brand_summary": job.get("brand_summary"),
         "error": job.get("error"),
     }
+
+
+@app.get("/api/phase5/job-stream/{job_id}")
+async def api_phase5_job_stream(job_id: str, request: Request):
+    """Stream Phase 5 job progress via Server-Sent Events."""
+    if phase5_jobs_col is None:
+        raise HTTPException(status_code=503, detail="phase5 job storage unavailable")
+
+    async def _event_generator():
+        last_processed = -1
+        last_status = ""
+        idle_ticks = 0
+        heartbeat_ticks = 0
+
+        while True:
+            if await request.is_disconnected():
+                return
+
+            job = await phase5_jobs_col.find_one(
+                {"job_id": job_id},
+                {
+                    "_id": 0,
+                    "job_id": 1,
+                    "status": 1,
+                    "processed": 1,
+                    "total": 1,
+                    "current_question_id": 1,
+                    "results": 1,
+                    "deep_competitors": 1,
+                    "brand_summary": 1,
+                    "provider_scores": 1,
+                    "error": 1,
+                },
+            )
+
+            if not job:
+                yield 'event: error\ndata: {"error":"job not found"}\n\n'
+                return
+
+            processed = int(job.get("processed", 0) or 0)
+            status = str(job.get("status", "") or "")
+
+            if processed != last_processed or status != last_status:
+                payload = {
+                    "job_id": job_id,
+                    "status": status,
+                    "processed": processed,
+                    "total": int(job.get("total", 0) or 0),
+                    "current_question_id": job.get("current_question_id"),
+                    "results": job.get("results", {}),
+                    "provider_scores": job.get("provider_scores", {}),
+                    "brand_summary": job.get("brand_summary"),
+                    "deep_competitors": job.get("deep_competitors", []),
+                    "error": job.get("error"),
+                }
+                yield f"data: {json.dumps(payload, default=str)}\n\n"
+                last_processed = processed
+                last_status = status
+                idle_ticks = 0
+                heartbeat_ticks = 0
+            else:
+                idle_ticks += 1
+                heartbeat_ticks += 1
+                if heartbeat_ticks >= 30:
+                    # SSE comment heartbeat keeps proxies/load balancers from closing the stream.
+                    yield ": keep-alive\n\n"
+                    heartbeat_ticks = 0
+
+            if status in PHASE5_TERMINAL_STATUSES:
+                return
+
+            if idle_ticks >= 600:
+                return
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/phase5/stop-job/{job_id}")
