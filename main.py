@@ -130,7 +130,7 @@ try:
     phase5_jobs_col = db.get_collection("phase5_jobs")
     ai_usage_col = db.get_collection("ai_usage_events")
 except Exception as e:
-    print(f"[API] Error connecting to MongoDB: {e}")
+    print(f"[API] Error connecting to MongoDB: {type(e).__name__}")
 
 app.add_middleware(
     CORSMiddleware,

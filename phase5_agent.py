@@ -577,10 +577,14 @@ async def _call_perplexity_chat_json(prompt: str, timeout_sec: int | None = None
     effective_timeout = max(8, timeout_sec if isinstance(timeout_sec, int) else PERPLEXITY_PHASE5_TIMEOUT_SEC)
 
     payload = {
-        "model": model,
-        "preset": preset,
         "input": prompt,
     }
+    # Perplexity Responses API supports preset-based agent flows. If preset is present,
+    # prefer it and avoid mixing with explicit model to prevent compatibility drift.
+    if preset:
+        payload["preset"] = preset
+    elif model:
+        payload["model"] = model
 
     try:
         started = asyncio.get_running_loop().time()
@@ -600,6 +604,7 @@ async def _call_perplexity_chat_json(prompt: str, timeout_sec: int | None = None
         body = response.json()
 
         text = ""
+        citation_domains: list[str] = []
         if isinstance(body, dict):
             text = str(body.get("output_text") or "")
             if not text:
@@ -611,7 +616,7 @@ async def _call_perplexity_chat_json(prompt: str, timeout_sec: int | None = None
                             content = item.get("content")
                             if isinstance(content, list):
                                 for c in content:
-                                    if isinstance(c, dict) and c.get("type") == "output_text":
+                                    if isinstance(c, dict):
                                         t = c.get("text")
                                         if isinstance(t, str) and t.strip():
                                             parts.append(t)
@@ -622,10 +627,39 @@ async def _call_perplexity_chat_json(prompt: str, timeout_sec: int | None = None
             if not text:
                 text = str(body.get("text") or "")
 
+            # Capture citation/source URLs when the model ignores JSON schema and returns normal search output.
+            citations = body.get("citations")
+            if isinstance(citations, list):
+                for u in citations:
+                    d = _normalize_domain(str(u))
+                    if d:
+                        citation_domains.append(d)
+
+            search_results = body.get("search_results")
+            if isinstance(search_results, list):
+                for item in search_results:
+                    if isinstance(item, dict):
+                        d = _normalize_domain(str(item.get("url") or ""))
+                        if d:
+                            citation_domains.append(d)
+
+            web_results = body.get("web_results")
+            if isinstance(web_results, list):
+                for item in web_results:
+                    if isinstance(item, dict):
+                        d = _normalize_domain(str(item.get("url") or ""))
+                        if d:
+                            citation_domains.append(d)
+
         parsed = _safe_json_parse(text)
         elapsed = asyncio.get_running_loop().time() - started
         _log_provider_healthy_once("Perplexity", model, elapsed)
-        return parsed if isinstance(parsed, dict) else {}
+        parsed_dict = parsed if isinstance(parsed, dict) else {}
+        if citation_domains:
+            parsed_dict["_meta_source_domains"] = list(dict.fromkeys(citation_domains))
+        if text:
+            parsed_dict["_meta_response_text"] = text[:4000]
+        return parsed_dict
     except Phase5RateLimitError:
         raise
     except Exception as e:
@@ -1303,6 +1337,22 @@ async def _analyze_single_question_perplexity(url: str, question: dict, include_
     clean_sources = list(dict.fromkeys(clean_sources))
     clean_references = list(dict.fromkeys(clean_references))
     idea_candidates = list(dict.fromkeys(idea_candidates))[:12]
+
+    # Fallback evidence path when Perplexity returns normal search output instead of strict JSON schema.
+    meta_sources = data.get("_meta_source_domains", []) if isinstance(data, dict) else []
+    if isinstance(meta_sources, list):
+        for s in meta_sources:
+            d = _normalize_domain(str(s))
+            if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+                clean_sources.append(d)
+        clean_sources = list(dict.fromkeys(clean_sources))
+
+    if position is None and clean_sources:
+        position = 3
+
+    response_text = str(data.get("_meta_response_text", "") if isinstance(data, dict) else "").lower()
+    if not target_mentioned and domain and domain in response_text:
+        target_mentioned = True
 
     has_external_evidence = len(clean_sources) > 0 or len(clean_references) > 0
     if not has_external_evidence:
