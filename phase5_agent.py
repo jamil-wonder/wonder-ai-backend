@@ -695,7 +695,6 @@ async def generate_brand_questions(url: str) -> list[str]:
     """
     Generate 20 realistic user-like search questions for a target domain.
     """
-    client = get_client()
     ctx = await _fetch_page_context(url)
     lines = []
     if ctx.get("name"):
@@ -736,31 +735,26 @@ async def generate_brand_questions(url: str) -> list[str]:
 
     response = None
     for _ in range(3):
-        response = await _call_gemini_with_retry(
-            client,
+        response = await _call_perplexity_with_retry(
             base_prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.2,
-                top_p=0.95,
-                max_output_tokens=2500,
-            ),
+            retry_once=True,
+            timeout_sec=PERPLEXITY_PHASE5_TIMEOUT_SEC,
         )
         if response is not None:
             break
         await asyncio.sleep(0.5)
 
     if response is None:
-        raise RuntimeError("Failed to generate brand questions from Gemini. Please retry.")
+        raise RuntimeError("Failed to generate brand questions from Perplexity. Please retry.")
 
     try:
-        cleaned_text = response.text.strip()
-        if cleaned_text.startswith("```json"):
-            cleaned_text = cleaned_text[7:]
-        if cleaned_text.endswith("```"):
-            cleaned_text = cleaned_text[:-3]
+        parsed = response if isinstance(response, dict) else {}
+        if not isinstance(parsed.get("queries"), list):
+            fallback_text = str(parsed.get("_meta_response_text") or "")
+            maybe = _safe_json_parse(fallback_text)
+            if isinstance(maybe, dict):
+                parsed = maybe
 
-        parsed = json.loads(cleaned_text.strip())
         if isinstance(parsed, dict) and isinstance(parsed.get("queries"), list):
             questions = parsed.get("queries", [])
         elif isinstance(parsed, list):
@@ -781,18 +775,19 @@ async def generate_brand_questions(url: str) -> list[str]:
             cleaned.append(text if text.endswith("?") else f"{text}?")
 
         if len(cleaned) < 12:
-            raise ValueError("Gemini returned too few valid, relevant queries.")
+            raise ValueError("Perplexity returned too few valid, relevant queries.")
 
         return cleaned[:20]
     except Exception as e:
-        print(f"Error parsing Gemini response: {e}, Response: {response.text}")
+        response_text = str(response.get("_meta_response_text") if isinstance(response, dict) else "")
+        print(f"Error parsing Perplexity response: {e}")
         q_list = [
             line.strip("- *1234567890. ")
-            for line in response.text.split("\n")
+            for line in response_text.split("\n")
             if len(line) > 10 and "?" in line
         ]
         if len(q_list) < 12:
-            raise ValueError("Gemini response parsing failed; insufficient relevant queries.")
+            raise ValueError("Perplexity response parsing failed; insufficient relevant queries.")
         return q_list[:20]
 
 
@@ -857,7 +852,6 @@ async def generate_brand_perception_summary(
         return visibility_line + rank_line + ref_line
 
     try:
-        client = get_client()
         domain = _normalize_domain(url)
 
         compact_items = []
@@ -894,20 +888,14 @@ async def generate_brand_perception_summary(
         - Output plain text only.
         """
 
-        response = await _call_gemini_with_retry(
-            client,
+        response = await _call_perplexity_with_retry(
             prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.25,
-                top_p=0.95,
-                max_output_tokens=320,
-            ),
             retry_once=False,
             timeout_sec=8,
         )
         if response is None:
             return _build_quick_summary()
-        text = (response.text or "").strip()
+        text = str((response.get("_meta_response_text") if isinstance(response, dict) else "") or "").strip()
         text = re.sub(r"\s+", " ", text)
         if not text:
             return _build_quick_summary()
@@ -922,7 +910,6 @@ async def generate_deep_competitor_scores(
     seed_results: dict,
 ) -> list[dict]:
     """Generate competitor scores in one aggregate pass using ideas collected during core analysis."""
-    client = get_client()
     domain = _normalize_domain(url)
 
     candidate_counts: dict[str, int] = {}
@@ -969,23 +956,16 @@ async def generate_deep_competitor_scores(
             f"Use Google Search and list domains that appear for these intents: {probe_text}. "
             f"Target domain is {domain}. Return short text with domains only."
         )
-        probe_response = await _call_gemini_with_retry(
-            client,
+        probe_response = await _call_perplexity_with_retry(
             probe_prompt,
-            config=types.GenerateContentConfig(
-                tools=[{"google_search": {}}],
-                temperature=0.0,
-                top_p=0.9,
-                max_output_tokens=180,
-            ),
             retry_once=False,
             timeout_sec=8,
         )
         probe_domains = []
         if probe_response is not None:
-            probe_domains.extend(_extract_domains_from_text(probe_response.text or ""))
-            refs, _, _, _ = _extract_grounding_signals(probe_response, domain)
-            probe_domains.extend(refs)
+            if isinstance(probe_response, dict):
+                probe_domains.extend(probe_response.get("_meta_source_domains", []) or [])
+                probe_domains.extend(_extract_domains_from_text(str(probe_response.get("_meta_response_text") or "")))
         for d in probe_domains:
             nd = _normalize_domain(d)
             if nd and nd != domain and nd not in NON_COMPETITOR_DOMAINS:
@@ -1044,15 +1024,8 @@ async def generate_deep_competitor_scores(
     - JSON only.
     """
 
-    response = await _call_gemini_with_retry(
-        client,
+    response = await _call_perplexity_with_retry(
         prompt,
-        config=types.GenerateContentConfig(
-            tools=[{"google_search": {}}],
-            temperature=0.0,
-            top_p=0.9,
-            max_output_tokens=420,
-        ),
         retry_once=False,
         timeout_sec=10,
     )
@@ -1060,7 +1033,11 @@ async def generate_deep_competitor_scores(
     if response is None:
         return heuristic_scores
 
-    parsed = _safe_json_parse(response.text or "")
+    parsed = response if isinstance(response, dict) else {}
+    if not isinstance(parsed.get("competitors"), list):
+        maybe = _safe_json_parse(str(parsed.get("_meta_response_text") or "")) if isinstance(parsed, dict) else {}
+        if isinstance(maybe, dict):
+            parsed = maybe
     raw = parsed.get("competitors", []) if isinstance(parsed, dict) else []
     if not isinstance(raw, list):
         return heuristic_scores
@@ -1379,14 +1356,14 @@ async def _analyze_single_question_perplexity(url: str, question: dict, include_
 async def analyze_single_question(
     url: str,
     question: dict,
-    model_provider: str = "gemini",
+    model_provider: str = "perplexity",
     include_competitors: bool = False,
 ) -> dict:
     """
     Analyzes a single question using Gemini with Google Search Grounding.
     Returns status, position, sources, and competitors dynamically.
     """
-    normalized_provider = str(model_provider or "gemini").strip().lower()
+    normalized_provider = str(model_provider or "perplexity").strip().lower()
     if normalized_provider == "openai":
         return await _analyze_single_question_openai(
             url=url,
@@ -1912,11 +1889,11 @@ async def analyze_single_question(
 async def _run_with_backoff(
     url: str,
     question: dict,
-    model_provider: str = "gemini",
+    model_provider: str = "perplexity",
     include_competitors: bool = False,
 ) -> dict:
     """Wrap analyze_single_question with exponential backoff for provider rate limits."""
-    provider = str(model_provider or "gemini").strip().lower()
+    provider = str(model_provider or "perplexity").strip().lower()
     if provider == "openai":
         retries = max(1, OPENAI_PHASE5_MAX_RETRIES)
     elif provider == "perplexity":

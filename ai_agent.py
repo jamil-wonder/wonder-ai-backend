@@ -14,6 +14,68 @@ load_dotenv()
 client = genai.Client()
 
 
+def _perplexity_model_name() -> str:
+    return (os.getenv("PERPLEXITY_MODEL_PHASE1") or os.getenv("PERPLEXITY_MODEL_PHASE5") or "sonar-pro").strip()
+
+
+def _perplexity_api_key() -> str:
+    api_key = (os.getenv("PERPLEXITY_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("PERPLEXITY_API_KEY is not configured")
+    return api_key
+
+
+async def _perplexity_response_json(
+    *,
+    prompt: str,
+    timeout_seconds: int = 90,
+) -> tuple[dict, str]:
+    api_key = _perplexity_api_key()
+    model = _perplexity_model_name()
+    preset = (os.getenv("PERPLEXITY_PRESET_PHASE1") or os.getenv("PERPLEXITY_PRESET_PHASE5") or "fast-search").strip()
+
+    payload: dict = {"input": prompt}
+    if preset:
+        payload["preset"] = preset
+    else:
+        payload["model"] = model
+
+    async with httpx.AsyncClient(timeout=timeout_seconds) as http:
+        res = await http.post(
+            "https://api.perplexity.ai/v1/responses",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        res.raise_for_status()
+        data = res.json()
+
+    text = ""
+    if isinstance(data, dict):
+        text = str(data.get("output_text") or "")
+        if not text:
+            output = data.get("output")
+            if isinstance(output, list):
+                parts: list[str] = []
+                for item in output:
+                    if isinstance(item, dict):
+                        content = item.get("content")
+                        if isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict):
+                                    t = c.get("text")
+                                    if isinstance(t, str) and t.strip():
+                                        parts.append(t)
+                        elif isinstance(content, str) and content.strip():
+                            parts.append(content)
+                text = "\n".join(parts).strip()
+
+    parsed = _safe_json_parse(text)
+    return (parsed if isinstance(parsed, dict) else {}), "Perplexity"
+
+
 def _openai_model_name() -> str:
     return (os.getenv("OPENAI_MODEL_PHASE1") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
@@ -167,7 +229,7 @@ async def get_ai_insights(business_name: str, url: str) -> dict:
 
     You MUST respond in valid JSON format matching exactly this structure:
     {{
-        "modelName": "Gemini",
+        "modelName": "Perplexity",
         "isKnown": true or false,
         "summary": "3-4 sentences summarizing what is known.",
         "sentiment": "Positive" | "Neutral" | "Negative" | "Mixed" | "Unknown",
@@ -183,43 +245,28 @@ async def get_ai_insights(business_name: str, url: str) -> dict:
     """
 
     try:
-        response = await _generate_with_fallback_async(
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                tools=[{"google_search": {}}],
-                temperature=0.2,
-                top_p=0.95,
-                max_output_tokens=2048,
-            ),
+        parsed, model = await _perplexity_response_json(
+            prompt=prompt,
+            timeout_seconds=90,
         )
-        if response and response.text:
-            parsed = _safe_json_parse(response.text)
-            if isinstance(parsed, dict):
-                return _normalize_insight_payload(parsed, _model_used(response))
-            return _normalize_insight_payload({
-                "isKnown": False,
-                "summary": "Invalid data returned.",
-                "sentiment": "Unknown",
-                "platforms": [],
-                "evidence": [],
-            }, _model_used(response))
-        else:
-            return _normalize_insight_payload({
-                "isKnown": False,
-                "summary": "No data returned.",
-                "sentiment": "Unknown",
-                "platforms": [],
-                "evidence": [],
-            }, "Gemini")
+        if isinstance(parsed, dict) and parsed:
+            return _normalize_insight_payload(parsed, model)
+        return _normalize_insight_payload({
+            "isKnown": False,
+            "summary": "No data returned.",
+            "sentiment": "Unknown",
+            "platforms": [],
+            "evidence": [],
+        }, model)
     except Exception as e:
-        print(f"Error fetching AI insights: {e}")
+        print(f"Error fetching Perplexity insights: {e}")
         return _normalize_insight_payload({
             "isKnown": False,
             "summary": "Failed to fetch AI insights.",
             "sentiment": "Unknown",
             "platforms": [],
             "evidence": [],
-        }, "Gemini")
+        }, "Perplexity")
 
 
 async def get_ai_insights_openai(business_name: str, url: str) -> dict:
@@ -265,9 +312,9 @@ async def get_ai_insights_openai(business_name: str, url: str) -> dict:
 
 
 async def get_ai_insights_multi(business_name: str, url: str) -> list[dict]:
-    gemini_task = get_ai_insights(business_name, url)
+    perplexity_task = get_ai_insights(business_name, url)
     gpt_task = get_ai_insights_openai(business_name, url)
-    results = await asyncio.gather(gemini_task, gpt_task, return_exceptions=True)
+    results = await asyncio.gather(perplexity_task, gpt_task, return_exceptions=True)
     insights: list[dict] = []
     for r in results:
         if isinstance(r, dict):

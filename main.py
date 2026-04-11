@@ -558,7 +558,13 @@ async def api_ai_insights(request: AiInsightsRequest, current_user: dict = Depen
 
         for insight in insights:
             model_name = insight.get("modelName") if isinstance(insight, dict) else None
-            provider_hint = "openai" if isinstance(model_name, str) and any(k in model_name.lower() for k in ["gpt", "o1", "o3", "o4"]) else "gemini"
+            lowered_model = str(model_name or "").lower()
+            if any(k in lowered_model for k in ["gpt", "o1", "o3", "o4"]):
+                provider_hint = "openai"
+            elif any(k in lowered_model for k in ["pplx", "sonar", "perplexity"]):
+                provider_hint = "perplexity"
+            else:
+                provider_hint = "gemini"
             await _log_ai_usage_event({
                 "feature": "phase1_ai_insights",
                 "endpoint": "/api/ai-insights",
@@ -907,7 +913,7 @@ async def admin_clear_ai_usage(admin: dict = Depends(get_current_admin_user)):
 async def api_phase5_generate_questions(req: Phase5QuestionsRequest, current_user: dict = Depends(get_current_user_optional)):
     try:
         questions = await generate_brand_questions(req.url)
-        configured_model = (os.getenv("GEMINI_MODEL_PRIMARY") or os.getenv("GEMINI_MODEL") or "").strip() or None
+        configured_model = (os.getenv("PERPLEXITY_MODEL_PHASE5") or "sonar-pro").strip() or None
         await _log_ai_usage_event({
             "feature": "phase5_generate_questions",
             "endpoint": "/api/phase5/generate-questions",
@@ -915,7 +921,7 @@ async def api_phase5_generate_questions(req: Phase5QuestionsRequest, current_use
             "user_id": current_user.get("id") if current_user else None,
             "user_email": current_user.get("email") if current_user else None,
             "model_name": configured_model,
-            "model_provider": "gemini",
+            "model_provider": "perplexity",
             "ai_calls_estimate": 1,
             "details": {
                 "questions_count": len(questions or []),
@@ -931,8 +937,14 @@ async def api_phase5_analyze(req: Phase5AnalyzeRequest, current_user: dict = Dep
     try:
         # q.model_dump() turns the pydantic model into a dictionary
         questions_dicts = [q.model_dump() for q in req.questions]
-        results = await rank_brand_in_ai(req.url, questions_dicts)
-        configured_model = (os.getenv("GEMINI_MODEL_PRIMARY") or os.getenv("GEMINI_MODEL") or "").strip() or None
+        tasks = [_run_with_backoff(req.url, q, model_provider="perplexity") for q in questions_dicts]
+        response_items = await asyncio.gather(*tasks)
+        results = {
+            item["id"]: item
+            for item in response_items
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        configured_model = (os.getenv("PERPLEXITY_MODEL_PHASE5") or "sonar-pro").strip() or None
         await _log_ai_usage_event({
             "feature": "phase5_analyze_direct",
             "endpoint": "/api/phase5/analyze",
@@ -940,7 +952,7 @@ async def api_phase5_analyze(req: Phase5AnalyzeRequest, current_user: dict = Dep
             "user_id": current_user.get("id") if current_user else None,
             "user_email": current_user.get("email") if current_user else None,
             "model_name": configured_model,
-            "model_provider": "gemini",
+            "model_provider": "perplexity",
             "ai_calls_estimate": max(1, len(questions_dicts)),
             "details": {
                 "questions_count": len(questions_dicts),
@@ -954,8 +966,8 @@ async def api_phase5_analyze(req: Phase5AnalyzeRequest, current_user: dict = Dep
 @app.post("/api/phase5/analyze-single", response_model=Phase5AnalyzeSingleResponse)
 async def api_phase5_analyze_single(req: Phase5AnalyzeSingleRequest, current_user: dict = Depends(get_current_user_optional)):
     try:
-        result = await analyze_single_question(req.url, req.question.model_dump())
-        configured_model = (os.getenv("GEMINI_MODEL_PRIMARY") or os.getenv("GEMINI_MODEL") or "").strip() or None
+        result = await analyze_single_question(req.url, req.question.model_dump(), model_provider="perplexity")
+        configured_model = (os.getenv("PERPLEXITY_MODEL_PHASE5") or "sonar-pro").strip() or None
         await _log_ai_usage_event({
             "feature": "phase5_analyze_single",
             "endpoint": "/api/phase5/analyze-single",
@@ -963,7 +975,7 @@ async def api_phase5_analyze_single(req: Phase5AnalyzeSingleRequest, current_use
             "user_id": current_user.get("id") if current_user else None,
             "user_email": current_user.get("email") if current_user else None,
             "model_name": configured_model,
-            "model_provider": "gemini",
+            "model_provider": "perplexity",
             "ai_calls_estimate": 1,
             "details": {
                 "question_id": req.question.id,
@@ -978,7 +990,7 @@ async def api_phase5_analyze_single(req: Phase5AnalyzeSingleRequest, current_use
 async def _process_phase5_job(job_doc: dict):
     job_id = job_doc["job_id"]
     job_type = job_doc.get("job_type", "core")
-    model_provider = str(job_doc.get("model", "gemini") or "gemini").strip().lower()
+    model_provider = str(job_doc.get("model", "perplexity") or "perplexity").strip().lower()
     include_competitors = job_type == "deep"
     print(f"[Phase5] worker start job_id={job_id} type={job_type} provider={model_provider}")
     try:
@@ -1063,7 +1075,7 @@ async def _process_phase5_job(job_doc: dict):
                     },
                 )
 
-                provider_for_q = str(job_doc.get("model", "gemini") or "gemini").strip().lower()
+                provider_for_q = str(job_doc.get("model", "perplexity") or "perplexity").strip().lower()
                 if provider_for_q == "openai":
                     per_question_timeout = PHASE5_QUESTION_TIMEOUT_OPENAI_SEC
                 elif provider_for_q == "perplexity":
@@ -1137,9 +1149,9 @@ async def _process_phase5_job(job_doc: dict):
             )
             return
 
-        # Gemini-only finalization: deep competitor scoring + brand narrative.
+        # Perplexity-only finalization: deep competitor scoring + brand narrative.
         # OpenAI jobs complete immediately after question analysis to keep them fast.
-        if model_provider != "gemini":
+        if model_provider != "perplexity":
             await phase5_jobs_col.update_one(
                 {"job_id": job_id},
                 {
@@ -1601,7 +1613,7 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
         questions_dicts = [q.model_dump() for q in req.questions]
         if not questions_dicts:
             raise HTTPException(status_code=400, detail="questions cannot be empty")
-        model_provider = str(req.model or "gemini").strip().lower()
+        model_provider = str(req.model or "perplexity").strip().lower()
         if model_provider not in {"gemini", "openai", "perplexity"}:
             raise HTTPException(status_code=400, detail="unsupported model provider")
 
@@ -1686,7 +1698,7 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
         questions_dicts = [q.model_dump() for q in req.questions]
         if not questions_dicts:
             raise HTTPException(status_code=400, detail="questions cannot be empty")
-        model_provider = str(req.model or "gemini").strip().lower()
+        model_provider = str(req.model or "perplexity").strip().lower()
         if model_provider not in {"gemini", "openai", "perplexity"}:
             raise HTTPException(status_code=400, detail="unsupported model provider")
 
