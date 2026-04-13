@@ -32,6 +32,7 @@ NON_COMPETITOR_DOMAINS = {
 
 PHASE5_VALIDATE_COMPETITORS = False
 PHASE5_FAST_MODE = False
+PHASE5_ENABLE_GEMINI = str(os.getenv("PHASE5_ENABLE_GEMINI", "false")).strip().lower() == "true"
 PHASE5_MODEL_CALL_TIMEOUT_SEC = int(os.getenv("PHASE5_MODEL_CALL_TIMEOUT_SEC", "90"))
 MAX_RETRIES = int(os.getenv("PHASE5_RATE_LIMIT_MAX_RETRIES", "3"))
 OPENAI_PHASE5_TIMEOUT_SEC = int(os.getenv("OPENAI_PHASE5_TIMEOUT_SEC", "18"))
@@ -1364,6 +1365,19 @@ async def analyze_single_question(
     Returns status, position, sources, and competitors dynamically.
     """
     normalized_provider = str(model_provider or "perplexity").strip().lower()
+    if normalized_provider == "gemini" and not PHASE5_ENABLE_GEMINI:
+        return {
+            "id": question["id"],
+            "status": "Not Mentioned",
+            "position": None,
+            "sources": [],
+            "source_urls": [],
+            "references": [],
+            "idea_candidates": [],
+            "competitors": [],
+            "competitor_scores": [],
+            "reasoning": "Gemini is temporarily disabled for Phase 5.",
+        }
     if normalized_provider == "openai":
         return await _analyze_single_question_openai(
             url=url,
@@ -1894,6 +1908,19 @@ async def _run_with_backoff(
 ) -> dict:
     """Wrap analyze_single_question with exponential backoff for provider rate limits."""
     provider = str(model_provider or "perplexity").strip().lower()
+    if provider == "gemini" and not PHASE5_ENABLE_GEMINI:
+        return {
+            "id": question["id"],
+            "status": "Not Mentioned",
+            "position": None,
+            "sources": [],
+            "source_urls": [],
+            "references": [],
+            "idea_candidates": [],
+            "competitors": [],
+            "competitor_scores": [],
+            "reasoning": "Gemini is temporarily disabled for Phase 5.",
+        }
     if provider == "openai":
         retries = max(1, OPENAI_PHASE5_MAX_RETRIES)
     elif provider == "perplexity":

@@ -88,7 +88,7 @@ app = FastAPI(title="Wonder AI Backend")
 # Phase 5 worker settings
 PHASE5_WORKER_CONCURRENCY = max(1, min(2, int(os.getenv("PHASE5_WORKER_CONCURRENCY", "2"))))
 PHASE5_WORKER_POLL_INTERVAL = float(os.getenv("PHASE5_WORKER_POLL_INTERVAL", "0.5"))
-PHASE5_JOB_PARALLELISM = max(1, min(8, int(os.getenv("PHASE5_JOB_PARALLELISM", "4"))))
+PHASE5_JOB_PARALLELISM = max(1, min(8, int(os.getenv("PHASE5_JOB_PARALLELISM", "8"))))
 PHASE5_MODEL_MAX_THREADS = max(4, min(16, int(os.getenv("PHASE5_MODEL_MAX_THREADS", "8"))))
 PHASE5_QUESTION_TIMEOUT_GEMINI_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_GEMINI_SEC", "140"))
 PHASE5_QUESTION_TIMEOUT_OPENAI_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_OPENAI_SEC", "40"))
@@ -991,6 +991,19 @@ async def _process_phase5_job(job_doc: dict):
     job_id = job_doc["job_id"]
     job_type = job_doc.get("job_type", "core")
     model_provider = str(job_doc.get("model", "perplexity") or "perplexity").strip().lower()
+    if model_provider == "gemini":
+        await phase5_jobs_col.update_one(
+            {"job_id": job_id},
+            {
+                "$set": {
+                    "status": "failed",
+                    "current_question_id": None,
+                    "error": "Gemini is temporarily disabled for Phase 5. Use OpenAI or Perplexity.",
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            },
+        )
+        return
     include_competitors = job_type == "deep"
     print(f"[Phase5] worker start job_id={job_id} type={job_type} provider={model_provider}")
     try:
@@ -1384,7 +1397,7 @@ def _phase5_request_hash(
     payload = {
         "url": str(url or "").strip().lower(),
         "job_type": str(job_type or "core").strip().lower(),
-        "model": str(model or "gemini").strip().lower(),
+        "model": str(model or "perplexity").strip().lower(),
         "questions": normalized_questions,
     }
 
@@ -1517,6 +1530,28 @@ async def _phase5_worker_startup():
         except Exception:
             traceback.print_exc()
 
+    # Hard safety gate: while Gemini is disabled for Phase 5, fail stale Gemini jobs on startup.
+    try:
+        startup_gemini_failed = await phase5_jobs_col.update_many(
+            {
+                "model": "gemini",
+                "status": {"$in": ["queued", "running", "finalizing"]},
+            },
+            {
+                "$set": {
+                    "status": "failed",
+                    "worker_id": None,
+                    "current_question_id": None,
+                    "error": "gemini_disabled_phase5",
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            },
+        )
+        if int(startup_gemini_failed.modified_count or 0) > 0:
+            print(f"[Phase5] startup failed stale gemini jobs={startup_gemini_failed.modified_count}")
+    except Exception:
+        traceback.print_exc()
+
     stale_running_cutoff_iso = (datetime.utcnow() - timedelta(seconds=max(30, PHASE5_STALE_RUNNING_SECONDS))).isoformat()
     stale_queued_cutoff_iso = (datetime.utcnow() - timedelta(seconds=max(120, PHASE5_STALE_QUEUED_SECONDS))).isoformat()
     try:
@@ -1614,7 +1649,9 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
         if not questions_dicts:
             raise HTTPException(status_code=400, detail="questions cannot be empty")
         model_provider = str(req.model or "perplexity").strip().lower()
-        if model_provider not in {"gemini", "openai", "perplexity"}:
+        if model_provider == "gemini":
+            raise HTTPException(status_code=400, detail="Gemini is temporarily disabled for Phase 5")
+        if model_provider not in {"openai", "perplexity"}:
             raise HTTPException(status_code=400, detail="unsupported model provider")
 
         request_hash = _phase5_request_hash(
@@ -1699,7 +1736,9 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
         if not questions_dicts:
             raise HTTPException(status_code=400, detail="questions cannot be empty")
         model_provider = str(req.model or "perplexity").strip().lower()
-        if model_provider not in {"gemini", "openai", "perplexity"}:
+        if model_provider == "gemini":
+            raise HTTPException(status_code=400, detail="Gemini is temporarily disabled for Phase 5")
+        if model_provider not in {"openai", "perplexity"}:
             raise HTTPException(status_code=400, detail="unsupported model provider")
 
         request_hash = _phase5_request_hash(
