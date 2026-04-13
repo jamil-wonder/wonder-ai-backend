@@ -77,7 +77,7 @@ async def _perplexity_response_json(
 
 
 def _openai_model_name() -> str:
-    return (os.getenv("OPENAI_MODEL_PHASE1") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+    return (os.getenv("OPENAI_MODEL_PHASE1") or os.getenv("OPENAI_MODEL") or "gpt-5.4-mini").strip()
 
 
 def _openai_api_key() -> str:

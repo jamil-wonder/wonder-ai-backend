@@ -513,7 +513,7 @@ def get_perplexity_api_key() -> str:
 
 async def _call_openai_chat_json(prompt: str, timeout_sec: int | None = None) -> dict | None:
     api_key = get_openai_api_key()
-    model = (os.getenv("OPENAI_MODEL_PHASE5") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+    model = (os.getenv("OPENAI_MODEL_PHASE5") or os.getenv("OPENAI_MODEL") or "gpt-5.4-mini").strip()
     effective_timeout = max(8, timeout_sec if isinstance(timeout_sec, int) else PHASE5_MODEL_CALL_TIMEOUT_SEC)
 
     payload = {

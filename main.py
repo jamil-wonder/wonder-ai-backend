@@ -225,7 +225,7 @@ async def _log_ai_usage_event(event: dict):
                 os.getenv("OPENAI_MODEL_PHASE5")
                 or os.getenv("OPENAI_MODEL_PHASE1")
                 or os.getenv("OPENAI_MODEL")
-                or "gpt-4o-mini"
+                or "gpt-5.4-mini"
             ).strip()
         if not model_name and model_provider == "perplexity":
             model_name = (os.getenv("PERPLEXITY_MODEL_PHASE5") or "sonar-pro").strip()
