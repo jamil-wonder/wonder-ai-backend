@@ -88,7 +88,7 @@ app = FastAPI(title="Wonder AI Backend")
 # Phase 5 worker settings
 PHASE5_WORKER_CONCURRENCY = max(1, min(2, int(os.getenv("PHASE5_WORKER_CONCURRENCY", "2"))))
 PHASE5_WORKER_POLL_INTERVAL = float(os.getenv("PHASE5_WORKER_POLL_INTERVAL", "0.5"))
-PHASE5_JOB_PARALLELISM = max(1, min(8, int(os.getenv("PHASE5_JOB_PARALLELISM", "8"))))
+PHASE5_JOB_PARALLELISM = max(1, min(8, int(os.getenv("PHASE5_JOB_PARALLELISM", "4"))))
 PHASE5_MODEL_MAX_THREADS = max(4, min(16, int(os.getenv("PHASE5_MODEL_MAX_THREADS", "8"))))
 PHASE5_QUESTION_TIMEOUT_GEMINI_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_GEMINI_SEC", "140"))
 PHASE5_QUESTION_TIMEOUT_OPENAI_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_OPENAI_SEC", "40"))
@@ -221,12 +221,7 @@ async def _log_ai_usage_event(event: dict):
         if not model_name and model_provider == "gemini":
             model_name = (os.getenv("GEMINI_MODEL_PRIMARY") or os.getenv("GEMINI_MODEL") or "").strip() or None
         if not model_name and model_provider == "openai":
-            model_name = (
-                os.getenv("OPENAI_MODEL_PHASE5")
-                or os.getenv("OPENAI_MODEL_PHASE1")
-                or os.getenv("OPENAI_MODEL")
-                or "gpt-5.4-mini"
-            ).strip()
+            model_name = (os.getenv("OPENAI_MODEL_PHASE5") or "").strip() or None
         if not model_name and model_provider == "perplexity":
             model_name = (os.getenv("PERPLEXITY_MODEL_PHASE5") or "sonar-pro").strip()
 
@@ -1351,7 +1346,7 @@ async def _phase5_worker_loop():
                         },
                         return_document=ReturnDocument.AFTER,
                     )
-            else:
+            if claimed is None:
                 claimed = await phase5_jobs_col.find_one_and_update(
                     {"status": "queued"},
                     {
@@ -1375,6 +1370,54 @@ async def _phase5_worker_loop():
         except Exception:
             traceback.print_exc()
             await asyncio.sleep(PHASE5_WORKER_POLL_INTERVAL)
+
+
+async def _phase5_kick_job_processing(job_id: str):
+    """Best-effort direct claim path so newly queued jobs are not stranded."""
+    if phase5_jobs_col is None:
+        return
+    try:
+        claimed = await phase5_jobs_col.find_one_and_update(
+            {"job_id": job_id, "status": "queued"},
+            {
+                "$set": {
+                    "status": "running",
+                    "worker_id": PHASE5_WORKER_ID,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if not claimed:
+            return
+        print(f"[Phase5] kick start job_id={job_id} provider={claimed.get('model')}")
+        await _process_phase5_job(claimed)
+    except Exception:
+        traceback.print_exc()
+
+
+async def _phase5_try_start_immediately(job_id: str) -> None:
+    """Try to claim a newly queued job right away and process in background."""
+    if phase5_jobs_col is None:
+        return
+    try:
+        claimed = await phase5_jobs_col.find_one_and_update(
+            {"job_id": job_id, "status": "queued"},
+            {
+                "$set": {
+                    "status": "running",
+                    "worker_id": PHASE5_WORKER_ID,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if not claimed:
+            return
+        print(f"[Phase5] immediate start job_id={job_id} provider={claimed.get('model')}")
+        asyncio.create_task(_process_phase5_job(claimed))
+    except Exception:
+        traceback.print_exc()
 
 
 def _phase5_request_hash(
@@ -1606,6 +1649,10 @@ async def _phase5_worker_startup():
         f"timeout_openai={PHASE5_QUESTION_TIMEOUT_OPENAI_SEC}s "
         f"timeout_perplexity={PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC}s"
     )
+    print(
+        f"[Phase5] providers openai_model={(os.getenv('OPENAI_MODEL_PHASE5') or 'unset').strip() or 'unset'} "
+        f"perplexity_model={(os.getenv('PERPLEXITY_MODEL_PHASE5') or 'sonar-pro').strip() or 'sonar-pro'}"
+    )
     app.state.phase5_worker_tasks = [
         asyncio.create_task(_phase5_worker_loop())
         for _ in range(max(1, PHASE5_WORKER_CONCURRENCY))
@@ -1699,6 +1746,13 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
             except Exception:
                 print("[Phase5] Redis enqueue failed. Job remains queued in Mongo and will be picked by polling worker.")
 
+        print(
+            f"[Phase5] queued job_id={job_id} provider={model_provider} "
+            f"type=core questions={len(questions_dicts)}"
+        )
+        await _phase5_try_start_immediately(job_id)
+        asyncio.create_task(_phase5_kick_job_processing(job_id))
+
         await _log_ai_usage_event({
             "feature": "phase5_job_started",
             "endpoint": "/api/phase5/start-job",
@@ -1786,6 +1840,13 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
                 await redis_client.rpush(PHASE5_REDIS_QUEUE_KEY, job_id.encode("utf-8"))
             except Exception:
                 print("[Phase5] Redis enqueue failed. Job remains queued in Mongo and will be picked by polling worker.")
+
+        print(
+            f"[Phase5] queued job_id={job_id} provider={model_provider} "
+            f"type=deep questions={len(questions_dicts)}"
+        )
+        await _phase5_try_start_immediately(job_id)
+        asyncio.create_task(_phase5_kick_job_processing(job_id))
 
         await _log_ai_usage_event({
             "feature": "phase5_deep_job_started",

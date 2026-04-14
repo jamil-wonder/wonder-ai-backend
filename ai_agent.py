@@ -77,7 +77,10 @@ async def _perplexity_response_json(
 
 
 def _openai_model_name() -> str:
-    return (os.getenv("OPENAI_MODEL_PHASE1") or os.getenv("OPENAI_MODEL") or "gpt-5.4-mini").strip()
+    model = (os.getenv("OPENAI_MODEL_PHASE5") or "").strip()
+    if not model:
+        raise RuntimeError("OPENAI_MODEL_PHASE5 is not configured")
+    return model
 
 
 def _openai_api_key() -> str:
@@ -302,13 +305,14 @@ async def get_ai_insights_openai(business_name: str, url: str) -> dict:
         return _normalize_insight_payload(parsed, model)
     except Exception as e:
         print(f"Error fetching OpenAI insights: {e}")
+        fallback_model = (os.getenv("OPENAI_MODEL_PHASE5") or "OpenAI").strip()
         return _normalize_insight_payload({
             "isKnown": False,
             "summary": "Failed to fetch AI insights.",
             "sentiment": "Unknown",
             "platforms": [],
             "evidence": [],
-        }, "gpt-4o-mini")
+        }, fallback_model)
 
 
 async def get_ai_insights_multi(business_name: str, url: str) -> list[dict]:

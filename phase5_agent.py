@@ -504,6 +504,13 @@ def get_openai_api_key() -> str:
     return api_key
 
 
+def get_openai_model_name() -> str:
+    model = (os.getenv("OPENAI_MODEL_PHASE5") or "").strip()
+    if not model:
+        raise ValueError("OPENAI_MODEL_PHASE5 environment variable not set")
+    return model
+
+
 def get_perplexity_api_key() -> str:
     api_key = os.getenv("PERPLEXITY_API_KEY", "").strip()
     if not api_key:
@@ -513,14 +520,15 @@ def get_perplexity_api_key() -> str:
 
 async def _call_openai_chat_json(prompt: str, timeout_sec: int | None = None) -> dict | None:
     api_key = get_openai_api_key()
-    model = (os.getenv("OPENAI_MODEL_PHASE5") or os.getenv("OPENAI_MODEL") or "gpt-5.4-mini").strip()
+    model = get_openai_model_name()
     effective_timeout = max(8, timeout_sec if isinstance(timeout_sec, int) else PHASE5_MODEL_CALL_TIMEOUT_SEC)
+    model_lower = model.lower()
+    is_gpt5_family = model_lower.startswith("gpt-5")
 
-    payload = {
+    chat_payload = {
         "model": model,
         "temperature": 0.0,
         "max_tokens": 700,
-        "response_format": {"type": "json_object"},
         "messages": [
             {
                 "role": "system",
@@ -532,27 +540,62 @@ async def _call_openai_chat_json(prompt: str, timeout_sec: int | None = None) ->
             },
         ],
     }
+    responses_payload = {
+        "model": model,
+        "input": prompt,
+        "max_output_tokens": 700,
+    }
 
     try:
         started = asyncio.get_running_loop().time()
         _log_provider_started_once("OpenAI", model)
         async with httpx.AsyncClient(timeout=effective_timeout) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
+            if is_gpt5_family:
+                response = await client.post(
+                    "https://api.openai.com/v1/responses",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=responses_payload,
+                )
+            else:
+                response = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=chat_payload,
+                )
         if response.status_code == 429:
             raise Phase5RateLimitError("OpenAI rate limit reached. Please retry shortly.")
         response.raise_for_status()
         body = response.json()
-        text = (
-            ((body.get("choices") or [{}])[0].get("message") or {}).get("content")
-            or ""
-        )
+        if is_gpt5_family:
+            text = str(body.get("output_text") or "")
+            if not text:
+                output = body.get("output")
+                if isinstance(output, list):
+                    parts = []
+                    for item in output:
+                        if not isinstance(item, dict):
+                            continue
+                        content = item.get("content")
+                        if isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict):
+                                    t = c.get("text")
+                                    if isinstance(t, str) and t.strip():
+                                        parts.append(t)
+                        elif isinstance(content, str) and content.strip():
+                            parts.append(content)
+                    text = "\n".join(parts).strip()
+        else:
+            text = (
+                ((body.get("choices") or [{}])[0].get("message") or {}).get("content")
+                or ""
+            )
         parsed = _safe_json_parse(text)
         elapsed = asyncio.get_running_loop().time() - started
         _log_provider_healthy_once("OpenAI", model, elapsed)
@@ -567,6 +610,11 @@ async def _call_openai_chat_json(prompt: str, timeout_sec: int | None = None) ->
             print(f"[Phase5][OpenAI] model={model} failed in {elapsed:.2f}s: {type(e).__name__}")
         except Exception:
             pass
+        if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+            try:
+                print(f"[Phase5][OpenAI] error body: {e.response.text[:500]}")
+            except Exception:
+                pass
         print(f"[Phase5][OpenAI] call failed: {e}")
         return None
 
@@ -1185,9 +1233,24 @@ async def _analyze_single_question_openai(url: str, question: dict, include_comp
     clean_references = list(dict.fromkeys(clean_references))
     idea_candidates = list(dict.fromkeys(idea_candidates))[:12]
 
-    # Guardrail: require third-party evidence before we mark Mentioned.
+    # Fallback for branded intent queries: if the brand token is present in the
+    # query text, keep visibility as Mentioned even when structured evidence is sparse.
+    normalized_query = re.sub(r"[^a-z0-9]", "", str(question.get("text", "")).lower())
+    brand_token = re.sub(r"[^a-z0-9]", "", (domain.split(".")[0] if domain else "").lower())
+    if (
+        not target_mentioned
+        and position is None
+        and brand_token
+        and len(brand_token) >= 4
+        and brand_token in normalized_query
+    ):
+        target_mentioned = True
+        position = 3
+
+    # Guardrail: keep strict behavior only when we have no evidence and no
+    # mention signal at all. Do not overwrite model-positive mention decisions.
     has_external_evidence = len(clean_sources) > 0 or len(clean_references) > 0
-    if not has_external_evidence:
+    if not has_external_evidence and not (target_mentioned or position is not None):
         target_mentioned = False
         position = None
 
