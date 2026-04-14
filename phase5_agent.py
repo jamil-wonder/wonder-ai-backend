@@ -597,9 +597,15 @@ async def _call_openai_chat_json(prompt: str, timeout_sec: int | None = None) ->
                 or ""
             )
         parsed = _safe_json_parse(text)
+        parsed_dict = parsed if isinstance(parsed, dict) else {}
+        if text:
+            parsed_dict["_meta_response_text"] = text[:4000]
+            text_domains = _extract_domains_from_text(text)
+            if text_domains:
+                parsed_dict["_meta_source_domains"] = list(dict.fromkeys(text_domains))
         elapsed = asyncio.get_running_loop().time() - started
         _log_provider_healthy_once("OpenAI", model, elapsed)
-        return parsed if isinstance(parsed, dict) else {}
+        return parsed_dict
     except Phase5RateLimitError:
         raise
     except Exception as e:
@@ -1191,6 +1197,13 @@ async def _analyze_single_question_openai(url: str, question: dict, include_comp
         if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
             clean_references.append(d)
 
+    meta_domains = data.get("_meta_source_domains", []) if isinstance(data, dict) else []
+    if isinstance(meta_domains, list):
+        for md in meta_domains:
+            d = _normalize_domain(md)
+            if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+                clean_references.append(d)
+
     idea_candidates: list[str] = []
     raw_ideas = data.get("idea_candidates", []) if isinstance(data, dict) else []
     if isinstance(raw_ideas, list):
@@ -1246,6 +1259,13 @@ async def _analyze_single_question_openai(url: str, question: dict, include_comp
     ):
         target_mentioned = True
         position = 3
+
+    response_text = str(data.get("_meta_response_text", "") if isinstance(data, dict) else "").lower()
+    if not target_mentioned and position is None and response_text:
+        # Recover mention signal when model prose mentions the target but structured JSON omits target fields.
+        if domain in response_text or (brand_token and len(brand_token) >= 4 and brand_token in response_text):
+            target_mentioned = True
+            position = 3
 
     # Guardrail: keep strict behavior only when we have no evidence and no
     # mention signal at all. Do not overwrite model-positive mention decisions.
