@@ -1159,7 +1159,8 @@ async def _analyze_single_question_openai(url: str, question: dict, include_comp
 
     Rules:
     - Keep lists short and realistic.
-    - Never use the target domain as a source or reference.
+    - If target appears in results, set target.mentioned=true and include a realistic position.
+    - It is okay to include the target domain once in references when it appears in results.
     - Sources/references must be third-party domains only.
     - Do not include target domain in competitors.
     - position must be 1..10 or null.
@@ -1182,6 +1183,7 @@ async def _analyze_single_question_openai(url: str, question: dict, include_comp
     raw_sources = target.get("source_domains", []) if isinstance(target, dict) else []
     if not isinstance(raw_sources, list):
         raw_sources = []
+    target_seen_in_sources = any(_is_target_domain_match(str(s), domain) for s in raw_sources)
     clean_sources = []
     for s in raw_sources:
         d = _normalize_domain(s)
@@ -1191,6 +1193,7 @@ async def _analyze_single_question_openai(url: str, question: dict, include_comp
     raw_references = data.get("references", []) if isinstance(data, dict) else []
     if not isinstance(raw_references, list):
         raw_references = []
+    target_seen_in_references = any(_is_target_domain_match(str(r), domain) for r in raw_references)
     clean_references = []
     for r in raw_references:
         d = _normalize_domain(r)
@@ -1257,6 +1260,10 @@ async def _analyze_single_question_openai(url: str, question: dict, include_comp
         and len(brand_token) >= 4
         and brand_token in normalized_query
     ):
+        target_mentioned = True
+        position = 3
+
+    if not target_mentioned and position is None and (target_seen_in_sources or target_seen_in_references):
         target_mentioned = True
         position = 3
 
