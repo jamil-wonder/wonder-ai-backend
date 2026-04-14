@@ -58,7 +58,7 @@ class Phase5JobStatusResponse(BaseModel):
     total: int
     processed: int
     current_question_id: Optional[str] = None
-    results: dict[str, Phase5AnalyzeSingleResponse]
+    results: dict[str, dict]
     deep_competitors: List[dict] = []
     brand_summary: Optional[str] = None
     error: Optional[str] = None

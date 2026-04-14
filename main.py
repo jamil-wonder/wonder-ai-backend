@@ -32,6 +32,8 @@ from phase5_agent import (
     generate_brand_questions,
     rank_brand_in_ai,
     analyze_single_question,
+    analyze_single_question_multi,
+    compute_provider_score,
     _run_with_backoff,
     generate_brand_perception_summary,
     generate_deep_competitor_scores,
@@ -56,6 +58,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
+from urllib.parse import urlparse
 
 load_dotenv()
 from redis import asyncio as aioredis
@@ -121,6 +124,7 @@ if not MONGO_URL:
     raise RuntimeError("CRITICAL ERROR: MONGODB_URL is missing from environment variables.")
 phase5_jobs_col = None
 ai_usage_col = None
+user_history_meta_col = None
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
     db = mongo_client.get_database("wonderai")
@@ -129,6 +133,7 @@ try:
     users_col = db.get_collection("users")
     phase5_jobs_col = db.get_collection("phase5_jobs")
     ai_usage_col = db.get_collection("ai_usage_events")
+    user_history_meta_col = db.get_collection("user_history_meta")
 except Exception as e:
     print(f"[API] Error connecting to MongoDB: {type(e).__name__}")
 
@@ -273,6 +278,50 @@ async def _log_ai_usage_event(event: dict):
 
 class GoogleAuthRequest(BaseModel):
     credential: str
+
+
+class UserProfileUpdateRequest(BaseModel):
+    name: str
+    email: str
+
+
+class UserPasswordChangeRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+def _normalize_site(value: str) -> str:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return ""
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    host = (parsed.netloc or parsed.path or "").strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _iso_from_range(range_value: str) -> str | None:
+    rv = (range_value or "").strip().lower()
+    if rv in {"", "all"}:
+        return None
+    now = datetime.utcnow()
+    if rv == "week":
+        return (now - timedelta(days=7)).isoformat()
+    if rv == "month":
+        return (now - timedelta(days=30)).isoformat()
+    if rv == "year":
+        return (now - timedelta(days=365)).isoformat()
+    return None
+
+
+def _to_datetime(iso_value: str | None) -> datetime | None:
+    if not iso_value:
+        return None
+    try:
+        return datetime.fromisoformat(str(iso_value).replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 @app.post("/api/auth/google", response_model=Token)
 async def api_google_login(request: GoogleAuthRequest):
@@ -433,6 +482,352 @@ async def api_login(request: LoginRequest):
         print(f"[API] ERROR during login: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/api/user/profile", response_model=UserResponse)
+async def api_user_profile(current_user: dict = Depends(get_current_user)):
+    user = await users_col.find_one({"_id": ObjectId(current_user["id"])})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return UserResponse(
+        id=str(user["_id"]),
+        name=user.get("name", ""),
+        email=user.get("email", ""),
+        created_at=user.get("created_at", datetime.utcnow().isoformat()),
+        role=user.get("role", "user"),
+        status=user.get("status", "active"),
+    )
+
+
+@app.put("/api/user/profile", response_model=UserResponse)
+async def api_user_profile_update(request: UserProfileUpdateRequest, current_user: dict = Depends(get_current_user)):
+    name = (request.name or "").strip()
+    email = (request.email or "").strip().lower()
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    existing = await users_col.find_one({"email": email})
+    if existing and str(existing.get("_id")) != current_user["id"]:
+        raise HTTPException(status_code=400, detail="Email already in use")
+
+    updated = await users_col.find_one_and_update(
+        {"_id": ObjectId(current_user["id"])},
+        {
+            "$set": {
+                "name": name,
+                "email": email,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return UserResponse(
+        id=str(updated["_id"]),
+        name=updated.get("name", ""),
+        email=updated.get("email", ""),
+        created_at=updated.get("created_at", datetime.utcnow().isoformat()),
+        role=updated.get("role", "user"),
+        status=updated.get("status", "active"),
+    )
+
+
+@app.put("/api/user/password")
+async def api_user_change_password(request: UserPasswordChangeRequest, current_user: dict = Depends(get_current_user)):
+    if not request.current_password or not request.new_password:
+        raise HTTPException(status_code=400, detail="Both current and new passwords are required")
+    if len(request.new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
+
+    user = await users_col.find_one({"_id": ObjectId(current_user["id"])})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not verify_password(request.current_password, user.get("hashed_password", "")):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+    await users_col.update_one(
+        {"_id": ObjectId(current_user["id"])},
+        {
+            "$set": {
+                "hashed_password": get_password_hash(request.new_password),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+        },
+    )
+    return {"message": "Password updated successfully"}
+
+
+@app.get("/api/user/history")
+async def api_user_history(
+    page: int = 1,
+    limit: int = 10,
+    status: str = "all",
+    model: str = "all",
+    site: str = "",
+    range: str = "all",
+    current_user: dict = Depends(get_current_user),
+):
+    safe_page = max(1, page)
+    safe_limit = max(1, min(limit, 50))
+    skip = (safe_page - 1) * safe_limit
+    user_id = current_user["id"]
+
+    clear_cutoff = None
+    if user_history_meta_col is not None:
+        meta = await user_history_meta_col.find_one({"user_id": user_id}, {"_id": 0, "cleared_at": 1})
+        clear_cutoff = meta.get("cleared_at") if meta else None
+
+    history_query = {"user_id": user_id}
+    status_filter = (status or "all").strip().lower()
+    if status_filter and status_filter != "all":
+        history_query["status"] = status_filter
+
+    model_filter = (model or "all").strip().lower()
+    if model_filter and model_filter != "all":
+        if model_filter in {"chatgpt", "openai"}:
+            history_query["$or"] = [
+                {"model": "openai"},
+                {"provider_scores.chatgpt": {"$exists": True}},
+            ]
+        elif model_filter == "perplexity":
+            history_query["$or"] = [
+                {"model": "perplexity"},
+                {"provider_scores.perplexity": {"$exists": True}},
+            ]
+        elif model_filter == "gemini":
+            history_query["$or"] = [
+                {"model": "gemini"},
+                {"provider_scores.gemini": {"$exists": True}},
+            ]
+        else:
+            history_query["model"] = model_filter
+
+    site_host = _normalize_site(site)
+    if site_host:
+        history_query["url"] = {"$regex": site_host, "$options": "i"}
+
+    cutoff_iso = _iso_from_range(range)
+    created_at_bounds = {}
+    if cutoff_iso:
+        created_at_bounds["$gte"] = cutoff_iso
+    if clear_cutoff:
+        created_at_bounds["$gt"] = max(clear_cutoff, created_at_bounds.get("$gte", clear_cutoff))
+    if created_at_bounds:
+        history_query["created_at"] = created_at_bounds
+
+    total_runs = 0
+    if phase5_jobs_col is not None:
+        total_runs = await phase5_jobs_col.count_documents(history_query)
+
+    phase5_runs = []
+    if phase5_jobs_col is not None:
+        cursor = phase5_jobs_col.find(
+            history_query,
+            {
+                "_id": 0,
+                "job_id": 1,
+                "job_type": 1,
+                "model": 1,
+                "url": 1,
+                "status": 1,
+                "total": 1,
+                "processed": 1,
+                "overall_score": 1,
+                "provider_scores": 1,
+                "created_at": 1,
+                "updated_at": 1,
+                "error": 1,
+            },
+        ).sort("created_at", -1).skip(skip).limit(safe_limit)
+        raw_runs = await cursor.to_list(length=safe_limit)
+
+        for run in raw_runs:
+            providers = run.get("provider_scores") or {}
+            models_ran = []
+            if isinstance(providers, dict):
+                if "perplexity" in providers:
+                    models_ran.append("perplexity")
+                if "chatgpt" in providers:
+                    models_ran.append("chatgpt")
+                if "gemini" in providers:
+                    models_ran.append("gemini")
+
+            if not models_ran:
+                model_name = str(run.get("model") or "").strip().lower()
+                if model_name in {"openai", "chatgpt"}:
+                    models_ran = ["chatgpt"]
+                elif model_name in {"perplexity", "gemini", "claude"}:
+                    models_ran = [model_name]
+                elif model_name == "multi":
+                    models_ran = ["perplexity", "chatgpt"]
+
+            run["models_ran"] = models_ran
+            phase5_runs.append(run)
+
+    recent_activity = []
+    if urls_col is not None:
+        activity_query = {"user_id": user_id}
+        if site_host:
+            activity_query["url"] = {"$regex": site_host, "$options": "i"}
+
+        ts_bounds = {}
+        if cutoff_iso:
+            ts_bounds["$gte"] = cutoff_iso
+        if clear_cutoff:
+            ts_bounds["$gt"] = max(clear_cutoff, ts_bounds.get("$gte", clear_cutoff))
+        if ts_bounds:
+            activity_query["timestamp"] = ts_bounds
+
+        cursor = urls_col.find(
+            activity_query,
+            {"_id": 0, "url": 1, "phase": 1, "timestamp": 1},
+        ).sort("timestamp", -1).limit(safe_limit)
+        recent_activity = await cursor.to_list(length=safe_limit)
+
+    total_pages = max(1, (total_runs + safe_limit - 1) // safe_limit)
+
+    return {
+        "phase5_runs": phase5_runs,
+        "recent_activity": recent_activity,
+        "pagination": {
+            "page": safe_page,
+            "limit": safe_limit,
+            "total": total_runs,
+            "total_pages": total_pages,
+            "has_next": safe_page < total_pages,
+            "has_prev": safe_page > 1,
+        },
+    }
+
+
+@app.post("/api/user/history/clear")
+async def api_user_history_clear(current_user: dict = Depends(get_current_user)):
+    if user_history_meta_col is None:
+        raise HTTPException(status_code=503, detail="history meta storage unavailable")
+
+    now_iso = datetime.utcnow().isoformat()
+    await user_history_meta_col.update_one(
+        {"user_id": current_user["id"]},
+        {
+            "$set": {
+                "user_id": current_user["id"],
+                "cleared_at": now_iso,
+                "updated_at": now_iso,
+            },
+            "$setOnInsert": {
+                "created_at": now_iso,
+            },
+        },
+        upsert=True,
+    )
+
+    return {"message": "History cleared for your view", "cleared_at": now_iso}
+
+
+@app.get("/api/user/history/site-trend")
+async def api_user_history_site_trend(site: str, range: str = "month", current_user: dict = Depends(get_current_user)):
+    if phase5_jobs_col is None:
+        raise HTTPException(status_code=503, detail="phase5 job storage unavailable")
+
+    site_host = _normalize_site(site)
+    if not site_host:
+        raise HTTPException(status_code=400, detail="A valid site is required")
+
+    query = {
+        "user_id": current_user["id"],
+        "url": {"$regex": site_host, "$options": "i"},
+        "overall_score": {"$type": "number"},
+    }
+
+    cutoff_iso = _iso_from_range(range)
+    if cutoff_iso:
+        query["created_at"] = {"$gte": cutoff_iso}
+
+    cursor = phase5_jobs_col.find(
+        query,
+        {
+            "_id": 0,
+            "job_id": 1,
+            "url": 1,
+            "status": 1,
+            "overall_score": 1,
+            "created_at": 1,
+            "model": 1,
+            "provider_scores": 1,
+        },
+    ).sort("created_at", 1)
+    runs = await cursor.to_list(length=500)
+
+    points = []
+    for run in runs:
+        created_at = run.get("created_at")
+        score = run.get("overall_score")
+        if created_at is None or not isinstance(score, (int, float)):
+            continue
+
+        providers = run.get("provider_scores") or {}
+        models_ran = []
+        if isinstance(providers, dict):
+            if "perplexity" in providers:
+                models_ran.append("perplexity")
+            if "chatgpt" in providers:
+                models_ran.append("chatgpt")
+            if "gemini" in providers:
+                models_ran.append("gemini")
+        if not models_ran:
+            model_name = str(run.get("model") or "").strip().lower()
+            if model_name in {"openai", "chatgpt"}:
+                models_ran = ["chatgpt"]
+            elif model_name in {"perplexity", "gemini", "claude"}:
+                models_ran = [model_name]
+            elif model_name == "multi":
+                models_ran = ["perplexity", "chatgpt"]
+
+        points.append(
+            {
+                "job_id": run.get("job_id"),
+                "url": run.get("url"),
+                "status": run.get("status"),
+                "score": round(float(score), 2),
+                "created_at": created_at,
+                "models_ran": models_ran,
+            }
+        )
+
+    first_score = points[0]["score"] if points else None
+    last_score = points[-1]["score"] if points else None
+    delta = None
+    direction = "flat"
+    if first_score is not None and last_score is not None:
+        delta = round(float(last_score) - float(first_score), 2)
+        if delta > 0:
+            direction = "up"
+        elif delta < 0:
+            direction = "down"
+
+    avg_score = None
+    if points:
+        avg_score = round(sum(p["score"] for p in points) / len(points), 2)
+
+    return {
+        "site": site_host,
+        "range": (range or "month").strip().lower(),
+        "runs_count": len(points),
+        "average_score": avg_score,
+        "first_score": first_score,
+        "last_score": last_score,
+        "delta": delta,
+        "direction": direction,
+        "points": points,
+    }
 
 
 # --- Existing Data Routes ---
@@ -1009,6 +1404,15 @@ async def _process_phase5_job(job_doc: dict):
             )
             return not latest or latest.get("status") == "cancelled"
 
+        def _compute_provider_scores(results_map: dict[str, dict]) -> tuple[dict, float | None]:
+            providers = ["perplexity", "chatgpt"]
+            score_map: dict[str, dict] = {}
+            for provider_name in providers:
+                score_map[provider_name] = compute_provider_score(results_map, provider_name)
+            numeric_scores = [float(v.get("score", 0)) for v in score_map.values() if isinstance(v, dict)]
+            overall = round(sum(numeric_scores) / len(numeric_scores), 2) if numeric_scores else None
+            return score_map, overall
+
         questions = list(job_doc.get("questions", []))
         seed_results = job_doc.get("seed_results", {}) or {}
         accumulated_results = {}
@@ -1088,19 +1492,35 @@ async def _process_phase5_job(job_doc: dict):
                     per_question_timeout = PHASE5_QUESTION_TIMEOUT_OPENAI_SEC
                 elif provider_for_q == "perplexity":
                     per_question_timeout = PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC
+                elif provider_for_q == "multi":
+                    per_question_timeout = max(
+                        PHASE5_QUESTION_TIMEOUT_OPENAI_SEC,
+                        PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC,
+                        PHASE5_QUESTION_TIMEOUT_GEMINI_SEC,
+                    )
                 else:
                     per_question_timeout = PHASE5_QUESTION_TIMEOUT_GEMINI_SEC
 
                 try:
-                    result = await asyncio.wait_for(
-                        _run_with_backoff(
-                            job_doc["url"],
-                            q,
-                            model_provider=provider_for_q,
-                            include_competitors=include_competitors,
-                        ),
-                        timeout=max(10, per_question_timeout),
-                    )
+                    if provider_for_q == "multi":
+                        result = await asyncio.wait_for(
+                            analyze_single_question_multi(
+                                url=job_doc["url"],
+                                question=q,
+                                include_competitors=include_competitors,
+                            ),
+                            timeout=max(10, per_question_timeout),
+                        )
+                    else:
+                        result = await asyncio.wait_for(
+                            _run_with_backoff(
+                                job_doc["url"],
+                                q,
+                                model_provider=provider_for_q,
+                                include_competitors=include_competitors,
+                            ),
+                            timeout=max(10, per_question_timeout),
+                        )
                 except asyncio.TimeoutError:
                     print(
                         f"[Phase5] qid={qid} job_id={job_id} provider={provider_for_q} "
@@ -1117,13 +1537,24 @@ async def _process_phase5_job(job_doc: dict):
                         "competitor_scores": [],
                         "reasoning": f"Timed out after {per_question_timeout}s",
                     }
+                    if provider_for_q == "multi":
+                        result = {
+                            "id": qid,
+                            "providers": {
+                                "gemini": {"mentioned": False, "position": None, "sources": [], "cited": False, "status": "Not Mentioned"},
+                                "perplexity": {"mentioned": False, "position": None, "sources": [], "cited": False, "status": "Not Mentioned"},
+                                "chatgpt": {"mentioned": False, "position": None, "sources": [], "cited": False, "status": "Not Mentioned"},
+                            },
+                        }
 
                 async with lock:
                     accumulated_results[qid] = result
 
+                running_scores, running_overall = _compute_provider_scores(accumulated_results) if provider_for_q == "multi" else ({}, None)
+
                 print(
                     f"[Phase5] done qid={qid} job_id={job_id} provider={model_provider} "
-                    f"status={result.get('status')} pos={result.get('position')}"
+                    f"status={result.get('status', 'multi')} pos={result.get('position')}"
                 )
 
                 await phase5_jobs_col.update_one(
@@ -1131,6 +1562,8 @@ async def _process_phase5_job(job_doc: dict):
                     {
                         "$set": {
                             f"results.{qid}": result,
+                            "provider_scores": running_scores,
+                            "overall_score": running_overall,
                             "updated_at": datetime.utcnow().isoformat(),
                         },
                         "$inc": {"processed": 1},
@@ -1160,6 +1593,7 @@ async def _process_phase5_job(job_doc: dict):
         # Perplexity-only finalization: deep competitor scoring + brand narrative.
         # OpenAI jobs complete immediately after question analysis to keep them fast.
         if model_provider != "perplexity":
+            final_scores, final_overall = _compute_provider_scores(accumulated_results) if model_provider == "multi" else ({}, None)
             await phase5_jobs_col.update_one(
                 {"job_id": job_id},
                 {
@@ -1168,6 +1602,8 @@ async def _process_phase5_job(job_doc: dict):
                         "current_question_id": None,
                         "deep_competitors": [],
                         "brand_summary": None,
+                        "provider_scores": final_scores,
+                        "overall_score": final_overall,
                         "updated_at": datetime.utcnow().isoformat(),
                     }
                 },
@@ -1695,11 +2131,7 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
         questions_dicts = [q.model_dump() for q in req.questions]
         if not questions_dicts:
             raise HTTPException(status_code=400, detail="questions cannot be empty")
-        model_provider = str(req.model or "perplexity").strip().lower()
-        if model_provider == "gemini":
-            raise HTTPException(status_code=400, detail="Gemini is temporarily disabled for Phase 5")
-        if model_provider not in {"openai", "perplexity"}:
-            raise HTTPException(status_code=400, detail="unsupported model provider")
+        model_provider = "multi"
 
         request_hash = _phase5_request_hash(
             url=req.url,
@@ -1716,12 +2148,13 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
             }
 
         job_id = uuid.uuid4().hex
-        await phase5_jobs_col.insert_one({
+        now_iso = datetime.utcnow().isoformat()
+        job_doc = {
             "job_id": job_id,
             "request_hash": request_hash,
             "job_type": "core",
             "model": model_provider,
-            "queue_priority": 0 if model_provider in {"openai", "perplexity"} else 1,
+            "queue_priority": 0,
             "url": req.url,
             "user_id": current_user.get("id") if current_user else None,
             "user_email": current_user.get("email") if current_user else None,
@@ -1735,9 +2168,10 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
             "deep_competitors": [],
             "brand_summary": None,
             "error": None,
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat(),
-        })
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }
+        await phase5_jobs_col.insert_one(job_doc)
 
         redis_client = getattr(app.state, "phase5_redis", None)
         if redis_client is not None:
@@ -1750,8 +2184,19 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
             f"[Phase5] queued job_id={job_id} provider={model_provider} "
             f"type=core questions={len(questions_dicts)}"
         )
-        await _phase5_try_start_immediately(job_id)
-        asyncio.create_task(_phase5_kick_job_processing(job_id))
+        await phase5_jobs_col.update_one(
+            {"job_id": job_id},
+            {
+                "$set": {
+                    "status": "running",
+                    "worker_id": PHASE5_WORKER_ID,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            },
+        )
+        print(f"[Phase5] immediate start job_id={job_id} provider={model_provider}")
+        running_doc = {**job_doc, "status": "running", "worker_id": PHASE5_WORKER_ID}
+        asyncio.create_task(_process_phase5_job(running_doc))
 
         await _log_ai_usage_event({
             "feature": "phase5_job_started",
@@ -1765,6 +2210,7 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
                 "job_id": job_id,
                 "job_type": "core",
                 "model_provider": model_provider,
+                "providers": ["gemini", "perplexity", "chatgpt"],
                 "question_count": len(questions_dicts),
             },
         })
@@ -1811,7 +2257,8 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
             }
 
         job_id = uuid.uuid4().hex
-        await phase5_jobs_col.insert_one({
+        now_iso = datetime.utcnow().isoformat()
+        job_doc = {
             "job_id": job_id,
             "request_hash": request_hash,
             "job_type": "deep",
@@ -1830,9 +2277,10 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
             "deep_competitors": [],
             "brand_summary": None,
             "error": None,
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat(),
-        })
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }
+        await phase5_jobs_col.insert_one(job_doc)
 
         redis_client = getattr(app.state, "phase5_redis", None)
         if redis_client is not None:
@@ -1845,8 +2293,19 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
             f"[Phase5] queued job_id={job_id} provider={model_provider} "
             f"type=deep questions={len(questions_dicts)}"
         )
-        await _phase5_try_start_immediately(job_id)
-        asyncio.create_task(_phase5_kick_job_processing(job_id))
+        await phase5_jobs_col.update_one(
+            {"job_id": job_id},
+            {
+                "$set": {
+                    "status": "running",
+                    "worker_id": PHASE5_WORKER_ID,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            },
+        )
+        print(f"[Phase5] immediate start job_id={job_id} provider={model_provider}")
+        running_doc = {**job_doc, "status": "running", "worker_id": PHASE5_WORKER_ID}
+        asyncio.create_task(_process_phase5_job(running_doc))
 
         await _log_ai_usage_event({
             "feature": "phase5_deep_job_started",
@@ -1926,6 +2385,7 @@ async def api_phase5_job_stream(job_id: str, request: Request):
                     "deep_competitors": 1,
                     "brand_summary": 1,
                     "provider_scores": 1,
+                    "overall_score": 1,
                     "error": 1,
                 },
             )
@@ -1946,6 +2406,7 @@ async def api_phase5_job_stream(job_id: str, request: Request):
                     "current_question_id": job.get("current_question_id"),
                     "results": job.get("results", {}),
                     "provider_scores": job.get("provider_scores", {}),
+                    "overall_score": job.get("overall_score"),
                     "brand_summary": job.get("brand_summary"),
                     "deep_competitors": job.get("deep_competitors", []),
                     "error": job.get("error"),

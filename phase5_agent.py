@@ -2035,6 +2035,149 @@ async def _run_with_backoff(
             )
             await asyncio.sleep(wait)
 
+
+def _empty_provider_result(error: str | None = None) -> dict:
+    payload = {
+        "mentioned": False,
+        "position": None,
+        "sources": [],
+        "source_urls": [],
+        "references": [],
+        "competitors": [],
+        "competitor_scores": [],
+        "reasoning": None,
+        "cited": False,
+        "status": "Not Mentioned",
+    }
+    if error:
+        payload["error"] = str(error)
+    return payload
+
+
+def _safe_provider_result(raw: dict | Exception | None) -> dict:
+    if isinstance(raw, Exception):
+        return _empty_provider_result(str(raw))
+    if not isinstance(raw, dict):
+        return _empty_provider_result()
+
+    status = str(raw.get("status") or "Not Mentioned")
+    position = raw.get("position") if isinstance(raw.get("position"), int) else None
+    sources = raw.get("sources") if isinstance(raw.get("sources"), list) else []
+    source_urls = raw.get("source_urls") if isinstance(raw.get("source_urls"), list) else []
+    references = raw.get("references") if isinstance(raw.get("references"), list) else []
+    competitors = raw.get("competitors") if isinstance(raw.get("competitors"), list) else []
+    competitor_scores = raw.get("competitor_scores") if isinstance(raw.get("competitor_scores"), list) else []
+    reasoning = raw.get("reasoning")
+    mentioned = status == "Mentioned" or position is not None
+    cited = bool(sources or references or source_urls)
+
+    return {
+        "mentioned": bool(mentioned),
+        "position": position,
+        "sources": sources,
+        "source_urls": source_urls,
+        "references": references,
+        "competitors": competitors,
+        "competitor_scores": competitor_scores,
+        "reasoning": reasoning if isinstance(reasoning, str) and reasoning.strip() else None,
+        "cited": cited,
+        "status": "Mentioned" if mentioned else "Not Mentioned",
+    }
+
+
+async def analyze_single_question_multi(
+    url: str,
+    question: dict,
+    include_competitors: bool = False,
+) -> dict:
+    async def _call_provider(provider: str):
+        return await _run_with_backoff(
+            url=url,
+            question=question,
+            model_provider=provider,
+            include_competitors=include_competitors,
+        )
+
+    gemini_call = _call_provider("gemini")
+    perplexity_call = _call_provider("perplexity")
+    openai_call = _call_provider("openai")
+
+    gemini_raw, perplexity_raw, openai_raw = await asyncio.gather(
+        gemini_call,
+        perplexity_call,
+        openai_call,
+        return_exceptions=True,
+    )
+
+    providers = {
+        "gemini": _safe_provider_result(gemini_raw),
+        "perplexity": _safe_provider_result(perplexity_raw),
+        "chatgpt": _safe_provider_result(openai_raw),
+    }
+
+    return {
+        "id": question.get("id"),
+        "providers": providers,
+    }
+
+
+def compute_provider_score(results: dict, provider: str) -> dict:
+    provider_key = str(provider or "").strip().lower()
+    rows = results if isinstance(results, dict) else {}
+    total = len(rows)
+
+    def _position_points(mentioned: bool, position: int | None) -> int:
+        if not mentioned:
+            return 0
+        if isinstance(position, int) and 1 <= position <= 10:
+            return max(10, 110 - (position * 10))
+        return 50
+
+    mentioned_count = 0
+    cited_count = 0
+    pos_points: list[int] = []
+
+    for _, row in rows.items():
+        providers = row.get("providers") if isinstance(row, dict) else None
+        pdata = providers.get(provider_key) if isinstance(providers, dict) else None
+        pdata = pdata if isinstance(pdata, dict) else {}
+
+        status = str(pdata.get("status") or "")
+        mentioned = bool(pdata.get("mentioned") or status == "Mentioned")
+        position_raw = pdata.get("position")
+        position = position_raw if isinstance(position_raw, int) else None
+        cited = bool(
+            pdata.get("cited")
+            or (isinstance(pdata.get("sources"), list) and len(pdata.get("sources")) > 0)
+            or (isinstance(pdata.get("references"), list) and len(pdata.get("references")) > 0)
+            or (isinstance(pdata.get("source_urls"), list) and len(pdata.get("source_urls")) > 0)
+        )
+
+        if mentioned:
+            mentioned_count += 1
+            pos_points.append(_position_points(True, position))
+        if cited:
+            cited_count += 1
+
+    not_mentioned_count = max(0, total - mentioned_count)
+    mention_rate = (mentioned_count / total) if total > 0 else 0.0
+    citation_rate = (cited_count / total) if total > 0 else 0.0
+    avg_pos_score = (sum(pos_points) / len(pos_points)) if pos_points else 0.0
+
+    composite = round((mention_rate * 0.6 + (avg_pos_score / 100.0) * 0.4) * 100)
+
+    return {
+        "provider": provider_key,
+        "score": composite,
+        "mention_rate": round(mention_rate, 4),
+        "avg_pos_score": round(avg_pos_score, 2),
+        "citation_rate": round(citation_rate, 4),
+        "mentioned": mentioned_count,
+        "not_mentioned": not_mentioned_count,
+        "cited": cited_count,
+        "total": total,
+    }
+
 async def rank_brand_in_ai(url: str, questions: list) -> dict:
     """
     Uses Gemini model chain with Google Search Grounding enabled.
