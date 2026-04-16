@@ -1135,20 +1135,7 @@ async def generate_brand_questions(url: str) -> list[str]:
             cleaned.append(text if text.endswith("?") else f"{text}?")
 
         if len(cleaned) < 20:
-            fallback = _build_non_branded_fallback_questions(url, ctx)
-            for q in fallback:
-                key = q.lower().rstrip("?.!")
-                if key in seen:
-                    continue
-                if _is_branded_question(q, blocked_tokens, blocked_phrases, blocked_domain):
-                    continue
-                seen.add(key)
-                cleaned.append(q)
-                if len(cleaned) >= 20:
-                    break
-
-        if len(cleaned) < 12:
-            raise ValueError("Perplexity returned too few non-branded, relevant queries.")
+            raise ValueError("Question generation failed: insufficient high-quality non-branded queries from AI.")
 
         return cleaned[:20]
     except Exception as e:
@@ -1175,19 +1162,7 @@ async def generate_brand_questions(url: str) -> list[str]:
             cleaned.append(text if text.endswith("?") else f"{text}?")
 
         if len(cleaned) < 20:
-            for q in _build_non_branded_fallback_questions(url, ctx):
-                key = q.lower().rstrip("?.!")
-                if key in seen:
-                    continue
-                if _is_branded_question(q, blocked_tokens, blocked_phrases, blocked_domain):
-                    continue
-                seen.add(key)
-                cleaned.append(q)
-                if len(cleaned) >= 20:
-                    break
-
-        if len(cleaned) < 12:
-            raise ValueError("Perplexity response parsing failed; insufficient non-branded relevant queries.")
+            raise ValueError("Question generation failed: unable to parse 20 high-quality non-branded queries from AI output.")
         return cleaned[:20]
 
 

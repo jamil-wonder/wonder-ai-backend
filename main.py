@@ -1318,9 +1318,18 @@ async def api_phase5_generate_questions(req: Phase5QuestionsRequest, current_use
             },
         })
         return {"questions": questions}
+    except ValueError as e:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=503,
+            detail="Questions cannot be generated at this moment. Please try again or refresh.",
+        )
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=503,
+            detail="Questions cannot be generated at this moment. Please try again or refresh.",
+        )
 
 @app.post("/api/phase5/analyze", response_model=Phase5AnalyzeResponse)
 async def api_phase5_analyze(req: Phase5AnalyzeRequest, current_user: dict = Depends(get_current_user_optional)):
