@@ -1319,7 +1319,7 @@ async def api_phase5_generate_questions(req: Phase5QuestionsRequest, current_use
         })
         return {"questions": questions}
     except ValueError as e:
-        traceback.print_exc()
+        print(f"[Phase5] generate-questions validation failed: {str(e)}")
         raise HTTPException(
             status_code=503,
             detail="Questions cannot be generated at this moment. Please try again or refresh.",

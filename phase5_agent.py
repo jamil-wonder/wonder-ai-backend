@@ -343,6 +343,42 @@ def _is_branded_question(text: str, blocked_tokens: set[str], blocked_phrases: s
     return False
 
 
+def _is_low_quality_query(text: str) -> bool:
+    raw = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not raw:
+        return True
+
+    # Reject navigation/section-heading leakage from scraped pages.
+    noisy_phrases = [
+        "where to find us",
+        "find us",
+        "about us",
+        "our story",
+        "contact us",
+        "get in touch",
+        "book now",
+        "learn more",
+        "read more",
+        "view more",
+        "click here",
+        "home page",
+        "privacy policy",
+        "terms of service",
+    ]
+    if any(p in raw for p in noisy_phrases):
+        return True
+
+    # Reject obvious placeholder-style wording.
+    if re.search(r"\b(business|company|place)\b", raw):
+        return True
+
+    # Avoid malformed punctuation noise.
+    if "??" in raw:
+        return True
+
+    return False
+
+
 def _pick_vertical_terms(url: str, ctx: dict) -> tuple[str, str]:
     domain = _normalize_domain(url)
     haystack = " ".join(
@@ -1083,6 +1119,8 @@ async def generate_brand_questions(url: str) -> list[str]:
     - Ensure queries are specific to the business category and services in the context.
     - Avoid repetitive wording patterns.
     - Return broad, high-intent user wording only.
+    - Never use placeholder words like "business", "company", or "place".
+    - Never use website section labels like "Where to find us", "About us", "Contact us", or "Learn more".
 
     Return ONLY valid JSON with this schema:
     {{
@@ -1090,80 +1128,150 @@ async def generate_brand_questions(url: str) -> list[str]:
     }}
     """
 
-    response = None
-    for _ in range(3):
-        response = await _call_perplexity_with_retry(
-            base_prompt,
-            retry_once=True,
-            timeout_sec=PERPLEXITY_PHASE5_TIMEOUT_SEC,
-        )
-        if response is not None:
-            break
-        await asyncio.sleep(0.5)
+    blocked_tokens, blocked_phrases, blocked_domain = _extract_brand_terms(url, ctx)
 
-    if response is None:
-        raise RuntimeError("Failed to generate brand questions from Perplexity. Please retry.")
+    def _extract_raw_questions(response: dict | None) -> list[str]:
+        if not isinstance(response, dict):
+            return []
 
-    try:
-        parsed = response if isinstance(response, dict) else {}
+        parsed = response
         if not isinstance(parsed.get("queries"), list):
-            fallback_text = str(parsed.get("_meta_response_text") or "")
-            maybe = _safe_json_parse(fallback_text)
+            maybe = _safe_json_parse(str(parsed.get("_meta_response_text") or ""))
             if isinstance(maybe, dict):
                 parsed = maybe
 
+        structured: list[str] = []
         if isinstance(parsed, dict) and isinstance(parsed.get("queries"), list):
-            questions = parsed.get("queries", [])
+            structured = [str(x) for x in parsed.get("queries", [])]
         elif isinstance(parsed, list):
-            questions = parsed
-        else:
-            questions = [str(parsed)]
+            structured = [str(x) for x in parsed]
 
-        blocked_tokens, blocked_phrases, blocked_domain = _extract_brand_terms(url, ctx)
+        response_text = str(response.get("_meta_response_text") or "")
+        prose_lines = [
+            line.strip("- *1234567890. ")
+            for line in response_text.split("\n")
+            if len(line.strip()) > 10 and "?" in line
+        ]
+
+        return [*structured, *prose_lines]
+
+    quality_attempts = 3
+    best_cleaned: list[str] = []
+    for attempt in range(1, quality_attempts + 1):
+        prompt = base_prompt
+        if attempt > 1:
+            prompt += "\n\nPrevious output had invalid items. Regenerate exactly 20 better non-branded queries."
+
+        response = await _call_perplexity_with_retry(
+            prompt,
+            retry_once=True,
+            timeout_sec=PERPLEXITY_PHASE5_TIMEOUT_SEC,
+        )
+        if response is None:
+            await asyncio.sleep(0.3)
+            continue
+
+        raw_questions = _extract_raw_questions(response)
         cleaned: list[str] = []
         seen = set()
-        for q in questions:
+        for q in raw_questions:
             text = re.sub(r"\s+", " ", str(q).strip())
             if text and text[0].isalpha():
                 text = text[0].upper() + text[1:]
             key = text.lower().rstrip("?.!")
             if len(text) < 12 or key in seen:
                 continue
+            if _is_low_quality_query(text):
+                continue
             if _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain):
                 continue
             seen.add(key)
             cleaned.append(text if text.endswith("?") else f"{text}?")
 
-        if len(cleaned) < 20:
-            raise ValueError("Question generation failed: insufficient high-quality non-branded queries from AI.")
+        if len(cleaned) >= 20:
+            return cleaned[:20]
 
-        return cleaned[:20]
-    except Exception as e:
-        response_text = str(response.get("_meta_response_text") if isinstance(response, dict) else "")
-        print(f"Error parsing Perplexity response: {e}")
-        q_list = [
-            line.strip("- *1234567890. ")
-            for line in response_text.split("\n")
-            if len(line) > 10 and "?" in line
-        ]
-        blocked_tokens, blocked_phrases, blocked_domain = _extract_brand_terms(url, ctx)
-        cleaned: list[str] = []
-        seen = set()
-        for q in q_list:
-            text = re.sub(r"\s+", " ", str(q).strip())
-            if not text:
-                continue
-            if _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain):
-                continue
-            key = text.lower().rstrip("?.!")
-            if key in seen:
-                continue
-            seen.add(key)
-            cleaned.append(text if text.endswith("?") else f"{text}?")
+        if len(cleaned) > len(best_cleaned):
+            best_cleaned = cleaned[:]
 
-        if len(cleaned) < 20:
-            raise ValueError("Question generation failed: unable to parse 20 high-quality non-branded queries from AI output.")
-        return cleaned[:20]
+        print(f"[Phase5] question-gen retry attempt={attempt}/{quality_attempts} valid={len(cleaned)}")
+
+    # AI-only expansion path (no template fallback):
+    # if we already have a strong base set, ask Perplexity to add only missing valid queries.
+    min_seed_for_expand = 10
+    if len(best_cleaned) >= min_seed_for_expand:
+        needed = max(0, 20 - len(best_cleaned))
+        if needed > 0:
+            expand_prompt = f"""
+            You are a search-intent strategist.
+            We already have valid non-branded queries for a business website.
+
+            Existing valid queries:
+            {json.dumps(best_cleaned)}
+
+            Generate exactly {needed} NEW additional queries that satisfy ALL rules:
+            - non-branded only
+            - no business name, no URL/domain, no brand variants
+            - no placeholder words like business/company/place
+            - no website section labels (about us/contact us/where to find us/learn more)
+            - realistic user intent wording
+            - no duplicates or near-duplicates of existing queries
+
+            Return JSON only:
+            {{"queries": ["...", "..."]}}
+            """
+
+            extra_response = await _call_perplexity_with_retry(
+                expand_prompt,
+                retry_once=True,
+                timeout_sec=PERPLEXITY_PHASE5_TIMEOUT_SEC,
+            )
+
+            extra_raw = []
+            if isinstance(extra_response, dict):
+                parsed_extra = extra_response
+                if not isinstance(parsed_extra.get("queries"), list):
+                    maybe = _safe_json_parse(str(parsed_extra.get("_meta_response_text") or ""))
+                    if isinstance(maybe, dict):
+                        parsed_extra = maybe
+                if isinstance(parsed_extra, dict) and isinstance(parsed_extra.get("queries"), list):
+                    extra_raw = [str(x) for x in parsed_extra.get("queries", [])]
+                else:
+                    extra_text = str(extra_response.get("_meta_response_text") or "")
+                    extra_raw = [
+                        line.strip("- *1234567890. ")
+                        for line in extra_text.split("\n")
+                        if len(line.strip()) > 10 and "?" in line
+                    ]
+
+            merged = best_cleaned[:]
+            seen = {q.lower().rstrip("?.!") for q in merged}
+            for q in extra_raw:
+                text = re.sub(r"\s+", " ", str(q).strip())
+                if text and text[0].isalpha():
+                    text = text[0].upper() + text[1:]
+                key = text.lower().rstrip("?.!")
+                if len(text) < 12 or key in seen:
+                    continue
+                if _is_low_quality_query(text):
+                    continue
+                if _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain):
+                    continue
+                seen.add(key)
+                merged.append(text if text.endswith("?") else f"{text}?")
+                if len(merged) >= 20:
+                    break
+
+            if len(merged) >= 20:
+                return merged[:20]
+
+            # Not enough to reach 20, but still return strong validated queries instead of hard-failing.
+            print(f"[Phase5] question-gen partial success valid={len(merged)} (returned without fallback)")
+            return merged
+
+        return best_cleaned[:20]
+
+    raise ValueError("Question generation failed: AI did not return enough valid queries. Please retry.")
 
 
 async def generate_brand_perception_summary(
