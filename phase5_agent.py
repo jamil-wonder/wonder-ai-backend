@@ -127,6 +127,163 @@ def _extract_domains_from_text(text: str) -> list[str]:
     return list(dict.fromkeys(clean))
 
 
+def _is_non_competitor_domain(domain: str) -> bool:
+    d = _normalize_domain(domain)
+    if not d:
+        return True
+    return d in NON_COMPETITOR_DOMAINS
+
+
+def _estimate_target_visibility_score(seed_results: dict) -> int:
+    rows = list(seed_results.values()) if isinstance(seed_results, dict) else []
+    if not rows:
+        return 45
+
+    points = 0.0
+    seen = 0
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        status = str(r.get("status", ""))
+        pos = r.get("position")
+        if isinstance(pos, int) and 1 <= pos <= 10:
+            points += max(20, 110 - (pos * 10))
+            seen += 1
+        elif status == "Mentioned":
+            points += 50
+            seen += 1
+
+    if seen == 0:
+        return 35
+
+    avg = points / seen
+    coverage = seen / max(1, len(rows))
+    score = int(round(avg * 0.7 + (coverage * 100) * 0.3))
+    return max(20, min(95, score))
+
+
+async def _validate_same_niche_competitors_perplexity(
+    *,
+    target_domain: str,
+    target_context: dict,
+    query_texts: list[str],
+    candidates: list[str],
+) -> list[dict]:
+    if not candidates:
+        return []
+
+    compact_context = {
+        "category": str(target_context.get("category") or "").strip(),
+        "location": str(target_context.get("location") or "").strip(),
+        "services": [str(s).strip() for s in (target_context.get("services") or []) if str(s).strip()][:6],
+        "description": str(target_context.get("description") or "").strip()[:180],
+    }
+
+    prompt = f"""
+        You are a strict competitor validation analyst.
+        Use live web search with Perplexity and validate only TRUE direct competitors.
+
+    Target domain: {target_domain}
+    Target context: {json.dumps(compact_context)}
+    Search intents: {json.dumps(query_texts[:20])}
+    Candidate domains: {json.dumps(candidates[:20])}
+
+    Return JSON only:
+    {{
+      "competitors": [
+        {{
+          "domain": "example.com",
+                    "is_direct_competitor": true,
+                    "competitor_type": "independent_business",
+                    "niche_match": 0,
+                    "business_model_match": 0,
+          "score": 0,
+          "position": null,
+          "evidence": "short reason"
+        }}
+      ]
+    }}
+
+    Rules:
+        - Include only same-niche, same customer-intent competitors.
+        - A valid competitor must have both:
+            1) niche_match >= 70
+            2) business_model_match >= 70
+        - competitor_type must be one of:
+            independent_business, marketplace, directory, social_profile, review_listing, media, other
+        - Prefer independent_business.
+        - Reject platforms/profiles/listings when they are not actual competing businesses.
+    - Exclude the target domain.
+    - Max 5 domains.
+        - is_direct_competitor must be true only for real same-niche alternatives.
+        - niche_match and business_model_match must be integers 0..100.
+    - score must be integer 0..100.
+    - position must be 1..10 or null.
+    - JSON only.
+    """
+
+    response = await _call_perplexity_with_retry(
+        prompt,
+        retry_once=False,
+        timeout_sec=10,
+    )
+    if not isinstance(response, dict):
+        return []
+
+    parsed = response
+    if not isinstance(parsed.get("competitors"), list):
+        maybe = _safe_json_parse(str(parsed.get("_meta_response_text") or ""))
+        if isinstance(maybe, dict):
+            parsed = maybe
+
+    raw = parsed.get("competitors", []) if isinstance(parsed, dict) else []
+    if not isinstance(raw, list):
+        return []
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        d = _normalize_domain(item.get("domain", ""))
+        is_direct = bool(item.get("is_direct_competitor", False))
+        competitor_type = str(item.get("competitor_type", "")).strip().lower()
+        niche_match = item.get("niche_match") if isinstance(item.get("niche_match"), int) else 0
+        model_match = item.get("business_model_match") if isinstance(item.get("business_model_match"), int) else 0
+        if (
+            not d
+            or d == target_domain
+            or _is_non_competitor_domain(d)
+            or d in seen
+        ):
+            continue
+        if not is_direct:
+            continue
+        if competitor_type != "independent_business":
+            continue
+        if niche_match < 70 or model_match < 70:
+            continue
+        score = item.get("score")
+        if not isinstance(score, int):
+            score = 60
+        score = max(0, min(100, score))
+        pos = item.get("position")
+        if not isinstance(pos, int) or pos < 1 or pos > 10:
+            pos = None
+        out.append(
+            {
+                "domain": d,
+                "position": pos,
+                "score": score,
+                "evidence": str(item.get("evidence", "")).strip()[:180],
+            }
+        )
+        seen.add(d)
+        if len(out) >= 5:
+            break
+    return out
+
+
 def _normalize_url(url: str) -> str:
     value = str(url or "").strip()
     if not value:
@@ -134,6 +291,100 @@ def _normalize_url(url: str) -> str:
     if not re.match(r"^https?://", value, re.I):
         value = f"https://{value}"
     return value
+
+
+def _extract_brand_terms(url: str, ctx: dict) -> tuple[set[str], set[str], str]:
+    domain = _normalize_domain(url)
+    domain_tokens = [t for t in re.split(r"[.\-]", domain) if t]
+
+    raw_name = str(ctx.get("name") or "").strip().lower()
+    name_phrase = re.sub(r"\s+", " ", raw_name)
+    name_tokens = re.findall(r"[a-z0-9']+", name_phrase)
+
+    # Keep common category/location words available for good generic query intent.
+    keep_words = {
+        "restaurant", "restaurants", "london", "belgravia", "bar", "hotel", "cafe",
+        "grill", "kitchen", "club", "store", "shop", "salon", "spa", "clinic",
+    }
+    blocked_tokens: set[str] = set()
+    for token in [*domain_tokens, *name_tokens]:
+        t = token.strip().lower()
+        if len(t) < 4:
+            continue
+        if t in keep_words:
+            continue
+        blocked_tokens.add(t)
+
+    blocked_phrases: set[str] = set()
+    if name_phrase and len(name_phrase) >= 5:
+        blocked_phrases.add(name_phrase)
+
+    return blocked_tokens, blocked_phrases, domain
+
+
+def _is_branded_question(text: str, blocked_tokens: set[str], blocked_phrases: set[str], domain: str) -> bool:
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return True
+
+    if domain and domain in raw:
+        return True
+    if "http://" in raw or "https://" in raw or "www." in raw:
+        return True
+
+    for phrase in blocked_phrases:
+        if phrase and phrase in raw:
+            return True
+
+    for token in blocked_tokens:
+        if re.search(rf"\b{re.escape(token)}\b", raw):
+            return True
+
+    return False
+
+
+def _build_non_branded_fallback_questions(ctx: dict) -> list[str]:
+    category_raw = str(ctx.get("category") or "").strip()
+    category = category_raw if category_raw else "business"
+    location = str(ctx.get("location") or "").strip()
+    services = [str(s).strip() for s in (ctx.get("services") or []) if str(s).strip()]
+    service = services[0] if services else f"{category}"
+
+    templates = [
+        f"Best {category} options{' in ' + location if location else ' nearby'}?",
+        f"Top-rated {category} with great value{' in ' + location if location else ''}?",
+        f"Newly opened {category}{' in ' + location if location else ''} this year?",
+        f"Upscale {category}{' near ' + location if location else ' nearby'}?",
+        f"Which {category} has the best customer reviews{' in ' + location if location else ''}?",
+        f"Where to find standout {service}{' in ' + location if location else ''}?",
+        f"Best {category} for special occasions{' in ' + location if location else ''}?",
+        f"Top {category} with strong service quality{' in ' + location if location else ''}?",
+        f"Most recommended {category}{' in ' + location if location else ''} right now?",
+        f"Which {category} offers the best overall experience{' in ' + location if location else ''}?",
+        f"Great {category} for date night{' in ' + location if location else ''}?",
+        f"Best {category} for business dinners{' in ' + location if location else ''}?",
+        f"Where can I book a premium {category} experience{' in ' + location if location else ''}?",
+        f"Top hidden-gem {category}{' in ' + location if location else ''}?",
+        f"Best value-for-money {category}{' in ' + location if location else ''}?",
+        f"What are the most talked-about {category}{' in ' + location if location else ''}?",
+        f"Which {category} is trending this month{' in ' + location if location else ''}?",
+        f"Best {category} with a strong menu selection{' in ' + location if location else ''}?",
+        f"Top choices for high-quality {service}{' in ' + location if location else ''}?",
+        f"Where should I go for reliable {category}{' in ' + location if location else ''}?",
+        f"Best premium {category} alternatives{' in ' + location if location else ''}?",
+        f"Most consistent {category} for quality and atmosphere{' in ' + location if location else ''}?",
+    ]
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for q in templates:
+        text = re.sub(r"\s+", " ", q).strip()
+        key = text.lower().rstrip("?.!")
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text if text.endswith("?") else f"{text}?")
+    return cleaned
 
 
 def _extract_text_value(node) -> str:
@@ -775,12 +1026,14 @@ async def generate_brand_questions(url: str) -> list[str]:
 
     Requirements:
     - Cover intent diversity: discovery, comparison, trust, pricing, urgency, and location.
-    - Mix branded queries (business name) and non-branded queries.
+    - All 20 queries must be non-branded.
+    - Do NOT include the business name, any brand name, website URL, or domain in any query.
+    - Do NOT include direct entity-name variants, abbreviations, or possessive forms.
     - Include local intent queries when location context exists.
     - Keep queries conversational and realistic.
     - Ensure queries are specific to the business category and services in the context.
     - Avoid repetitive wording patterns.
-    - Avoid directly including the raw domain unless naturally phrased.
+    - Return broad, high-intent user wording only.
 
     Return ONLY valid JSON with this schema:
     {{
@@ -817,6 +1070,7 @@ async def generate_brand_questions(url: str) -> list[str]:
         else:
             questions = [str(parsed)]
 
+        blocked_tokens, blocked_phrases, blocked_domain = _extract_brand_terms(url, ctx)
         cleaned: list[str] = []
         seen = set()
         for q in questions:
@@ -826,11 +1080,26 @@ async def generate_brand_questions(url: str) -> list[str]:
             key = text.lower().rstrip("?.!")
             if len(text) < 12 or key in seen:
                 continue
+            if _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain):
+                continue
             seen.add(key)
             cleaned.append(text if text.endswith("?") else f"{text}?")
 
+        if len(cleaned) < 20:
+            fallback = _build_non_branded_fallback_questions(ctx)
+            for q in fallback:
+                key = q.lower().rstrip("?.!")
+                if key in seen:
+                    continue
+                if _is_branded_question(q, blocked_tokens, blocked_phrases, blocked_domain):
+                    continue
+                seen.add(key)
+                cleaned.append(q)
+                if len(cleaned) >= 20:
+                    break
+
         if len(cleaned) < 12:
-            raise ValueError("Perplexity returned too few valid, relevant queries.")
+            raise ValueError("Perplexity returned too few non-branded, relevant queries.")
 
         return cleaned[:20]
     except Exception as e:
@@ -841,9 +1110,36 @@ async def generate_brand_questions(url: str) -> list[str]:
             for line in response_text.split("\n")
             if len(line) > 10 and "?" in line
         ]
-        if len(q_list) < 12:
-            raise ValueError("Perplexity response parsing failed; insufficient relevant queries.")
-        return q_list[:20]
+        blocked_tokens, blocked_phrases, blocked_domain = _extract_brand_terms(url, ctx)
+        cleaned: list[str] = []
+        seen = set()
+        for q in q_list:
+            text = re.sub(r"\s+", " ", str(q).strip())
+            if not text:
+                continue
+            if _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain):
+                continue
+            key = text.lower().rstrip("?.!")
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(text if text.endswith("?") else f"{text}?")
+
+        if len(cleaned) < 20:
+            for q in _build_non_branded_fallback_questions(ctx):
+                key = q.lower().rstrip("?.!")
+                if key in seen:
+                    continue
+                if _is_branded_question(q, blocked_tokens, blocked_phrases, blocked_domain):
+                    continue
+                seen.add(key)
+                cleaned.append(q)
+                if len(cleaned) >= 20:
+                    break
+
+        if len(cleaned) < 12:
+            raise ValueError("Perplexity response parsing failed; insufficient non-branded relevant queries.")
+        return cleaned[:20]
 
 
 async def generate_brand_perception_summary(
@@ -1003,7 +1299,10 @@ async def generate_deep_competitor_scores(
                 if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
                     candidate_counts[d] = candidate_counts.get(d, 0) + 1
 
-    top_candidates = [d for d, _ in sorted(candidate_counts.items(), key=lambda kv: kv[1], reverse=True)[:12]]
+    sorted_candidates = sorted(candidate_counts.items(), key=lambda kv: kv[1], reverse=True)
+    top_candidates = [d for d, hits in sorted_candidates if hits >= 2 and not _is_non_competitor_domain(d)][:12]
+    if not top_candidates:
+        top_candidates = [d for d, _ in sorted_candidates if not _is_non_competitor_domain(d)][:12]
     if not top_candidates:
         # Quick grounded probe fallback to avoid empty competitor lists.
         probe_text = " ; ".join([q.get("text", "") for q in questions[:5]])
@@ -1023,18 +1322,26 @@ async def generate_deep_competitor_scores(
                 probe_domains.extend(_extract_domains_from_text(str(probe_response.get("_meta_response_text") or "")))
         for d in probe_domains:
             nd = _normalize_domain(d)
-            if nd and nd != domain and nd not in NON_COMPETITOR_DOMAINS:
+            if nd and nd != domain and not _is_non_competitor_domain(nd):
                 candidate_counts[nd] = candidate_counts.get(nd, 0) + 1
 
         top_candidates = [d for d, _ in sorted(candidate_counts.items(), key=lambda kv: kv[1], reverse=True)[:12]]
         if not top_candidates:
-            return []
+            target_score = _estimate_target_visibility_score(seed_results)
+            return [
+                {
+                    "domain": domain,
+                    "position": None,
+                    "score": target_score,
+                    "evidence": "Your site score from visibility and rank consistency across analyzed prompts.",
+                }
+            ]
 
     # Fast deterministic fallback from observed first-pass signals.
     heuristic_scores: list[dict] = []
     max_hits = max(candidate_counts.values()) if candidate_counts else 1
     for d, hits in sorted(candidate_counts.items(), key=lambda kv: kv[1], reverse=True):
-        if d in NON_COMPETITOR_DOMAINS or d == domain:
+        if _is_non_competitor_domain(d) or d == domain:
             continue
         score = int(round((hits / max_hits) * 100)) if max_hits > 0 else 50
         heuristic_scores.append(
@@ -1072,7 +1379,8 @@ async def generate_deep_competitor_scores(
     Rules:
     - Max 5 competitors.
     - Direct competitors only (same intent/category overlap).
-    - Exclude aggregator/listing/general platform sites.
+    - Prefer independent business websites that users can choose instead of the target.
+    - Avoid platform/profile/listing style domains when they are not actual competing businesses.
     - Exclude target domain.
     - score must be integer 0..100.
     - position must be 1..10 or null.
@@ -1086,7 +1394,16 @@ async def generate_deep_competitor_scores(
     )
 
     if response is None:
-        return heuristic_scores
+        target_score = _estimate_target_visibility_score(seed_results)
+        return [
+            *heuristic_scores,
+            {
+                "domain": domain,
+                "position": None,
+                "score": target_score,
+                "evidence": "Your site score from visibility and rank consistency across analyzed prompts.",
+            },
+        ][:6]
 
     parsed = response if isinstance(response, dict) else {}
     if not isinstance(parsed.get("competitors"), list):
@@ -1106,7 +1423,7 @@ async def generate_deep_competitor_scores(
         if (
             not d
             or d == domain
-            or d in NON_COMPETITOR_DOMAINS
+            or _is_non_competitor_domain(d)
             or d in seen
         ):
             continue
@@ -1129,7 +1446,30 @@ async def generate_deep_competitor_scores(
         if len(out) >= 5:
             break
 
-    return out if out else heuristic_scores
+    combined_pool = list(dict.fromkeys([*top_candidates, *[c.get("domain", "") for c in out], *[h.get("domain", "") for h in heuristic_scores]]))
+    combined_pool = [d for d in combined_pool if isinstance(d, str) and d and d != domain and not _is_non_competitor_domain(d)][:20]
+
+    validated = await _validate_same_niche_competitors_perplexity(
+        target_domain=domain,
+        target_context=await _fetch_page_context(url),
+        query_texts=compact_questions,
+        candidates=combined_pool,
+    )
+
+    final_competitors = validated if validated else (out if out else heuristic_scores)
+    final_competitors = [c for c in final_competitors if _normalize_domain(c.get("domain", "")) != domain and not _is_non_competitor_domain(c.get("domain", ""))][:5]
+
+    target_score = _estimate_target_visibility_score(seed_results)
+    final_competitors.append(
+        {
+            "domain": domain,
+            "position": None,
+            "score": target_score,
+            "evidence": "Your site score from visibility and rank consistency across analyzed prompts.",
+        }
+    )
+
+    return final_competitors
 
 async def _analyze_single_question_openai(url: str, question: dict, include_competitors: bool = False) -> dict:
     domain_match = re.search(r'(?:https?://)?(?:www\.)?([^/]+)', url)

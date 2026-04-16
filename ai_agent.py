@@ -77,9 +77,9 @@ async def _perplexity_response_json(
 
 
 def _openai_model_name() -> str:
-    model = (os.getenv("OPENAI_MODEL_PHASE5") or "").strip()
+    model = (os.getenv("OPENAI_MODEL_PHASE1") or os.getenv("OPENAI_MODEL_PHASE5") or "").strip()
     if not model:
-        raise RuntimeError("OPENAI_MODEL_PHASE5 is not configured")
+        raise RuntimeError("OPENAI_MODEL_PHASE1/OPENAI_MODEL_PHASE5 is not configured")
     return model
 
 
@@ -99,7 +99,10 @@ async def _openai_chat_json(
 ) -> tuple[dict, str]:
     api_key = _openai_api_key()
     model = _openai_model_name()
-    payload = {
+    model_lower = model.lower()
+    is_gpt5_family = model_lower.startswith("gpt-5")
+
+    chat_payload = {
         "model": model,
         "temperature": temperature,
         "max_tokens": max_tokens,
@@ -109,20 +112,212 @@ async def _openai_chat_json(
             {"role": "user", "content": prompt},
         ],
     }
+    responses_payload = {
+        "model": model,
+        "input": prompt,
+        "max_output_tokens": max_tokens,
+    }
+
     async with httpx.AsyncClient(timeout=timeout_seconds) as http:
-        res = await http.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
+        if is_gpt5_family:
+            res = await http.post(
+                "https://api.openai.com/v1/responses",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=responses_payload,
+            )
+        else:
+            res = await http.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=chat_payload,
+            )
         res.raise_for_status()
         data = res.json()
-    content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+
+    if is_gpt5_family:
+        content = str(data.get("output_text") or "")
+        if not content:
+            output = data.get("output")
+            if isinstance(output, list):
+                parts: list[str] = []
+                for item in output:
+                    if not isinstance(item, dict):
+                        continue
+                    block = item.get("content")
+                    if isinstance(block, list):
+                        for c in block:
+                            if isinstance(c, dict):
+                                t = c.get("text")
+                                if isinstance(t, str) and t.strip():
+                                    parts.append(t)
+                    elif isinstance(block, str) and block.strip():
+                        parts.append(block)
+                content = "\n".join(parts).strip()
+    else:
+        content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+
     parsed = _safe_json_parse(content)
     return (parsed if isinstance(parsed, dict) else {}), model
+
+
+async def get_phase1_perplexity_contact_extraction(
+    url: str,
+    business_name: str,
+    page_text_excerpt: str,
+    current_data: dict,
+) -> dict:
+    compact_text = re.sub(r"\s+", " ", page_text_excerpt or "").strip()[:16000]
+    seed = {
+        "emails": current_data.get("emails", [])[:8],
+        "phones": current_data.get("phones", [])[:8],
+        "addresses": current_data.get("addresses", [])[:6],
+        "openingHours": current_data.get("openingHours", [])[:8],
+        "socialLinks": current_data.get("socialLinks", {}),
+    }
+
+    prompt = f"""
+    You are a business data extractor.
+    Use URL + provided text excerpt + existing extracted fields to find missing business contact details.
+
+    URL: {url}
+    Business name: {business_name}
+    Current extracted data: {json.dumps(seed)}
+
+    Visible page text excerpt:
+    {compact_text}
+
+    Return strict JSON only:
+    {{
+      "emails": ["contact@example.com"],
+      "phones": ["+44 20 7946 0958"],
+      "addresses": ["221B Baker Street, London NW1 6XE"],
+      "openingHours": ["Mon-Fri: 09:00-18:00"],
+      "socialLinks": {{"instagram": "https://instagram.com/example"}},
+      "hasBookingPath": false,
+      "confidence": {{
+        "emails": 0,
+        "phones": 0,
+        "addresses": 0,
+        "openingHours": 0,
+        "socialLinks": 0,
+        "bookingPath": 0
+      }}
+    }}
+
+    Rules:
+    - Do not invent facts.
+    - Prefer values visible in the text excerpt or clearly tied to the URL/business.
+    - confidence values must be integers 0..100.
+    - JSON only.
+    """
+
+    try:
+        parsed, model = await _perplexity_response_json(prompt=prompt, timeout_seconds=90)
+        if not isinstance(parsed, dict):
+            parsed = {}
+        return {
+            "emails": parsed.get("emails", []) if isinstance(parsed.get("emails"), list) else [],
+            "phones": parsed.get("phones", []) if isinstance(parsed.get("phones"), list) else [],
+            "addresses": parsed.get("addresses", []) if isinstance(parsed.get("addresses"), list) else [],
+            "openingHours": parsed.get("openingHours", []) if isinstance(parsed.get("openingHours"), list) else [],
+            "socialLinks": parsed.get("socialLinks", {}) if isinstance(parsed.get("socialLinks"), dict) else {},
+            "hasBookingPath": bool(parsed.get("hasBookingPath", False)),
+            "confidence": parsed.get("confidence", {}) if isinstance(parsed.get("confidence"), dict) else {},
+            "modelUsed": model,
+        }
+    except Exception as e:
+        print(f"Error in phase1 Perplexity contact extraction: {e}")
+        return {
+            "emails": [],
+            "phones": [],
+            "addresses": [],
+            "openingHours": [],
+            "socialLinks": {},
+            "hasBookingPath": False,
+            "confidence": {},
+            "modelUsed": "Perplexity",
+        }
+
+
+async def get_phase1_deep_analyzer(
+    url: str,
+    business_name: str,
+    page_text_excerpt: str,
+    current_data: dict,
+) -> dict:
+    compact_text = re.sub(r"\s+", " ", page_text_excerpt or "").strip()[:16000]
+    seed = {
+        "emails": current_data.get("emails", [])[:8],
+        "phones": current_data.get("phones", [])[:8],
+        "addresses": current_data.get("addresses", [])[:6],
+        "openingHours": current_data.get("openingHours", [])[:8],
+        "socialLinks": current_data.get("socialLinks", {}),
+    }
+
+    prompt = f"""
+    You are a website quality analyst.
+    Based on URL, business name, current extracted fields and page text, give short practical improvement suggestions.
+
+    URL: {url}
+    Business name: {business_name}
+    Current extracted data: {json.dumps(seed)}
+    Visible page text excerpt:
+    {compact_text}
+
+    Return strict JSON only:
+    {{
+      "suggestions": {{
+        "Business name": "...",
+        "Description": "...",
+        "Logo": "...",
+        "Language": "...",
+        "Phone": "...",
+        "Email": "...",
+        "Address": "...",
+        "Hours visible": "...",
+        "Hours in schema": "...",
+        "Social links": "...",
+        "Booking path": "...",
+        "Schema present": "...",
+        "Correct type": "...",
+        "Key fields": "...",
+        "HTTPS": "...",
+        "Mobile": "...",
+        "Canonical": "...",
+        "Sitemap": "...",
+        "Robots": "..."
+      }}
+    }}
+
+    Rules:
+    - Keep each suggestion concise (max 150 chars).
+    - JSON only.
+    """
+
+    try:
+        parsed, model = await _openai_chat_json(
+            prompt=prompt,
+            timeout_seconds=180,
+            temperature=0.1,
+            max_tokens=2500,
+        )
+        if not isinstance(parsed, dict):
+            parsed = {}
+        return {
+            "suggestions": parsed.get("suggestions", {}) if isinstance(parsed.get("suggestions"), dict) else {},
+            "modelUsed": model,
+        }
+    except Exception as e:
+        print(f"Error in phase1 deep analyzer: {e}")
+        return {
+            "suggestions": {},
+        }
 
 
 async def _openai_vision_json(
@@ -184,9 +379,15 @@ def _model_used(response) -> str:
     return model if isinstance(model, str) and model.strip() else "unknown"
 
 
+def _strip_numeric_citations(text: str) -> str:
+    # Removes citation markers like [1], [6], [10], including chained forms like [1][6].
+    cleaned = re.sub(r"\[(\d{1,3}(\s*,\s*\d{1,3})*)\]", "", str(text or ""))
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def _normalize_insight_payload(payload: dict, model_name: str) -> dict:
     summary_raw = str(payload.get("summary") or "No data returned.").strip()
-    summary = re.sub(r"\s+", " ", summary_raw)
+    summary = _strip_numeric_citations(summary_raw)
     if len(summary) > 900:
         summary = summary[:897].rstrip() + "..."
 
@@ -200,7 +401,7 @@ def _normalize_insight_payload(payload: dict, model_name: str) -> dict:
         evidence = []
     cleaned_evidence = []
     for item in evidence:
-        text = re.sub(r"\s+", " ", str(item or "")).strip()
+        text = _strip_numeric_citations(str(item or ""))
         if not text:
             continue
         if len(text) > 240:
@@ -305,7 +506,7 @@ async def get_ai_insights_openai(business_name: str, url: str) -> dict:
         return _normalize_insight_payload(parsed, model)
     except Exception as e:
         print(f"Error fetching OpenAI insights: {e}")
-        fallback_model = (os.getenv("OPENAI_MODEL_PHASE5") or "OpenAI").strip()
+        fallback_model = (os.getenv("OPENAI_MODEL_PHASE1") or os.getenv("OPENAI_MODEL_PHASE5") or "OpenAI").strip()
         return _normalize_insight_payload({
             "isKnown": False,
             "summary": "Failed to fetch AI insights.",
@@ -541,11 +742,9 @@ async def get_phase1_contact_fallback(url: str, business_name: str) -> dict:
     """
 
     try:
-        parsed, model = await _openai_chat_json(
+        parsed, model = await _perplexity_response_json(
             prompt=prompt,
             timeout_seconds=90,
-            temperature=0.0,
-            max_tokens=1800,
         )
         if not isinstance(parsed, dict):
             return {"emails": [], "phones": [], "addresses": [], "openingHours": [], "confidence": {}, "modelUsed": model}

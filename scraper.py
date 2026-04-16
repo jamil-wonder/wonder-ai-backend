@@ -590,11 +590,20 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
             "vision": False,
             "enrichment": False,
             "contact_fallback": False,
+            "perplexity_extract": False,
         },
         "models": {
             "vision": None,
             "enrichment": None,
             "contact_fallback": None,
+            "perplexity_extract": None,
+        },
+        "perplexity_extract": {
+            "emails": [],
+            "phones": [],
+            "addresses": [],
+            "openingHours": [],
+            "confidence": {},
         },
         "confidence": {},
         "thresholds": AI_ENRICHMENT_CONFIDENCE_THRESHOLDS,
@@ -659,35 +668,74 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
     try:
         if not allow_ai_enrichment:
             raise RuntimeError("AI enrichment skipped for reduced analysis mode")
-        print("[AI] Phase1 enrichment started")
+        print("[AI] Phase1 enrichment started (Perplexity extract + GPT deep analyzer)")
         text_blocks = []
         for s_doc in all_soups:
             text_blocks.append(s_doc.get_text(" ", strip=True))
         text_excerpt = re.sub(r'\s+', ' ', " ".join(text_blocks)).strip()[:16000]
 
-        enrichment = await asyncio.wait_for(
-            ai_agent.get_phase1_enrichment(
-                url=target_url,
-                business_name=business_name,
-                page_text_excerpt=text_excerpt,
-                current_data={
-                    "emails": clean_set(emails),
-                    "phones": clean_set(phones),
-                    "addresses": [x for x in addresses if x],
-                    "openingHours": [str(x) for x in opening_hours],
-                    "socialLinks": social_links,
-                },
+        current_data_snapshot = {
+            "emails": clean_set(emails),
+            "phones": clean_set(phones),
+            "addresses": [x for x in addresses if x],
+            "openingHours": [str(x) for x in opening_hours],
+            "socialLinks": social_links,
+        }
+
+        perplexity_extract, deep_analysis = await asyncio.wait_for(
+            asyncio.gather(
+                ai_agent.get_phase1_perplexity_contact_extraction(
+                    url=target_url,
+                    business_name=business_name,
+                    page_text_excerpt=text_excerpt,
+                    current_data=current_data_snapshot,
+                ),
+                ai_agent.get_phase1_deep_analyzer(
+                    url=target_url,
+                    business_name=business_name,
+                    page_text_excerpt=text_excerpt,
+                    current_data=current_data_snapshot,
+                ),
             ),
             timeout=PHASE1_AI_ENRICH_TIMEOUT_SECONDS,
         )
 
+        if not isinstance(perplexity_extract, dict):
+            perplexity_extract = {}
+        if not isinstance(deep_analysis, dict):
+            deep_analysis = {}
+
         ai_debug["ran"] = True
         ai_debug["calls"]["enrichment"] = True
-        if isinstance(enrichment, dict):
-            ai_debug["models"]["enrichment"] = enrichment.get("modelUsed")
-        confidence = enrichment.get("confidence", {}) if isinstance(enrichment.get("confidence"), dict) else {}
+        ai_debug["calls"]["perplexity_extract"] = True
+        ai_debug["models"]["perplexity_extract"] = perplexity_extract.get("modelUsed")
+        ai_debug["models"]["enrichment"] = deep_analysis.get("modelUsed")
+        ai_debug["perplexity_extract"] = {
+            "emails": [str(v) for v in (perplexity_extract.get("emails", []) or [])][:5],
+            "phones": [str(v) for v in (perplexity_extract.get("phones", []) or [])][:5],
+            "addresses": [str(v) for v in (perplexity_extract.get("addresses", []) or [])][:3],
+            "openingHours": [str(v) for v in (perplexity_extract.get("openingHours", []) or [])][:5],
+            "confidence": perplexity_extract.get("confidence", {}) if isinstance(perplexity_extract.get("confidence"), dict) else {},
+        }
+
+        confidence = perplexity_extract.get("confidence", {}) if isinstance(perplexity_extract.get("confidence"), dict) else {}
         ai_debug["confidence"] = confidence
         text_excerpt_lower = text_excerpt.lower()
+        target_host = (urlparse(target_url).netloc or "").strip().lower().replace("www.", "")
+
+        def email_domain_matches_target(email_value: str) -> bool:
+            if "@" not in email_value:
+                return False
+            domain = email_value.split("@", 1)[1].strip().lower()
+            return bool(domain) and (domain == target_host or domain.endswith(f".{target_host}"))
+
+        def looks_like_opening_hours(value: str) -> bool:
+            raw = str(value or "").strip().lower()
+            if not raw:
+                return False
+            has_day = bool(re.search(r"\b(mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|daily|weekend)\b", raw))
+            has_time = bool(re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm)?\b", raw))
+            return has_day or has_time
 
         def conf_ok(key: str) -> bool:
             raw = confidence.get(key, 0)
@@ -695,20 +743,20 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
             return value >= AI_ENRICHMENT_CONFIDENCE_THRESHOLDS[key]
 
         if conf_ok("phones"):
-            for p in enrichment.get("phones", []):
+            for p in perplexity_extract.get("phones", []):
                 p_str = normalise_phone(str(p))
                 if len(re.sub(r'\D', '', p_str)) >= 7:
                     phones.add(p_str)
                     ai_debug["merged"]["phones"] += 1
         else:
-            ai_debug["blocked"]["phones"] = len(enrichment.get("phones", []))
+            ai_debug["blocked"]["phones"] = len(perplexity_extract.get("phones", []))
 
         # Email fallback: if confidence metadata is missing/low, still accept emails that literally exist on page text.
-        for e in enrichment.get("emails", []):
+        for e in perplexity_extract.get("emails", []):
             e_str = str(e).strip().lower()
             if not EMAIL_REGEX.match(e_str):
                 continue
-            if conf_ok("emails") or (e_str in text_excerpt_lower):
+            if conf_ok("emails") or (e_str in text_excerpt_lower) or email_domain_matches_target(e_str):
                 before = len(emails)
                 emails.add(e_str)
                 if len(emails) > before:
@@ -717,37 +765,39 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
                 ai_debug["blocked"]["emails"] += 1
 
         if conf_ok("addresses"):
-            for a in enrichment.get("addresses", []):
+            for a in perplexity_extract.get("addresses", []):
                 a_str = str(a).strip()
                 if len(a_str) >= 10:
                     addresses.add(a_str)
                     ai_debug["merged"]["addresses"] += 1
         else:
-            ai_debug["blocked"]["addresses"] = len(enrichment.get("addresses", []))
+            ai_debug["blocked"]["addresses"] = len(perplexity_extract.get("addresses", []))
 
-        if conf_ok("openingHours"):
-            for h in enrichment.get("openingHours", []):
-                h_str = str(h).strip()
-                if h_str:
-                    opening_hours.append(h_str)
-                    ai_debug["merged"]["openingHours"] += 1
-        else:
-            ai_debug["blocked"]["openingHours"] = len(enrichment.get("openingHours", []))
+        for h in perplexity_extract.get("openingHours", []):
+            h_str = str(h).strip()
+            if not h_str:
+                continue
+            if conf_ok("openingHours") or looks_like_opening_hours(h_str):
+                opening_hours.append(h_str)
+                ai_debug["merged"]["openingHours"] += 1
+            else:
+                ai_debug["blocked"]["openingHours"] += 1
 
         if conf_ok("socialLinks"):
-            ai_social_links = enrichment.get("socialLinks", {}) if isinstance(enrichment.get("socialLinks"), dict) else {}
+            ai_social_links = perplexity_extract.get("socialLinks", {}) if isinstance(perplexity_extract.get("socialLinks"), dict) else {}
             for platform, link in ai_social_links.items():
                 if platform not in social_links and isinstance(link, str) and link.strip():
                     social_links[platform] = link.strip()
                     ai_debug["merged"]["socialLinks"] += 1
         else:
-            ai_social_links = enrichment.get("socialLinks", {}) if isinstance(enrichment.get("socialLinks"), dict) else {}
+            ai_social_links = perplexity_extract.get("socialLinks", {}) if isinstance(perplexity_extract.get("socialLinks"), dict) else {}
             ai_debug["blocked"]["socialLinks"] = len(ai_social_links)
 
-        ai_booking_path = bool(enrichment.get("hasBookingPath", False)) if conf_ok("bookingPath") else False
+        ai_booking_path = bool(perplexity_extract.get("hasBookingPath", False)) if conf_ok("bookingPath") else False
         ai_debug["merged"]["bookingPath"] = ai_booking_path
-        ai_debug["blocked"]["bookingPath"] = bool(enrichment.get("hasBookingPath", False)) and not ai_booking_path
-        ai_suggestions = enrichment.get("suggestions", {}) if isinstance(enrichment.get("suggestions"), dict) else {}
+        ai_debug["blocked"]["bookingPath"] = bool(perplexity_extract.get("hasBookingPath", False)) and not ai_booking_path
+
+        ai_suggestions = deep_analysis.get("suggestions", {}) if isinstance(deep_analysis.get("suggestions"), dict) else {}
         print("[AI] Phase1 enrichment completed")
     except asyncio.TimeoutError:
         print(f"Phase1 enrichment error: timeout while waiting for AI enrichment response ({PHASE1_AI_ENRICH_TIMEOUT_SECONDS}s)")

@@ -1984,9 +1984,57 @@ async def _phase5_worker_startup():
             print(f"[Phase5] Redis unavailable ({PHASE5_REDIS_URL}). Falling back to Mongo polling workers.")
             app.state.phase5_redis = None
 
-    await phase5_jobs_col.create_index("job_id", unique=True)
-    await phase5_jobs_col.create_index("status")
-    await phase5_jobs_col.create_index("request_hash")
+    # Indexes tuned to current Phase 5 query/update patterns.
+    try:
+        # Direct lookups
+        await phase5_jobs_col.create_index("job_id", unique=True)
+
+        # Worker claim path: find queued jobs sorted by priority and creation time.
+        await phase5_jobs_col.create_index([
+            ("status", 1),
+            ("queue_priority", 1),
+            ("created_at", 1),
+        ])
+
+        # Reuse path: request hash + job type + status sorted by latest update.
+        await phase5_jobs_col.create_index([
+            ("request_hash", 1),
+            ("job_type", 1),
+            ("status", 1),
+            ("updated_at", -1),
+        ])
+
+        # User history and trend listing paths.
+        await phase5_jobs_col.create_index([
+            ("user_id", 1),
+            ("created_at", -1),
+        ])
+        await phase5_jobs_col.create_index([
+            ("user_id", 1),
+            ("status", 1),
+            ("created_at", -1),
+        ])
+
+        # Stale job sweeps and startup recovery updates.
+        await phase5_jobs_col.create_index([
+            ("status", 1),
+            ("updated_at", 1),
+        ])
+
+        # Existing standalone index kept for compatibility with older lookups.
+        await phase5_jobs_col.create_index("request_hash")
+
+        # Related collections used by history endpoints.
+        if urls_col is not None:
+            await urls_col.create_index([
+                ("user_id", 1),
+                ("timestamp", -1),
+            ])
+        if user_history_meta_col is not None:
+            await user_history_meta_col.create_index("user_id", unique=True)
+    except Exception:
+        print("[Phase5] warning: index creation failed; continuing without blocking startup")
+        traceback.print_exc()
 
     # Cost-safety default: do not auto-resume previously queued/in-progress jobs after restart
     # unless explicitly enabled via env.
