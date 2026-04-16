@@ -343,36 +343,85 @@ def _is_branded_question(text: str, blocked_tokens: set[str], blocked_phrases: s
     return False
 
 
-def _build_non_branded_fallback_questions(ctx: dict) -> list[str]:
-    category_raw = str(ctx.get("category") or "").strip()
-    category = category_raw if category_raw else "business"
+def _pick_vertical_terms(url: str, ctx: dict) -> tuple[str, str]:
+    domain = _normalize_domain(url)
+    haystack = " ".join(
+        [
+            domain,
+            str(ctx.get("category") or ""),
+            str(ctx.get("name") or ""),
+            str(ctx.get("description") or ""),
+            " ".join([str(s) for s in (ctx.get("services") or [])]),
+        ]
+    ).lower()
+
+    if any(k in haystack for k in ["restaurant", "dining", "menu", "bar", "food", "brunch", "lunch", "dinner"]):
+        return "restaurant", "restaurants"
+    if any(k in haystack for k in ["hotel", "resort", "stay", "accommodation"]):
+        return "hotel", "hotels"
+    if any(k in haystack for k in ["clinic", "dental", "doctor", "medical", "health"]):
+        return "clinic", "clinics"
+    if any(k in haystack for k in ["law", "attorney", "legal"]):
+        return "law firm", "law firms"
+    if any(k in haystack for k in ["agency", "studio", "portfolio", "designer", "developer"]):
+        return "agency", "agencies"
+    if any(k in haystack for k in ["salon", "spa", "beauty", "barber"]):
+        return "salon", "salons"
+    if any(k in haystack for k in ["shop", "store", "retail", "boutique"]):
+        return "store", "stores"
+
+    return "service", "services"
+
+
+def _clean_service_hint(raw_services: list) -> str:
+    for item in raw_services:
+        text = re.sub(r"\s+", " ", str(item or "")).strip()
+        if not text:
+            continue
+        if "?" in text:
+            continue
+        if len(text) < 4 or len(text) > 45:
+            continue
+        # avoid promo/cta-like heading fragments
+        lowered = text.lower()
+        if any(token in lowered for token in ["book now", "learn more", "contact", "party", "event"]):
+            continue
+        return text
+    return ""
+
+
+def _build_non_branded_fallback_questions(url: str, ctx: dict) -> list[str]:
+    singular, plural = _pick_vertical_terms(url, ctx)
     location = str(ctx.get("location") or "").strip()
     services = [str(s).strip() for s in (ctx.get("services") or []) if str(s).strip()]
-    service = services[0] if services else f"{category}"
+    service_hint = _clean_service_hint(services)
+    service_phrase = service_hint if service_hint else singular
+
+    where = f" in {location}" if location else " nearby"
 
     templates = [
-        f"Best {category} options{' in ' + location if location else ' nearby'}?",
-        f"Top-rated {category} with great value{' in ' + location if location else ''}?",
-        f"Newly opened {category}{' in ' + location if location else ''} this year?",
-        f"Upscale {category}{' near ' + location if location else ' nearby'}?",
-        f"Which {category} has the best customer reviews{' in ' + location if location else ''}?",
-        f"Where to find standout {service}{' in ' + location if location else ''}?",
-        f"Best {category} for special occasions{' in ' + location if location else ''}?",
-        f"Top {category} with strong service quality{' in ' + location if location else ''}?",
-        f"Most recommended {category}{' in ' + location if location else ''} right now?",
-        f"Which {category} offers the best overall experience{' in ' + location if location else ''}?",
-        f"Great {category} for date night{' in ' + location if location else ''}?",
-        f"Best {category} for business dinners{' in ' + location if location else ''}?",
-        f"Where can I book a premium {category} experience{' in ' + location if location else ''}?",
-        f"Top hidden-gem {category}{' in ' + location if location else ''}?",
-        f"Best value-for-money {category}{' in ' + location if location else ''}?",
-        f"What are the most talked-about {category}{' in ' + location if location else ''}?",
-        f"Which {category} is trending this month{' in ' + location if location else ''}?",
-        f"Best {category} with a strong menu selection{' in ' + location if location else ''}?",
-        f"Top choices for high-quality {service}{' in ' + location if location else ''}?",
-        f"Where should I go for reliable {category}{' in ' + location if location else ''}?",
-        f"Best premium {category} alternatives{' in ' + location if location else ''}?",
-        f"Most consistent {category} for quality and atmosphere{' in ' + location if location else ''}?",
+        f"Best {plural}{where}?",
+        f"Top-rated {plural}{' in ' + location if location else ''} with great value?",
+        f"Best newly opened {plural}{' in ' + location if location else ''} this year?",
+        f"Upscale {plural}{where}?",
+        f"Which {plural} have the best customer reviews{' in ' + location if location else ''}?",
+        f"Where can I find standout {service_phrase}{' in ' + location if location else ''}?",
+        f"Best {plural} for special occasions{' in ' + location if location else ''}?",
+        f"Top {plural} known for service quality{' in ' + location if location else ''}?",
+        f"Most recommended {plural}{' in ' + location if location else ''} right now?",
+        f"Which {plural} offer the best overall experience{' in ' + location if location else ''}?",
+        f"Great {plural} for date night{' in ' + location if location else ''}?",
+        f"Best {plural} for business dinners{' in ' + location if location else ''}?",
+        f"Where can I book a premium {singular} experience{' in ' + location if location else ''}?",
+        f"Top hidden-gem {plural}{' in ' + location if location else ''}?",
+        f"Best value-for-money {plural}{' in ' + location if location else ''}?",
+        f"What are the most talked-about {plural}{' in ' + location if location else ''}?",
+        f"Which {plural} are trending this month{' in ' + location if location else ''}?",
+        f"Best {plural} with a strong menu selection{' in ' + location if location else ''}?",
+        f"Top choices for high-quality {service_phrase}{' in ' + location if location else ''}?",
+        f"Where should I go for reliable {plural}{' in ' + location if location else ''}?",
+        f"Best premium {plural} alternatives{' in ' + location if location else ''}?",
+        f"Most consistent {plural} for quality and atmosphere{' in ' + location if location else ''}?",
     ]
 
     cleaned: list[str] = []
@@ -1086,7 +1135,7 @@ async def generate_brand_questions(url: str) -> list[str]:
             cleaned.append(text if text.endswith("?") else f"{text}?")
 
         if len(cleaned) < 20:
-            fallback = _build_non_branded_fallback_questions(ctx)
+            fallback = _build_non_branded_fallback_questions(url, ctx)
             for q in fallback:
                 key = q.lower().rstrip("?.!")
                 if key in seen:
@@ -1126,7 +1175,7 @@ async def generate_brand_questions(url: str) -> list[str]:
             cleaned.append(text if text.endswith("?") else f"{text}?")
 
         if len(cleaned) < 20:
-            for q in _build_non_branded_fallback_questions(ctx):
+            for q in _build_non_branded_fallback_questions(url, ctx):
                 key = q.lower().rstrip("?.!")
                 if key in seen:
                     continue
