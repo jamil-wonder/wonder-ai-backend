@@ -37,6 +37,7 @@ class Phase5AnalyzeSingleResponse(BaseModel):
     competitors: List[str] = []
     competitor_scores: List[dict] = []
     reasoning: Optional[str] = None
+    llm_response: Optional[str] = None
 
 
 class Phase5StartJobRequest(BaseModel):

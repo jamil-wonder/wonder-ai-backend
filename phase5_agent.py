@@ -134,6 +134,100 @@ def _is_non_competitor_domain(domain: str) -> bool:
     return d in NON_COMPETITOR_DOMAINS
 
 
+def _align_reasoning_with_status(
+    *,
+    reasoning: str,
+    status: str,
+    domain: str,
+    position: int | None,
+    source_count: int,
+    reference_count: int,
+) -> str:
+    text = str(reasoning or "").strip()
+    low = text.lower()
+
+    positive_markers = [
+        "appears",
+        "mentioned",
+        "listed",
+        "rank",
+        "position",
+        "in top",
+        "strong position",
+    ]
+    negative_markers = [
+        "not mentioned",
+        "absent",
+        "not present",
+        "not listed",
+        "does not appear",
+        "missing",
+    ]
+
+    if status == "Not Mentioned":
+        contradicts = any(m in low for m in positive_markers) and not any(n in low for n in negative_markers)
+        if not text or contradicts:
+            return (
+                f"Target {domain} was not verified in top returned results. "
+                f"Evidence captured from third-party domains only (sources={source_count}, references={reference_count})."
+            )
+        return text
+
+    # Mentioned
+    contradicts = any(n in low for n in negative_markers)
+    if not text or contradicts:
+        if isinstance(position, int):
+            return f"Target {domain} appears in returned results around rank #{position} based on captured evidence."
+        return f"Target {domain} appears in returned results based on captured evidence."
+    return text
+
+
+def _build_fallback_concise_answer(
+    *,
+    question_text: str,
+    status: str,
+    position: int | None,
+    references: list[str],
+    sources: list[str],
+    competitor_scores: list[dict],
+    domain: str,
+) -> str:
+    seen_domains: list[str] = []
+    for d in [*(references or []), *(sources or [])]:
+        n = _normalize_domain(str(d))
+        if n and n not in seen_domains:
+            seen_domains.append(n)
+    top_refs = seen_domains[:3]
+
+    comp_names: list[str] = []
+    for c in (competitor_scores or [])[:3]:
+        d = _normalize_domain(str(c.get("domain") or ""))
+        if d and d not in comp_names:
+            comp_names.append(d)
+
+    if status == "Mentioned":
+        if isinstance(position, int):
+            lead = f"For \"{question_text}\", your brand appears in the returned set around rank #{position}."
+        else:
+            lead = f"For \"{question_text}\", your brand appears in the returned set."
+        src = (
+            f"Evidence was seen on domains like {', '.join(top_refs)}."
+            if top_refs
+            else "Evidence was captured from returned third-party results."
+        )
+        comp = f"Other visible alternatives include {', '.join(comp_names)}." if comp_names else ""
+        return " ".join([lead, src, comp]).strip()
+
+    lead = f"For \"{question_text}\", your brand ({domain}) was not clearly verified in the top returned results."
+    src = (
+        f"The strongest visible evidence came from domains like {', '.join(top_refs)}."
+        if top_refs
+        else "No strong third-party domain evidence was captured for this query."
+    )
+    comp = f"Competing domains that surfaced include {', '.join(comp_names)}." if comp_names else ""
+    return " ".join([lead, src, comp]).strip()
+
+
 def _estimate_target_visibility_score(seed_results: dict) -> int:
     rows = list(seed_results.values()) if isinstance(seed_results, dict) else []
     if not rows:
@@ -996,6 +1090,7 @@ async def _call_perplexity_chat_json(prompt: str, timeout_sec: int | None = None
 
         text = ""
         citation_domains: list[str] = []
+        citation_urls: list[str] = []
         if isinstance(body, dict):
             text = str(body.get("output_text") or "")
             if not text:
@@ -1022,6 +1117,9 @@ async def _call_perplexity_chat_json(prompt: str, timeout_sec: int | None = None
             citations = body.get("citations")
             if isinstance(citations, list):
                 for u in citations:
+                    u_str = str(u or "").strip()
+                    if u_str.startswith("http://") or u_str.startswith("https://"):
+                        citation_urls.append(u_str)
                     d = _normalize_domain(str(u))
                     if d:
                         citation_domains.append(d)
@@ -1030,7 +1128,10 @@ async def _call_perplexity_chat_json(prompt: str, timeout_sec: int | None = None
             if isinstance(search_results, list):
                 for item in search_results:
                     if isinstance(item, dict):
-                        d = _normalize_domain(str(item.get("url") or ""))
+                        url_value = str(item.get("url") or "").strip()
+                        if url_value.startswith("http://") or url_value.startswith("https://"):
+                            citation_urls.append(url_value)
+                        d = _normalize_domain(url_value)
                         if d:
                             citation_domains.append(d)
 
@@ -1038,7 +1139,10 @@ async def _call_perplexity_chat_json(prompt: str, timeout_sec: int | None = None
             if isinstance(web_results, list):
                 for item in web_results:
                     if isinstance(item, dict):
-                        d = _normalize_domain(str(item.get("url") or ""))
+                        url_value = str(item.get("url") or "").strip()
+                        if url_value.startswith("http://") or url_value.startswith("https://"):
+                            citation_urls.append(url_value)
+                        d = _normalize_domain(url_value)
                         if d:
                             citation_domains.append(d)
 
@@ -1048,6 +1152,8 @@ async def _call_perplexity_chat_json(prompt: str, timeout_sec: int | None = None
         parsed_dict = parsed if isinstance(parsed, dict) else {}
         if citation_domains:
             parsed_dict["_meta_source_domains"] = list(dict.fromkeys(citation_domains))
+        if citation_urls:
+            parsed_dict["_meta_source_urls"] = list(dict.fromkeys(citation_urls))
         if text:
             parsed_dict["_meta_response_text"] = text[:4000]
         return parsed_dict
@@ -1626,7 +1732,8 @@ async def _analyze_single_question_openai(url: str, question: dict, include_comp
       "ranked_competitors": [
         {{"domain": "competitor.com", "position": 1, "evidence": "short reason"}}
       ],
-      "reasoning": "1 short sentence"
+            "reasoning": "1 short sentence",
+            "concise_answer": "Natural user-facing answer to the query (90-180 words), mentioning top options and practical guidance."
     }}
 
     Rules:
@@ -1636,6 +1743,8 @@ async def _analyze_single_question_openai(url: str, question: dict, include_comp
     - Sources/references must be third-party domains only.
     - Do not include target domain in competitors.
     - position must be 1..10 or null.
+    - concise_answer must sound like a real assistant reply to the query (no analytics wording, no "mentioned/not mentioned" wording).
+    - concise_answer should be compact but useful: top picks, brief why, and one practical tip.
     - JSON only.
     """
 
@@ -1721,40 +1830,75 @@ async def _analyze_single_question_openai(url: str, question: dict, include_comp
     clean_references = list(dict.fromkeys(clean_references))
     idea_candidates = list(dict.fromkeys(idea_candidates))[:12]
 
-    # Fallback for branded intent queries: if the brand token is present in the
-    # query text, keep visibility as Mentioned even when structured evidence is sparse.
-    normalized_query = re.sub(r"[^a-z0-9]", "", str(question.get("text", "")).lower())
     brand_token = re.sub(r"[^a-z0-9]", "", (domain.split(".")[0] if domain else "").lower())
-    if (
-        not target_mentioned
-        and position is None
-        and brand_token
-        and len(brand_token) >= 4
-        and brand_token in normalized_query
-    ):
-        target_mentioned = True
-        position = 3
-
     if not target_mentioned and position is None and (target_seen_in_sources or target_seen_in_references):
         target_mentioned = True
-        position = 3
 
-    response_text = str(data.get("_meta_response_text", "") if isinstance(data, dict) else "").lower()
-    if not target_mentioned and position is None and response_text:
-        # Recover mention signal when model prose mentions the target but structured JSON omits target fields.
-        if domain in response_text or (brand_token and len(brand_token) >= 4 and brand_token in response_text):
-            target_mentioned = True
-            position = 3
+    concise_answer = str(data.get("concise_answer", "") if isinstance(data, dict) else "").strip()
+    response_text_raw = str(data.get("_meta_response_text", "") if isinstance(data, dict) else "").strip()
+    response_text = response_text_raw.lower()
 
-    # Guardrail: keep strict behavior only when we have no evidence and no
-    # mention signal at all. Do not overwrite model-positive mention decisions.
-    has_external_evidence = len(clean_sources) > 0 or len(clean_references) > 0
-    if not has_external_evidence and not (target_mentioned or position is not None):
+    def _is_negative_text_mention(text: str, token: str) -> bool:
+        if not token:
+            return False
+        safe = re.escape(token)
+        return bool(
+            re.search(rf"(no|not|without)\\W+(clear\\W+)?mention(?:ed)?[^\\n\\r.]{{0,40}}{safe}", text)
+            or re.search(rf"{safe}[^\\n\\r.]{{0,40}}(not|no)\\W+mention(?:ed)?", text)
+            or re.search(rf"{safe}[^\\n\\r.]{{0,60}}(absent|missing|not present|not listed|does not appear|isn't listed|not in top)", text)
+            or re.search(rf"(absent|missing|not present|not listed|does not appear|isn't listed|not in top)[^\\n\\r.]{{0,60}}{safe}", text)
+        )
+
+    def _is_positive_text_mention(text: str, token: str) -> bool:
+        if not token:
+            return False
+        safe = re.escape(token)
+        return bool(
+            re.search(rf"{safe}[^\\n\\r.]{{0,60}}(appears|listed|featured|included|shown|ranking|ranked|in top)", text)
+            or re.search(rf"(appears|listed|featured|included|shown|ranking|ranked|in top)[^\\n\\r.]{{0,60}}{safe}", text)
+        )
+
+    token_domain = _normalize_domain(domain)
+    text_has_domain = bool(token_domain and token_domain in response_text)
+    text_has_brand = bool(brand_token and len(brand_token) >= 4 and brand_token in response_text)
+    text_negative = _is_negative_text_mention(response_text, token_domain) or _is_negative_text_mention(response_text, brand_token)
+    text_positive = _is_positive_text_mention(response_text, token_domain)
+
+    target_evidence = bool(
+        target_seen_in_sources
+        or target_seen_in_references
+        or (text_has_domain and text_positive and not text_negative)
+    )
+
+    if not target_evidence:
         target_mentioned = False
         position = None
+    elif not target_mentioned:
+        target_mentioned = True
 
     status = "Mentioned" if (target_mentioned or position is not None) else "Not Mentioned"
-    reasoning = str(data.get("reasoning", "")).strip() if isinstance(data, dict) else ""
+    reasoning_raw = str(data.get("reasoning", "")).strip() if isinstance(data, dict) else ""
+    reasoning = _align_reasoning_with_status(
+        reasoning=reasoning_raw,
+        status=status,
+        domain=domain,
+        position=position,
+        source_count=len(clean_sources),
+        reference_count=len(clean_references),
+    )
+    answer_text = (
+        concise_answer[:4000]
+        if concise_answer
+        else _build_fallback_concise_answer(
+            question_text=str(question.get("text") or "").strip(),
+            status=status,
+            position=position,
+            references=clean_references,
+            sources=clean_sources,
+            competitor_scores=competitor_scores,
+            domain=domain,
+        )[:4000]
+    )
 
     return {
         "id": question["id"],
@@ -1767,6 +1911,7 @@ async def _analyze_single_question_openai(url: str, question: dict, include_comp
         "competitors": competitors[:5],
         "competitor_scores": competitor_scores[:5],
         "reasoning": reasoning or None,
+        "llm_response": answer_text,
     }
 
 
@@ -1793,7 +1938,8 @@ async def _analyze_single_question_perplexity(url: str, question: dict, include_
       "ranked_competitors": [
         {{"domain": "competitor.com", "position": 1, "evidence": "short reason"}}
       ],
-      "reasoning": "1 short sentence"
+            "reasoning": "1 short sentence",
+            "concise_answer": "Natural user-facing answer to the query (90-180 words), mentioning top options and practical guidance."
     }}
 
     Rules:
@@ -1802,6 +1948,8 @@ async def _analyze_single_question_perplexity(url: str, question: dict, include_
     - Sources/references must be third-party domains only.
     - Do not include target domain in competitors.
     - position must be 1..10 or null.
+    - concise_answer must sound like a real assistant reply to the query (no analytics wording, no "mentioned/not mentioned" wording).
+    - concise_answer should be compact but useful: top picks, brief why, and one practical tip.
     - JSON only.
     """
 
@@ -1821,6 +1969,7 @@ async def _analyze_single_question_perplexity(url: str, question: dict, include_
     raw_sources = target.get("source_domains", []) if isinstance(target, dict) else []
     if not isinstance(raw_sources, list):
         raw_sources = []
+    target_seen_in_sources = any(_is_target_domain_match(str(s), domain) for s in raw_sources)
     clean_sources = []
     for s in raw_sources:
         d = _normalize_domain(s)
@@ -1830,6 +1979,7 @@ async def _analyze_single_question_perplexity(url: str, question: dict, include_
     raw_references = data.get("references", []) if isinstance(data, dict) else []
     if not isinstance(raw_references, list):
         raw_references = []
+    target_seen_in_references = any(_is_target_domain_match(str(r), domain) for r in raw_references)
     clean_references = []
     for r in raw_references:
         d = _normalize_domain(r)
@@ -1880,6 +2030,15 @@ async def _analyze_single_question_perplexity(url: str, question: dict, include_
 
     # Fallback evidence path when Perplexity returns normal search output instead of strict JSON schema.
     meta_sources = data.get("_meta_source_domains", []) if isinstance(data, dict) else []
+    meta_source_urls = data.get("_meta_source_urls", []) if isinstance(data, dict) else []
+    source_urls: list[str] = []
+    if isinstance(meta_source_urls, list):
+        for u in meta_source_urls:
+            u_str = str(u or "").strip()
+            if u_str.startswith("http://") or u_str.startswith("https://"):
+                source_urls.append(u_str)
+        source_urls = list(dict.fromkeys(source_urls))[:50]
+
     if isinstance(meta_sources, list):
         for s in meta_sources:
             d = _normalize_domain(str(s))
@@ -1887,32 +2046,85 @@ async def _analyze_single_question_perplexity(url: str, question: dict, include_
                 clean_sources.append(d)
         clean_sources = list(dict.fromkeys(clean_sources))
 
-    if position is None and clean_sources:
-        position = 3
+    concise_answer = str(data.get("concise_answer", "") if isinstance(data, dict) else "").strip()
+    response_text_raw = str(data.get("_meta_response_text", "") if isinstance(data, dict) else "").strip()
+    response_text = response_text_raw.lower()
+    brand_token = re.sub(r"[^a-z0-9]", "", (domain.split(".")[0] if domain else "").lower())
 
-    response_text = str(data.get("_meta_response_text", "") if isinstance(data, dict) else "").lower()
-    if not target_mentioned and domain and domain in response_text:
-        target_mentioned = True
+    def _is_negative_text_mention(text: str, token: str) -> bool:
+        if not token:
+            return False
+        safe = re.escape(token)
+        return bool(
+            re.search(rf"(no|not|without)\\W+(clear\\W+)?mention(?:ed)?[^\\n\\r.]{{0,40}}{safe}", text)
+            or re.search(rf"{safe}[^\\n\\r.]{{0,40}}(not|no)\\W+mention(?:ed)?", text)
+            or re.search(rf"{safe}[^\\n\\r.]{{0,60}}(absent|missing|not present|not listed|does not appear|isn't listed|not in top)", text)
+            or re.search(rf"(absent|missing|not present|not listed|does not appear|isn't listed|not in top)[^\\n\\r.]{{0,60}}{safe}", text)
+        )
 
-    has_external_evidence = len(clean_sources) > 0 or len(clean_references) > 0
-    if not has_external_evidence:
+    def _is_positive_text_mention(text: str, token: str) -> bool:
+        if not token:
+            return False
+        safe = re.escape(token)
+        return bool(
+            re.search(rf"{safe}[^\\n\\r.]{{0,60}}(appears|listed|featured|included|shown|ranking|ranked|in top)", text)
+            or re.search(rf"(appears|listed|featured|included|shown|ranking|ranked|in top)[^\\n\\r.]{{0,60}}{safe}", text)
+        )
+
+    token_domain = _normalize_domain(domain)
+    text_has_domain = bool(token_domain and token_domain in response_text)
+    text_has_brand = bool(brand_token and len(brand_token) >= 4 and brand_token in response_text)
+    text_negative = _is_negative_text_mention(response_text, token_domain) or _is_negative_text_mention(response_text, brand_token)
+    text_positive = _is_positive_text_mention(response_text, token_domain)
+
+    target_evidence = bool(
+        target_seen_in_sources
+        or target_seen_in_references
+        or (text_has_domain and text_positive and not text_negative)
+    )
+
+    if not target_evidence:
         target_mentioned = False
         position = None
+    elif not target_mentioned:
+        target_mentioned = True
 
     status = "Mentioned" if (target_mentioned or position is not None) else "Not Mentioned"
-    reasoning = str(data.get("reasoning", "")).strip() if isinstance(data, dict) else ""
+    reasoning_raw = str(data.get("reasoning", "")).strip() if isinstance(data, dict) else ""
+    reasoning = _align_reasoning_with_status(
+        reasoning=reasoning_raw,
+        status=status,
+        domain=domain,
+        position=position,
+        source_count=len(clean_sources),
+        reference_count=len(clean_references),
+    )
+    answer_text = (
+        concise_answer[:4000]
+        if concise_answer
+        else _build_fallback_concise_answer(
+            question_text=str(question.get("text") or "").strip(),
+            status=status,
+            position=position,
+            references=clean_references,
+            sources=clean_sources,
+            competitor_scores=competitor_scores,
+            domain=domain,
+        )[:4000]
+    )
 
     return {
         "id": question["id"],
         "status": status,
         "position": position,
         "sources": clean_sources[:30],
-        "source_urls": [],
+        "source_urls": source_urls,
         "references": clean_references[:30],
         "idea_candidates": idea_candidates,
         "competitors": competitors[:5],
         "competitor_scores": competitor_scores[:5],
         "reasoning": reasoning or None,
+        "llm_response": answer_text,
     }
 
 
@@ -1939,6 +2151,7 @@ async def analyze_single_question(
             "competitors": [],
             "competitor_scores": [],
             "reasoning": "Gemini is temporarily disabled for Phase 5.",
+            "llm_response": None,
         }
     if normalized_provider == "openai":
         return await _analyze_single_question_openai(
@@ -2442,6 +2655,7 @@ async def analyze_single_question(
             "competitors": competitors[:5],
             "competitor_scores": competitor_scores[:5],
             "reasoning": reasoning or None,
+            "llm_response": ((response.text or "")[:4000] if response is not None and getattr(response, "text", None) else None),
         }
         return result_payload
 
@@ -2459,6 +2673,7 @@ async def analyze_single_question(
             "competitors": [],
             "competitor_scores": [],
             "reasoning": None,
+            "llm_response": None,
         }
 
 
@@ -2482,6 +2697,7 @@ async def _run_with_backoff(
             "competitors": [],
             "competitor_scores": [],
             "reasoning": "Gemini is temporarily disabled for Phase 5.",
+            "llm_response": None,
         }
     if provider == "openai":
         retries = max(1, OPENAI_PHASE5_MAX_RETRIES)
@@ -2518,6 +2734,7 @@ def _empty_provider_result(error: str | None = None) -> dict:
         "competitors": [],
         "competitor_scores": [],
         "reasoning": None,
+        "llm_response": None,
         "cited": False,
         "status": "Not Mentioned",
     }
@@ -2540,6 +2757,7 @@ def _safe_provider_result(raw: dict | Exception | None) -> dict:
     competitors = raw.get("competitors") if isinstance(raw.get("competitors"), list) else []
     competitor_scores = raw.get("competitor_scores") if isinstance(raw.get("competitor_scores"), list) else []
     reasoning = raw.get("reasoning")
+    llm_response = raw.get("llm_response")
     mentioned = status == "Mentioned" or position is not None
     cited = bool(sources or references or source_urls)
 
@@ -2552,6 +2770,7 @@ def _safe_provider_result(raw: dict | Exception | None) -> dict:
         "competitors": competitors,
         "competitor_scores": competitor_scores,
         "reasoning": reasoning if isinstance(reasoning, str) and reasoning.strip() else None,
+        "llm_response": llm_response if isinstance(llm_response, str) and llm_response.strip() else None,
         "cited": cited,
         "status": "Mentioned" if mentioned else "Not Mentioned",
     }
