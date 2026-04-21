@@ -275,6 +275,48 @@ def _build_fallback_concise_answer(
     return " ".join([lead, src, comp]).strip()
 
 
+def _flatten_multi_result(r: dict) -> dict:
+    """Helper to unify normal and multi-provider results into a single flat structure."""
+    if not isinstance(r, dict):
+        return {}
+    if "providers" not in r:
+        return r
+    
+    p = r["providers"]
+    flat = {
+        "status": "Not Mentioned",
+        "position": None,
+        "references": [],
+        "sources": [],
+        "source_urls": [],
+        "idea_candidates": [],
+        "competitors": [],
+        "reasoning": ""
+    }
+    
+    # Prefer perplexity status, then chatgpt, then gemini
+    for prov in ["perplexity", "chatgpt", "gemini"]:
+        d = p.get(prov, {})
+        if isinstance(d, dict) and d.get("status") == "Mentioned":
+            flat["status"] = "Mentioned"
+            pos = d.get("position")
+            if isinstance(pos, int):
+                if flat["position"] is None or pos < flat["position"]:
+                    flat["position"] = pos
+    
+    for prov, d in p.items():
+        if not isinstance(d, dict): continue
+        for key in ["references", "sources", "source_urls", "idea_candidates", "competitors"]:
+            val = d.get(key, [])
+            if isinstance(val, list):
+                flat[key].extend(val)
+    
+    for key in ["references", "sources", "source_urls", "idea_candidates", "competitors"]:
+        flat[key] = list(dict.fromkeys(flat[key]))
+        
+    return flat
+
+
 def _estimate_target_visibility_score(seed_results: dict) -> int:
     rows = list(seed_results.values()) if isinstance(seed_results, dict) else []
     if not rows:
@@ -282,9 +324,10 @@ def _estimate_target_visibility_score(seed_results: dict) -> int:
 
     points = 0.0
     seen = 0
-    for r in rows:
-        if not isinstance(r, dict):
+    for raw_r in rows:
+        if not isinstance(raw_r, dict):
             continue
+        r = _flatten_multi_result(raw_r)
         status = str(r.get("status", ""))
         pos = r.get("position")
         if isinstance(pos, int) and 1 <= pos <= 10:
@@ -1449,7 +1492,8 @@ async def generate_brand_perception_summary(
         positions: list[int] = []
         ref_counts: dict[str, int] = {}
 
-        for r in rows:
+        for raw_r in rows:
+            r = _flatten_multi_result(raw_r)
             status = str(r.get("status", ""))
             if status == "Mentioned":
                 mentioned += 1
@@ -1495,7 +1539,8 @@ async def generate_brand_perception_summary(
         compact_items = []
         for q in questions[:30]:
             qid = q.get("id")
-            r = results.get(qid, {}) if isinstance(results, dict) else {}
+            raw_r = results.get(qid, {}) if isinstance(results, dict) else {}
+            r = _flatten_multi_result(raw_r)
             compact_items.append(
                 {
                     "question": q.get("text", ""),
@@ -1553,7 +1598,8 @@ async def generate_deep_competitor_scores(
     candidate_counts: dict[str, int] = {}
     for q in questions:
         qid = q.get("id")
-        r = seed_results.get(qid, {}) if isinstance(seed_results, dict) else {}
+        raw_r = seed_results.get(qid, {}) if isinstance(seed_results, dict) else {}
+        r = _flatten_multi_result(raw_r)
 
         idea_candidates = r.get("idea_candidates", []) if isinstance(r, dict) else []
         if isinstance(idea_candidates, list):
@@ -1594,7 +1640,10 @@ async def generate_deep_competitor_scores(
         top_candidates = [d for d, hits in sorted_candidates if hits >= 2 and not _is_non_competitor_domain(d)][:20]
     if not top_candidates:
         top_candidates = [d for d, _ in sorted_candidates if not _is_non_competitor_domain(d) and not _looks_like_platform_domain(d)][:20]
-    if not top_candidates:
+    
+    # If we still have very few candidates, or if we are running in parallel (seed_results empty),
+    # force a broad probe to ensure we find something.
+    if len(top_candidates) < 3:
         # Quick grounded probe fallback to avoid empty competitor lists.
         probe_text = " ; ".join([q.get("text", "") for q in questions[:5]])
         probe_prompt = (
@@ -1604,7 +1653,7 @@ async def generate_deep_competitor_scores(
         probe_response = await _call_perplexity_with_retry(
             probe_prompt,
             retry_once=False,
-            timeout_sec=8,
+            timeout_sec=10,
         )
         probe_domains = []
         if probe_response is not None:
@@ -1616,10 +1665,7 @@ async def generate_deep_competitor_scores(
             if nd and nd != domain and not _is_non_competitor_domain(nd) and not _looks_like_platform_domain(nd):
                 candidate_counts[nd] = candidate_counts.get(nd, 0) + 1
 
-        top_candidates = [d for d, _ in sorted(candidate_counts.items(), key=lambda kv: kv[1], reverse=True)[:12]]
-        # If still no top candidates, continue and attempt deeper probes below
-        # instead of returning early — we want to guarantee fallback attempts
-        # so the finalizer can produce external competitors even for weak sites.
+        top_candidates = [d for d, _ in sorted(candidate_counts.items(), key=lambda kv: kv[1], reverse=True)[:15]]
 
     # Fast deterministic fallback from observed first-pass signals.
     heuristic_scores: list[dict] = []
@@ -2911,6 +2957,7 @@ def _empty_provider_result(error: str | None = None) -> dict:
         "sources": [],
         "source_urls": [],
         "references": [],
+        "idea_candidates": [],
         "competitors": [],
         "competitor_scores": [],
         "reasoning": None,
@@ -2934,6 +2981,7 @@ def _safe_provider_result(raw: dict | Exception | None) -> dict:
     sources = raw.get("sources") if isinstance(raw.get("sources"), list) else []
     source_urls = raw.get("source_urls") if isinstance(raw.get("source_urls"), list) else []
     references = raw.get("references") if isinstance(raw.get("references"), list) else []
+    idea_candidates = raw.get("idea_candidates") if isinstance(raw.get("idea_candidates"), list) else []
     competitors = raw.get("competitors") if isinstance(raw.get("competitors"), list) else []
     competitor_scores = raw.get("competitor_scores") if isinstance(raw.get("competitor_scores"), list) else []
     reasoning = raw.get("reasoning")
@@ -2947,6 +2995,7 @@ def _safe_provider_result(raw: dict | Exception | None) -> dict:
         "sources": sources,
         "source_urls": source_urls,
         "references": references,
+        "idea_candidates": idea_candidates,
         "competitors": competitors,
         "competitor_scores": competitor_scores,
         "reasoning": reasoning if isinstance(reasoning, str) and reasoning.strip() else None,

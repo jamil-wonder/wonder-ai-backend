@@ -38,6 +38,8 @@ from phase5_agent import (
     generate_brand_perception_summary,
     generate_deep_competitor_scores,
     Phase5RateLimitError,
+    _estimate_target_visibility_score,
+    _normalize_domain,
 )
 from models import UserCreate, UserResponse, Token, LoginRequest
 from google.oauth2 import id_token
@@ -1474,6 +1476,41 @@ async def _process_phase5_job(job_doc: dict):
         for q in questions:
             queue.put_nowait(q)
 
+        # Background finalization: start it immediately in parallel with workers
+        # so it doesn't block question analysis. It will use its own Perplexity
+        # probes if seed_results is empty/incomplete.
+        always_run_deep = os.getenv("PHASE5_ALWAYS_RUN_DEEP", "false").strip().lower() == "true"
+        finalize_task = None
+        if always_run_deep or include_competitors:
+            async def _finalize_background_task():
+                print(f"[Phase5] background competitor finalizing job_id={job_id}")
+                try:
+                    # Run competitor discovery early using Perplexity probes.
+                    # It will return 4 external competitors. Target site is added later.
+                    deep_competitors = await generate_deep_competitor_scores(
+                        url=job_doc["url"],
+                        questions=questions,
+                        seed_results={}, # Intentionally empty to force fast probe
+                    )
+                    
+                    # Update deep competitors immediately so UI has early partial data
+                    await phase5_jobs_col.update_one(
+                        {"job_id": job_id, "status": {"$ne": "cancelled"}},
+                        {
+                            "$set": {
+                                "deep_competitors": deep_competitors,
+                                "updated_at": datetime.utcnow().isoformat(),
+                            }
+                        },
+                    )
+                    print(f"[Phase5] background competitor finalizing done job_id={job_id}")
+                    return deep_competitors
+                except Exception:
+                    traceback.print_exc()
+                    return []
+
+            finalize_task = asyncio.create_task(_finalize_background_task())
+
         async def _worker_run():
             while True:
                 if await _is_cancelled():
@@ -1585,6 +1622,16 @@ async def _process_phase5_job(job_doc: dict):
             for _ in range(max(1, PHASE5_JOB_PARALLELISM))
         ]
         await asyncio.gather(*workers)
+        
+        deep_competitors = []
+        # Ensure the background finalization task (started earlier) is finished
+        if finalize_task:
+            try:
+                # Give it a small extra timeout just in case, but it should be done.
+                deep_competitors = await asyncio.wait_for(finalize_task, timeout=40)
+            except Exception as e:
+                print(f"[Phase5] background finalization wait error: {e}")
+
         processed_count = len(accumulated_results)
 
         if await _is_cancelled():
@@ -1599,101 +1646,51 @@ async def _process_phase5_job(job_doc: dict):
             )
             return
 
-        # Perplexity finalization: deep competitor scoring + brand narrative.
-        # By default, only Perplexity provider runs trigger finalization to keep
-        # multi/OpenAI runs fast. Set PHASE5_ALWAYS_RUN_DEEP=true to run the
-        # Perplexity deep finalization after any job automatically.
-        always_run_deep = os.getenv("PHASE5_ALWAYS_RUN_DEEP", "false").strip().lower() == "true"
-        if model_provider != "perplexity" and not always_run_deep:
-            final_scores, final_overall = _compute_provider_scores(accumulated_results) if model_provider == "multi" else ({}, None)
-            await phase5_jobs_col.update_one(
-                {"job_id": job_id},
-                {
-                    "$set": {
-                        "status": "completed",
-                        "current_question_id": None,
-                        "deep_competitors": [],
-                        "brand_summary": None,
-                        "provider_scores": final_scores,
-                        "overall_score": final_overall,
-                        "updated_at": datetime.utcnow().isoformat(),
-                    }
-                },
-            )
-            print(f"[Phase5] worker completed job_id={job_id} provider={model_provider} without finalizing")
-            await _log_ai_usage_event({
-                "feature": "phase5_job_completed",
-                "endpoint": "/api/phase5/start-job",
-                "url": job_doc.get("url"),
-                "user_id": job_doc.get("user_id"),
-                "user_email": job_doc.get("user_email"),
-                "model_provider": model_provider,
-                "ai_calls_estimate": int(processed_count),
-                "details": {
-                    "job_id": job_id,
-                    "job_type": job_type,
-                    "model_provider": model_provider,
-                    "processed": processed_count,
-                    "total": len(questions),
-                    "finalization": "skipped_non_gemini",
-                },
-            })
-            return
+        # Calculate accurate target score now that all questions are finished
+        target_score = _estimate_target_visibility_score(accumulated_results)
+        domain = _normalize_domain(job_doc["url"])
+        
+        # Remove any existing target site entry from deep_competitors
+        deep_competitors = [c for c in (deep_competitors or []) if c.get("domain") != domain]
+        
+        # Append target site with the fully accurate score
+        deep_competitors.append({
+            "domain": domain,
+            "position": None,
+            "score": target_score,
+            "evidence": "Your site score from visibility and rank consistency across analyzed prompts.",
+        })
 
-        await phase5_jobs_col.update_one(
-            {"job_id": job_id},
-            {
-                "$set": {
-                    "status": "finalizing",
-                    "current_question_id": None,
-                    "updated_at": datetime.utcnow().isoformat(),
-                }
-            },
-        )
-        print(f"[Phase5] job_id={job_id} entering finalizing")
-
-        deep_competitors = []
-        try:
-            deep_competitors = await asyncio.wait_for(
-                generate_deep_competitor_scores(
-                    url=job_doc["url"],
-                    questions=questions,
-                    seed_results=accumulated_results,
-                ),
-                timeout=15,
-            )
-        except Exception as e:
-            print(f"[Phase5] deep competitor finalize fallback: {e}")
-            deep_competitors = []
-
+        # Generate accurate brand summary now that questions are finished
         brand_summary = None
-        try:
-            brand_summary = await asyncio.wait_for(
-                generate_brand_perception_summary(
+        if always_run_deep or include_competitors:
+            try:
+                brand_summary = await generate_brand_perception_summary(
                     url=job_doc["url"],
                     questions=questions,
                     results=accumulated_results,
-                ),
-                timeout=10,
-            )
-        except Exception as e:
-            print(f"[Phase5] brand summary finalize fallback: {e}")
-            domain = str(job_doc.get("url", "")).replace("https://", "").replace("http://", "").split("/")[0]
-            brand_summary = f"{domain} appears to have a clear business identity and a visible presence across customer search intent."
+                )
+            except Exception as e:
+                print(f"[Phase5] brand summary error: {e}")
 
+        # Finalize job status
+        final_scores, final_overall = _compute_provider_scores(accumulated_results) if model_provider == "multi" else ({}, None)
         await phase5_jobs_col.update_one(
             {"job_id": job_id},
             {
                 "$set": {
                     "status": "completed",
                     "current_question_id": None,
+                    "provider_scores": final_scores,
+                    "overall_score": final_overall,
                     "deep_competitors": deep_competitors,
                     "brand_summary": brand_summary,
                     "updated_at": datetime.utcnow().isoformat(),
                 }
             },
         )
-        print(f"[Phase5] worker completed job_id={job_id} competitors={len(deep_competitors)}")
+        print(f"[Phase5] worker completed job_id={job_id} provider={model_provider}")
+
         await _log_ai_usage_event({
             "feature": "phase5_job_completed",
             "endpoint": "/api/phase5/start-job",
@@ -1701,14 +1698,13 @@ async def _process_phase5_job(job_doc: dict):
             "user_id": job_doc.get("user_id"),
             "user_email": job_doc.get("user_email"),
             "model_provider": model_provider,
-            "ai_calls_estimate": int(processed_count) + 2,
+            "ai_calls_estimate": int(processed_count),
             "details": {
                 "job_id": job_id,
                 "job_type": job_type,
                 "model_provider": model_provider,
                 "processed": processed_count,
                 "total": len(questions),
-                "competitors_count": len(deep_competitors or []),
             },
         })
     except Phase5RateLimitError as e:
