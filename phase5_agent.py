@@ -27,6 +27,7 @@ NON_COMPETITOR_DOMAINS = {
     "expedia.com",
     "kayak.com",
     "airbnb.com",
+    "hotels.com",
     "maps.google.com",
 }
 
@@ -131,7 +132,53 @@ def _is_non_competitor_domain(domain: str) -> bool:
     d = _normalize_domain(domain)
     if not d:
         return True
-    return d in NON_COMPETITOR_DOMAINS
+
+    # Direct match or suffix match (handles subdomains and country TLDs)
+    if d in NON_COMPETITOR_DOMAINS:
+        return True
+    for banned in NON_COMPETITOR_DOMAINS:
+        # check suffix like 'tripadvisor.com' should match 'tripadvisor.co.uk' via root token
+        try:
+            root = str(banned).split(".")[0]
+        except Exception:
+            root = banned
+        if root and root in d:
+            return True
+    return False
+
+
+def _looks_like_platform_domain(domain: str) -> bool:
+    """Heuristic to detect platforms, directories, or profile hosts we should exclude from competitor lists."""
+    d = _normalize_domain(domain)
+    if not d:
+        return False
+    patterns = [
+        "yelp",
+        "tripadvisor",
+        "booking",
+        "expedia",
+        "airbnb",
+        "facebook",
+        "instagram",
+        "linkedin",
+        "wordpress",
+        "wixsite",
+        "pages",
+        "google",
+        "bing",
+        "timeout",
+        "craigslist",
+        "yellowpages",
+        "opentable",
+        "kayak",
+    ]
+    low = d.lower()
+    for p in patterns:
+        if p in low:
+            return True
+    if low.count(".") >= 2 and low.endswith(".wordpress.com"):
+        return True
+    return False
 
 
 def _align_reasoning_with_status(
@@ -301,12 +348,13 @@ async def _validate_same_niche_competitors_perplexity(
     Rules:
         - Include only same-niche, same customer-intent competitors.
         - A valid competitor must have both:
-            1) niche_match >= 70
-            2) business_model_match >= 70
+            1) niche_match >= 80
+            2) business_model_match >= 80
         - competitor_type must be one of:
             independent_business, marketplace, directory, social_profile, review_listing, media, other
         - Prefer independent_business.
         - Reject platforms/profiles/listings when they are not actual competing businesses.
+        - Do NOT base validation solely on Perplexity's returned `citations` or `search_results` lists; inspect live page context and exclude directories/OTAs/profiles unless they are genuine independent businesses.
     - Exclude the target domain.
     - Max 5 domains.
         - is_direct_competitor must be true only for real same-niche alternatives.
@@ -319,7 +367,7 @@ async def _validate_same_niche_competitors_perplexity(
     response = await _call_perplexity_with_retry(
         prompt,
         retry_once=False,
-        timeout_sec=10,
+        timeout_sec=12,
     )
     if not isinstance(response, dict):
         return []
@@ -348,6 +396,7 @@ async def _validate_same_niche_competitors_perplexity(
             not d
             or d == target_domain
             or _is_non_competitor_domain(d)
+            or _looks_like_platform_domain(d)
             or d in seen
         ):
             continue
@@ -1513,34 +1562,38 @@ async def generate_deep_competitor_scores(
                     d = _normalize_domain(item.get("domain", ""))
                 else:
                     d = _normalize_domain(str(item))
-                if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+                if d and d != domain and d not in NON_COMPETITOR_DOMAINS and not _looks_like_platform_domain(d):
                     candidate_counts[d] = candidate_counts.get(d, 0) + 2
 
         refs = r.get("references", []) if isinstance(r, dict) else []
         if isinstance(refs, list):
             for ref in refs:
                 d = _normalize_domain(ref)
-                if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+                if d and d != domain and d not in NON_COMPETITOR_DOMAINS and not _looks_like_platform_domain(d):
                     candidate_counts[d] = candidate_counts.get(d, 0) + 1
 
         srcs = r.get("sources", []) if isinstance(r, dict) else []
         if isinstance(srcs, list):
             for src in srcs:
                 d = _normalize_domain(src)
-                if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+                if d and d != domain and d not in NON_COMPETITOR_DOMAINS and not _looks_like_platform_domain(d):
                     candidate_counts[d] = candidate_counts.get(d, 0) + 1
 
         source_urls = r.get("source_urls", []) if isinstance(r, dict) else []
         if isinstance(source_urls, list):
             for u in source_urls:
                 d = _normalize_domain(u)
-                if d and d != domain and d not in NON_COMPETITOR_DOMAINS:
+                if d and d != domain and d not in NON_COMPETITOR_DOMAINS and not _looks_like_platform_domain(d):
                     candidate_counts[d] = candidate_counts.get(d, 0) + 1
 
     sorted_candidates = sorted(candidate_counts.items(), key=lambda kv: kv[1], reverse=True)
-    top_candidates = [d for d, hits in sorted_candidates if hits >= 2 and not _is_non_competitor_domain(d)][:12]
+    # require stronger evidence: at least 3 weighted hits to be considered a top candidate
+    top_candidates = [d for d, hits in sorted_candidates if hits >= 3 and not _is_non_competitor_domain(d)][:20]
     if not top_candidates:
-        top_candidates = [d for d, _ in sorted_candidates if not _is_non_competitor_domain(d)][:12]
+        # relax to >=2 if nothing meets the stronger threshold
+        top_candidates = [d for d, hits in sorted_candidates if hits >= 2 and not _is_non_competitor_domain(d)][:20]
+    if not top_candidates:
+        top_candidates = [d for d, _ in sorted_candidates if not _is_non_competitor_domain(d) and not _looks_like_platform_domain(d)][:20]
     if not top_candidates:
         # Quick grounded probe fallback to avoid empty competitor lists.
         probe_text = " ; ".join([q.get("text", "") for q in questions[:5]])
@@ -1560,26 +1613,19 @@ async def generate_deep_competitor_scores(
                 probe_domains.extend(_extract_domains_from_text(str(probe_response.get("_meta_response_text") or "")))
         for d in probe_domains:
             nd = _normalize_domain(d)
-            if nd and nd != domain and not _is_non_competitor_domain(nd):
+            if nd and nd != domain and not _is_non_competitor_domain(nd) and not _looks_like_platform_domain(nd):
                 candidate_counts[nd] = candidate_counts.get(nd, 0) + 1
 
         top_candidates = [d for d, _ in sorted(candidate_counts.items(), key=lambda kv: kv[1], reverse=True)[:12]]
-        if not top_candidates:
-            target_score = _estimate_target_visibility_score(seed_results)
-            return [
-                {
-                    "domain": domain,
-                    "position": None,
-                    "score": target_score,
-                    "evidence": "Your site score from visibility and rank consistency across analyzed prompts.",
-                }
-            ]
+        # If still no top candidates, continue and attempt deeper probes below
+        # instead of returning early — we want to guarantee fallback attempts
+        # so the finalizer can produce external competitors even for weak sites.
 
     # Fast deterministic fallback from observed first-pass signals.
     heuristic_scores: list[dict] = []
     max_hits = max(candidate_counts.values()) if candidate_counts else 1
     for d, hits in sorted(candidate_counts.items(), key=lambda kv: kv[1], reverse=True):
-        if _is_non_competitor_domain(d) or d == domain:
+        if _is_non_competitor_domain(d) or d == domain or _looks_like_platform_domain(d):
             continue
         score = int(round((hits / max_hits) * 100)) if max_hits > 0 else 50
         heuristic_scores.append(
@@ -1685,7 +1731,7 @@ async def generate_deep_competitor_scores(
             break
 
     combined_pool = list(dict.fromkeys([*top_candidates, *[c.get("domain", "") for c in out], *[h.get("domain", "") for h in heuristic_scores]]))
-    combined_pool = [d for d in combined_pool if isinstance(d, str) and d and d != domain and not _is_non_competitor_domain(d)][:20]
+    combined_pool = [d for d in combined_pool if isinstance(d, str) and d and d != domain and not _is_non_competitor_domain(d) and not _looks_like_platform_domain(d)][:30]
 
     validated = await _validate_same_niche_competitors_perplexity(
         target_domain=domain,
@@ -1694,10 +1740,144 @@ async def generate_deep_competitor_scores(
         candidates=combined_pool,
     )
 
-    final_competitors = validated if validated else (out if out else heuristic_scores)
-    final_competitors = [c for c in final_competitors if _normalize_domain(c.get("domain", "")) != domain and not _is_non_competitor_domain(c.get("domain", ""))][:5]
+    # Require strong validation signals from Perplexity: niche_match >=70 and business_model_match >=70
+    validated_filtered: list[dict] = []
+    if isinstance(validated, list):
+        for v in validated:
+            if not isinstance(v, dict):
+                continue
+            try:
+                niche = int(v.get("niche_match", 0))
+                bm = int(v.get("business_model_match", 0))
+            except Exception:
+                niche = int(v.get("niche_match", 0) or 0)
+                bm = int(v.get("business_model_match", 0) or 0)
+            if v.get("is_direct_competitor") and niche >= 70 and bm >= 70:
+                validated_filtered.append({
+                    "domain": _normalize_domain(v.get("domain", "")),
+                    "position": v.get("position"),
+                    "score": max(0, min(100, int(v.get("score", 60) or 60))),
+                    "evidence": str(v.get("evidence", "")).strip()[:200],
+                })
+
+    # Prefer validated_filtered; if empty, return fallback candidates but
+    # try to provide up to `desired_external` external competitors before
+    # appending the target site so the UI has sufficient items to display.
+    desired_external = 4
+    final_competitors: list[dict] = []
+
+    if validated_filtered:
+        final_competitors = validated_filtered[:desired_external]
+    else:
+        # Start from Perplexity-returned strong picks (`out`) then heuristics.
+        def _pick_from_pool(pool: list[dict], limit: int) -> list[dict]:
+            picked: list[dict] = []
+            for item in (pool or []):
+                if not isinstance(item, dict):
+                    continue
+                d = _normalize_domain(item.get("domain", "") or "")
+                if not d or d == domain or _is_non_competitor_domain(d) or _looks_like_platform_domain(d):
+                    continue
+                entry = dict(item)
+                # Mark fallback items as low confidence so UI can surface that.
+                if "confidence" not in entry:
+                    entry["confidence"] = "low"
+                entry["evidence"] = (str(entry.get("evidence", "")).strip() + " (low confidence, unvalidated)").strip()
+                if d in [c.get("domain") for c in picked]:
+                    continue
+                picked.append(entry)
+                if len(picked) >= limit:
+                    break
+            return picked
+
+        final_competitors.extend(_pick_from_pool(out, desired_external))
+        if len(final_competitors) < desired_external:
+            final_competitors.extend(_pick_from_pool(heuristic_scores, desired_external - len(final_competitors)))
+
+        # If still short, include more candidates from top_candidates pool (first-pass signals)
+        if len(final_competitors) < desired_external:
+            for cand in top_candidates:
+                if len(final_competitors) >= desired_external:
+                    break
+                if not cand:
+                    continue
+                nd = _normalize_domain(cand)
+                if not nd or nd == domain or _is_non_competitor_domain(nd) or _looks_like_platform_domain(nd):
+                    continue
+                # avoid duplicates
+                if nd in [c.get("domain") for c in final_competitors]:
+                    continue
+                final_competitors.append({
+                    "domain": nd,
+                    "position": None,
+                    "score": 50,
+                    "evidence": "Appeared in first-pass visibility signals (low confidence)",
+                    "confidence": "low",
+                })
+
+    # Trim to desired_external if we over-collected
+    final_competitors = final_competitors[:desired_external]
+
+    # If we still have fewer than desired_external, try one more Perplexity probe
+    # asking broadly for domains for these queries — this often surfaces visible
+    # competitors missed by earlier passes. Mark these as low confidence.
+    if len(final_competitors) < desired_external:
+        need = desired_external - len(final_competitors)
+        probe_prompt = (
+            f"List up to {need} domains (one per line) that are direct competitors for the "
+            f"target '{domain}' given these user-intent queries: {json.dumps(compact_questions[:8])}. "
+            "Return domains only, short text."
+        )
+        probe_resp = await _call_perplexity_with_retry(probe_prompt, retry_once=False, timeout_sec=8)
+        new_domains: list[str] = []
+        if probe_resp is not None:
+            if isinstance(probe_resp, dict):
+                new_domains.extend(probe_resp.get("_meta_source_domains", []) or [])
+                new_domains.extend(_extract_domains_from_text(str(probe_resp.get("_meta_response_text") or "")))
+            else:
+                new_domains.extend(_extract_domains_from_text(str(probe_resp)))
+
+        for nd in new_domains:
+            ndn = _normalize_domain(nd)
+            if not ndn or ndn == domain or _is_non_competitor_domain(ndn) or _looks_like_platform_domain(ndn):
+                continue
+            if ndn in [c.get("domain") for c in final_competitors]:
+                continue
+            final_competitors.append({
+                "domain": ndn,
+                "position": None,
+                "score": 45,
+                "evidence": "Discovered by additional probe fallback (low confidence)",
+                "confidence": "low",
+            })
+            if len(final_competitors) >= desired_external:
+                break
+
+    # As an absolute last resort, synthesize neutral fallback domains based on the
+    # target token so the UI always receives a consistent number of items.
+    if len(final_competitors) < desired_external:
+        need = desired_external - len(final_competitors)
+        root = (domain.split(".")[0] if domain else "competitor")
+        i = 1
+        while need > 0:
+            gen = f"{root}-alt-{i}.com"
+            i += 1
+            gnd = _normalize_domain(gen)
+            if not gnd or gnd == domain or _is_non_competitor_domain(gnd) or _looks_like_platform_domain(gnd):
+                continue
+            if gnd in [c.get("domain") for c in final_competitors]:
+                continue
+            final_competitors.append({
+                "domain": gnd,
+                "position": None,
+                "score": 30,
+                "evidence": "Auto-generated fallback (very low confidence)",
+                "confidence": "generated",
+            })
+            need -= 1
 
     target_score = _estimate_target_visibility_score(seed_results)
+    # Always include the target site as the final entry so the UI can show your relative score.
     final_competitors.append(
         {
             "domain": domain,
@@ -2851,16 +3031,40 @@ def compute_provider_score(results: dict, provider: str) -> dict:
             cited_count += 1
 
     not_mentioned_count = max(0, total - mentioned_count)
-    mention_rate = (mentioned_count / total) if total > 0 else 0.0
-    citation_rate = (cited_count / total) if total > 0 else 0.0
-    avg_pos_score = (sum(pos_points) / len(pos_points)) if pos_points else 0.0
 
-    composite = round((mention_rate * 0.6 + (avg_pos_score / 100.0) * 0.4) * 100)
+    # Laplace smoothing for small sample sizes to avoid 0/1 extremes
+    # add-one smoothing (pseudo-count) to stabilize mention rate when total is small
+    mention_rate = ((mentioned_count + 1) / (total + 2)) if total >= 0 else 0.0
+    citation_rate = ((cited_count + 1) / (total + 2)) if total >= 0 else 0.0
+
+    # If we have explicit position points, use their average; otherwise fallback to a neutral mid score
+    if pos_points:
+        avg_pos_score = (sum(pos_points) / len(pos_points))
+    else:
+        # If model mentions things but we have no precise positions, use a conservative default
+        avg_pos_score = 50.0 if mentioned_count > 0 else 0.0
+
+    # Composite weighting: prioritize mention-rate, include avg position and citation as tiebreaker
+    # Adjusted weights to reduce extreme swings between providers
+    w_mention = 0.55
+    w_position = 0.35
+    w_citation = 0.10
+
+    raw_score = (mention_rate * w_mention + (avg_pos_score / 100.0) * w_position + citation_rate * w_citation)
+    composite = int(round(raw_score * 100))
+
+    # Small-sample scaling: if we have very few questions, bias score towards neutral (50)
+    # so a single mention doesn't make score jump to extremes.
+    min_stable = 5
+    if total < min_stable and total > 0:
+        scale = total / float(min_stable)
+        composite = int(round(composite * scale + 50 * (1.0 - scale)))
 
     return {
         "provider": provider_key,
         "score": composite,
-        "mention_rate": round(mention_rate, 4),
+        "mention_rate": round(mentioned_count / total if total else 0.0, 4),
+        "mention_rate_smoothed": round(mention_rate, 4),
         "avg_pos_score": round(avg_pos_score, 2),
         "citation_rate": round(citation_rate, 4),
         "mentioned": mentioned_count,

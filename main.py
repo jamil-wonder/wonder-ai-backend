@@ -1599,9 +1599,12 @@ async def _process_phase5_job(job_doc: dict):
             )
             return
 
-        # Perplexity-only finalization: deep competitor scoring + brand narrative.
-        # OpenAI jobs complete immediately after question analysis to keep them fast.
-        if model_provider != "perplexity":
+        # Perplexity finalization: deep competitor scoring + brand narrative.
+        # By default, only Perplexity provider runs trigger finalization to keep
+        # multi/OpenAI runs fast. Set PHASE5_ALWAYS_RUN_DEEP=true to run the
+        # Perplexity deep finalization after any job automatically.
+        always_run_deep = os.getenv("PHASE5_ALWAYS_RUN_DEEP", "false").strip().lower() == "true"
+        if model_provider != "perplexity" and not always_run_deep:
             final_scores, final_overall = _compute_provider_scores(accumulated_results) if model_provider == "multi" else ({}, None)
             await phase5_jobs_col.update_one(
                 {"job_id": job_id},
@@ -2422,6 +2425,8 @@ async def api_phase5_job_stream(job_id: str, request: Request):
     async def _event_generator():
         last_processed = -1
         last_status = ""
+        last_deep = None
+        last_brand = None
         idle_ticks = 0
         heartbeat_ticks = 0
 
@@ -2454,7 +2459,12 @@ async def api_phase5_job_stream(job_id: str, request: Request):
             processed = int(job.get("processed", 0) or 0)
             status = str(job.get("status", "") or "")
 
-            if processed != last_processed or status != last_status:
+            # Also emit when deep_competitors or brand_summary change so clients
+            # reliably receive finalization results even if processed/status
+            # didn't change.
+            deep_serial = json.dumps(job.get("deep_competitors", []), default=str, sort_keys=True)
+            brand_now = str(job.get("brand_summary") or "")
+            if processed != last_processed or status != last_status or deep_serial != last_deep or brand_now != last_brand:
                 payload = {
                     "job_id": job_id,
                     "status": status,
@@ -2471,6 +2481,8 @@ async def api_phase5_job_stream(job_id: str, request: Request):
                 yield f"data: {json.dumps(payload, default=str)}\n\n"
                 last_processed = processed
                 last_status = status
+                last_deep = deep_serial
+                last_brand = brand_now
                 idle_ticks = 0
                 heartbeat_ticks = 0
             else:
