@@ -367,42 +367,48 @@ def _build_blog_base_analysis(text: str, attachment_count: int) -> dict:
     sentence_lengths = [len([w for w in s.split() if w]) for s in _blog_split_sentences(cleaned)]
     avg_sentence_length = (sum(sentence_lengths) / len(sentence_lengths)) if sentence_lengths else 0
 
-    structure = 10
-    structure += _blog_clamp(heading_count * 4, 0, 16)
-    structure += _blog_clamp(list_count * 2, 0, 8)
-    structure += _blog_clamp(8 if paragraph_count >= 4 else paragraph_count * 2, 0, 8)
-    structure += 8 if word_count >= 700 else 4 if word_count >= 400 else 0
-    structure += 4 if attachment_count > 0 else 0
-    structure = _blog_clamp(structure, 0, 35)
+    structure_raw = 10
+    structure_raw += _blog_clamp(heading_count * 4, 0, 16)
+    structure_raw += _blog_clamp(list_count * 2, 0, 8)
+    structure_raw += _blog_clamp(8 if paragraph_count >= 4 else paragraph_count * 2, 0, 8)
+    structure_raw += 8 if word_count >= 700 else 4 if word_count >= 400 else 0
+    structure_raw += 4 if attachment_count > 0 else 0
+    structure_raw = _blog_clamp(structure_raw, 0, 35)
 
-    readability = 10
+    readability_raw = 10
     if avg_sentence_length > 0:
         if 12 <= avg_sentence_length <= 22:
-            readability += 18
+            readability_raw += 18
         elif 8 <= avg_sentence_length <= 28:
-            readability += 12
+            readability_raw += 12
         else:
-            readability += 4
-    readability += 10 if paragraph_count >= 4 else 6 if paragraph_count >= 2 else 2
-    readability += 8 if word_count >= 500 else 5 if word_count >= 250 else 1
-    readability = _blog_clamp(readability, 0, 30)
+            readability_raw += 4
+    readability_raw += 10 if paragraph_count >= 4 else 6 if paragraph_count >= 2 else 2
+    readability_raw += 8 if word_count >= 500 else 5 if word_count >= 250 else 1
+    readability_raw = _blog_clamp(readability_raw, 0, 30)
 
-    seo = 10
-    seo += 10 if heading_count > 0 else 0
-    seo += 6 if link_count > 0 else 0
-    seo += 8 if word_count >= 800 else 5 if word_count >= 500 else 1
-    seo += 4 if attachment_count > 0 else 0
-    seo = _blog_clamp(seo, 0, 30)
+    seo_raw = 10
+    seo_raw += 10 if heading_count > 0 else 0
+    seo_raw += 6 if link_count > 0 else 0
+    seo_raw += 8 if word_count >= 800 else 5 if word_count >= 500 else 1
+    seo_raw += 4 if attachment_count > 0 else 0
+    seo_raw = _blog_clamp(seo_raw, 0, 30)
 
-    engagement = 8
-    engagement += 10 if cta_count > 0 else 0
-    engagement += 8 if list_count > 0 else 0
-    engagement += 4 if _blog_count_matches(cleaned, r"\?") > 2 else 0
-    engagement += 4 if _blog_count_matches(cleaned, r"\b(example|tip|guide|step|how to|why|benefit)\b") > 2 else 0
-    engagement = _blog_clamp(engagement, 0, 20)
+    engagement_raw = 8
+    engagement_raw += 10 if cta_count > 0 else 0
+    engagement_raw += 8 if list_count > 0 else 0
+    engagement_raw += 4 if _blog_count_matches(cleaned, r"\?") > 2 else 0
+    engagement_raw += 4 if _blog_count_matches(cleaned, r"\b(example|tip|guide|step|how to|why|benefit)\b") > 2 else 0
+    engagement_raw = _blog_clamp(engagement_raw, 0, 20)
 
-    score = round(structure * 0.3 + readability * 0.24 + seo * 0.28 + engagement * 0.18)
-    score = _blog_clamp(score, 0, 100)
+    structure = _blog_clamp(round((structure_raw / 35) * 100), 0, 100)
+    readability = _blog_clamp(round((readability_raw / 30) * 100), 0, 100)
+    seo = _blog_clamp(round((seo_raw / 30) * 100), 0, 100)
+    engagement = _blog_clamp(round((engagement_raw / 20) * 100), 0, 100)
+
+    # Normalize component totals (max 115) to a 0-100 scale.
+    total = structure_raw + readability_raw + seo_raw + engagement_raw
+    score = _blog_clamp(round((total / 115) * 100), 0, 100)
     if word_count < 150:
         score = max(18, score - 12)
     elif word_count < 350:
@@ -474,7 +480,7 @@ def _build_blog_base_analysis(text: str, attachment_count: int) -> dict:
         else "This draft needs more structure, clearer search intent coverage, and stronger on-page SEO signals before it is competitive."
     )
 
-    engagement_label = "high" if engagement > 70 else "moderate"
+    engagement_label = "high" if engagement >= 60 else "moderate"
     summary = (
         f"A {word_count}-word {grade.lower()} draft. It features {heading_count} headings and {link_count} links, aiming for a {engagement_label} level of reader engagement."
         if word_count > 0
