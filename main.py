@@ -99,6 +99,20 @@ def _run_scrape_worker_core(url: str):
             pass
     return asyncio.run(scrape_website(url, enable_ai=False, enable_deep_crawl=False))
 
+
+def _normalize_cache_url(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if not re.match(r"^https?://", raw):
+        raw = f"https://{raw}"
+    parsed = urlparse(raw)
+    host = parsed.netloc.strip().lower()
+    path = parsed.path.rstrip("/")
+    if not host:
+        return ""
+    return f"{host}{path}"
+
 app = FastAPI(title="Wonder AI Backend")
 
 # Phase 5 worker settings
@@ -117,7 +131,9 @@ PHASE5_WORKER_ID = f"{os.getenv('HOSTNAME', 'local')}-{uuid.uuid4().hex[:8]}"
 PHASE5_REDIS_URL = os.getenv("REDIS_URL", "").strip()
 PHASE5_REDIS_QUEUE_KEY = os.getenv("PHASE5_REDIS_QUEUE_KEY", "phase5:jobs:queue")
 PHASE5_CACHE_REUSE_SECONDS = int(os.getenv("PHASE5_CACHE_REUSE_SECONDS", "21600"))
+PHASE5_QUESTIONS_CACHE_TTL_SEC = int(os.getenv("PHASE5_QUESTIONS_CACHE_TTL_SEC", "604800"))
 PHASE5_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+PHASE1_SCRAPE_CACHE_TTL_SEC = int(os.getenv("PHASE1_SCRAPE_CACHE_TTL_SEC", "3600"))
 
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
 if allowed_origins_env.strip():
@@ -1027,10 +1043,28 @@ async def api_user_history_site_trend(site: str, range: str = "month", current_u
 # --- Existing Data Routes ---
 
 @app.post("/api/scrape", response_model=ScrapeResult)
-async def api_scrape(request: ScrapeRequest, current_user: dict = Depends(get_current_user_optional)):
+async def api_scrape(
+    request: ScrapeRequest,
+    refresh: bool = False,
+    current_user: dict = Depends(get_current_user_optional),
+):
     try:
         started_at = datetime.utcnow()
         print(f"[API] /api/scrape started: {request.url}")
+        redis_client = getattr(app.state, "phase5_redis", None)
+        cache_key = ""
+        if redis_client is not None and not refresh:
+            normalized_url = _normalize_cache_url(request.url)
+            if normalized_url:
+                cache_key = f"phase1:scrape:{normalized_url}"
+                try:
+                    cached = await redis_client.get(cache_key)
+                    if cached:
+                        cached_result = json.loads(cached.decode("utf-8"))
+                        if isinstance(cached_result, dict):
+                            return cached_result
+                except Exception as e:
+                    print(f"[Phase1] scrape cache read failed: {e}")
         try:
             doc = {
                 "url": request.url, 
@@ -1074,6 +1108,12 @@ async def api_scrape(request: ScrapeRequest, current_user: dict = Depends(get_cu
                 })
         elapsed = (datetime.utcnow() - started_at).total_seconds()
         print(f"[API] /api/scrape completed in {elapsed:.1f}s: {request.url}")
+        if redis_client is not None and cache_key and isinstance(result, dict):
+            try:
+                payload = json.dumps(result, ensure_ascii=True).encode("utf-8")
+                await redis_client.setex(cache_key, PHASE1_SCRAPE_CACHE_TTL_SEC, payload)
+            except Exception as e:
+                print(f"[Phase1] scrape cache write failed: {e}")
         return result
     except asyncio.TimeoutError:
         print(f"[API] /api/scrape timeout: {request.url}")
@@ -1565,9 +1605,33 @@ async def admin_clear_ai_usage(admin: dict = Depends(get_current_admin_user)):
 # PHASE 5 ROUTES
 # ==============================================================================
 @app.post("/api/phase5/generate-questions", response_model=Phase5QuestionsResponse)
-async def api_phase5_generate_questions(req: Phase5QuestionsRequest, current_user: dict = Depends(get_current_user_optional)):
+async def api_phase5_generate_questions(
+    req: Phase5QuestionsRequest,
+    refresh: bool = False,
+    current_user: dict = Depends(get_current_user_optional),
+):
     try:
+        redis_client = getattr(app.state, "phase5_redis", None)
+        normalized_domain = _normalize_domain(req.url)
+        cache_key = f"phase5:questions:{normalized_domain}" if normalized_domain else ""
+
+        if redis_client is not None and cache_key and not refresh:
+            try:
+                cached = await redis_client.get(cache_key)
+                if cached:
+                    cached_questions = json.loads(cached.decode("utf-8"))
+                    if isinstance(cached_questions, list) and cached_questions:
+                        return {"questions": cached_questions}
+            except Exception as e:
+                print(f"[Phase5] question cache read failed: {e}")
+
         questions = await generate_brand_questions(req.url)
+        if redis_client is not None and cache_key and isinstance(questions, list) and questions:
+            try:
+                payload = json.dumps(questions, ensure_ascii=True).encode("utf-8")
+                await redis_client.setex(cache_key, PHASE5_QUESTIONS_CACHE_TTL_SEC, payload)
+            except Exception as e:
+                print(f"[Phase5] question cache write failed: {e}")
         configured_model = (os.getenv("PERPLEXITY_MODEL_PHASE5") or "sonar-pro").strip() or None
         await _log_ai_usage_event({
             "feature": "phase5_generate_questions",
