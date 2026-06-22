@@ -5,6 +5,8 @@ from google.genai import types
 from utils.gemini_utils import generate_with_fallback
 
 from .config import (
+    ANTHROPIC_PHASE5_MAX_RETRIES,
+    ANTHROPIC_PHASE5_TIMEOUT_SEC,
     MAX_RETRIES,
     OPENAI_PHASE5_MAX_RETRIES,
     OPENAI_PHASE5_TIMEOUT_SEC,
@@ -27,6 +29,7 @@ from .helpers import (
 )
 from .providers import (
     Phase5RateLimitError,
+    _call_claude_with_retry,
     _call_gemini_with_retry,
     _call_openai_with_retry,
     _call_perplexity_with_retry,
@@ -138,7 +141,12 @@ async def _validate_direct_competitors(
         return []
 
 
-async def _analyze_single_question_openai(url: str, question: dict, include_competitors: bool = False) -> dict:
+async def _analyze_single_question_openai(
+    url: str,
+    question: dict,
+    include_competitors: bool = False,
+    provider_name: str = "openai",
+) -> dict:
     domain_match = re.search(r"(?:https?://)?(?:www\.)?([^/]+)", url)
     raw_domain = domain_match.group(1).lower() if domain_match else url.lower()
     domain = _normalize_domain(raw_domain)
@@ -177,11 +185,18 @@ async def _analyze_single_question_openai(url: str, question: dict, include_comp
     - JSON only.
     """
 
-    data = await _call_openai_with_retry(
-        prompt,
-        retry_once=True,
-        timeout_sec=OPENAI_PHASE5_TIMEOUT_SEC,
-    )
+    if provider_name == "claude":
+        data = await _call_claude_with_retry(
+            prompt,
+            retry_once=True,
+            timeout_sec=ANTHROPIC_PHASE5_TIMEOUT_SEC,
+        )
+    else:
+        data = await _call_openai_with_retry(
+            prompt,
+            retry_once=True,
+            timeout_sec=OPENAI_PHASE5_TIMEOUT_SEC,
+        )
     if not isinstance(data, dict):
         data = {}
 
@@ -586,6 +601,13 @@ async def analyze_single_question(
             url=url,
             question=question,
             include_competitors=include_competitors,
+        )
+    if normalized_provider == "claude":
+        return await _analyze_single_question_openai(
+            url=url,
+            question=question,
+            include_competitors=include_competitors,
+            provider_name="claude",
         )
     if normalized_provider == "perplexity":
         return await _analyze_single_question_perplexity(
@@ -1125,6 +1147,8 @@ async def _run_with_backoff(
         retries = max(1, OPENAI_PHASE5_MAX_RETRIES)
     elif provider == "perplexity":
         retries = max(1, PERPLEXITY_PHASE5_MAX_RETRIES)
+    elif provider == "claude":
+        retries = max(1, ANTHROPIC_PHASE5_MAX_RETRIES)
     else:
         retries = max(1, MAX_RETRIES)
     for attempt in range(retries):
@@ -1217,11 +1241,13 @@ async def analyze_single_question_multi(
     gemini_call = _call_provider("gemini")
     perplexity_call = _call_provider("perplexity")
     openai_call = _call_provider("openai")
+    claude_call = _call_provider("claude")
 
-    gemini_raw, perplexity_raw, openai_raw = await asyncio.gather(
+    gemini_raw, perplexity_raw, openai_raw, claude_raw = await asyncio.gather(
         gemini_call,
         perplexity_call,
         openai_call,
+        claude_call,
         return_exceptions=True,
     )
 
@@ -1229,6 +1255,7 @@ async def analyze_single_question_multi(
         "gemini": _safe_provider_result(gemini_raw),
         "perplexity": _safe_provider_result(perplexity_raw),
         "chatgpt": _safe_provider_result(openai_raw),
+        "claude": _safe_provider_result(claude_raw),
     }
 
     return {

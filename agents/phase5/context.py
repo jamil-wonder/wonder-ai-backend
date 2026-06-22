@@ -3,10 +3,8 @@ import json
 import httpx
 from bs4 import BeautifulSoup
 
-from .config import PHASE5_CONTEXT_CACHE_TTL_SEC, PHASE5_CONTEXT_FETCH_TIMEOUT_SEC
+from .config import PHASE5_CONTEXT_FETCH_TIMEOUT_SEC
 from .helpers import _extract_text_value, _normalize_url
-
-_PAGE_CONTEXT_CACHE: dict[str, dict] = {}
 
 
 async def _fetch_page_context(url: str) -> dict:
@@ -22,11 +20,6 @@ async def _fetch_page_context(url: str) -> dict:
     if not normalized_url:
         return empty
 
-    now = asyncio.get_running_loop().time()
-    cached = _PAGE_CONTEXT_CACHE.get(normalized_url)
-    if cached and isinstance(cached.get("expires_at"), (int, float)) and cached["expires_at"] > now:
-        return dict(cached.get("ctx") or empty)
-
     ctx = dict(empty)
     try:
         headers = {"User-Agent": "Mozilla/5.0 (compatible; WonderBot/1.0)"}
@@ -34,10 +27,6 @@ async def _fetch_page_context(url: str) -> dict:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             resp = await client.get(normalized_url, headers=headers)
             if resp.status_code >= 400:
-                _PAGE_CONTEXT_CACHE[normalized_url] = {
-                    "ctx": ctx,
-                    "expires_at": now + PHASE5_CONTEXT_CACHE_TTL_SEC,
-                }
                 return ctx
 
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -134,8 +123,4 @@ async def _fetch_page_context(url: str) -> dict:
     except Exception as e:
         print(f"[Phase5] context fetch failed for {normalized_url}: {e}")
 
-    _PAGE_CONTEXT_CACHE[normalized_url] = {
-        "ctx": ctx,
-        "expires_at": now + PHASE5_CONTEXT_CACHE_TTL_SEC,
-    }
     return ctx

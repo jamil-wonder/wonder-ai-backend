@@ -31,6 +31,7 @@ from models.phase5_models import (
     Phase5QuestionsRequest,
     Phase5QuestionsResponse,
     Phase5AnalyzeRequest,
+
     Phase5AnalyzeResponse,
     Phase5AnalyzeSingleRequest,
     Phase5AnalyzeSingleResponse,
@@ -38,6 +39,7 @@ from models.phase5_models import (
     Phase5StartJobResponse,
     Phase5JobStatusResponse,
 )
+from agents.phase5.config import PHASE5_ENABLE_GEMINI
 from agents.phase5_agent import (
     generate_brand_questions,
     rank_brand_in_ai,
@@ -65,17 +67,12 @@ import traceback
 import uvicorn
 import os
 import uuid
-import hashlib
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from urllib.parse import urlparse
-
-load_dotenv()
-from redis import asyncio as aioredis
-from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -100,19 +97,6 @@ def _run_scrape_worker_core(url: str):
     return asyncio.run(scrape_website(url, enable_ai=False, enable_deep_crawl=False))
 
 
-def _normalize_cache_url(value: str) -> str:
-    raw = str(value or "").strip().lower()
-    if not raw:
-        return ""
-    if not re.match(r"^https?://", raw):
-        raw = f"https://{raw}"
-    parsed = urlparse(raw)
-    host = parsed.netloc.strip().lower()
-    path = parsed.path.rstrip("/")
-    if not host:
-        return ""
-    return f"{host}{path}"
-
 app = FastAPI(title="Wonder AI Backend")
 
 # Phase 5 worker settings
@@ -123,17 +107,13 @@ PHASE5_MODEL_MAX_THREADS = max(4, min(16, int(os.getenv("PHASE5_MODEL_MAX_THREAD
 PHASE5_QUESTION_TIMEOUT_GEMINI_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_GEMINI_SEC", "140"))
 PHASE5_QUESTION_TIMEOUT_OPENAI_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_OPENAI_SEC", "40"))
 PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC", "45"))
+PHASE5_QUESTION_TIMEOUT_ANTHROPIC_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_ANTHROPIC_SEC", "45"))
 PHASE5_STALE_RUNNING_SECONDS = int(os.getenv("PHASE5_STALE_RUNNING_SECONDS", "120"))
 PHASE5_RECOVER_STALE_RUNNING = str(os.getenv("PHASE5_RECOVER_STALE_RUNNING", "false")).strip().lower() == "true"
 PHASE5_STALE_QUEUED_SECONDS = int(os.getenv("PHASE5_STALE_QUEUED_SECONDS", "1800"))
 PHASE5_RESUME_QUEUED_ON_STARTUP = str(os.getenv("PHASE5_RESUME_QUEUED_ON_STARTUP", "false")).strip().lower() == "true"
 PHASE5_WORKER_ID = f"{os.getenv('HOSTNAME', 'local')}-{uuid.uuid4().hex[:8]}"
-PHASE5_REDIS_URL = os.getenv("REDIS_URL", "").strip()
-PHASE5_REDIS_QUEUE_KEY = os.getenv("PHASE5_REDIS_QUEUE_KEY", "phase5:jobs:queue")
-PHASE5_CACHE_REUSE_SECONDS = int(os.getenv("PHASE5_CACHE_REUSE_SECONDS", "21600"))
-PHASE5_QUESTIONS_CACHE_TTL_SEC = int(os.getenv("PHASE5_QUESTIONS_CACHE_TTL_SEC", "604800"))
 PHASE5_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
-PHASE1_SCRAPE_CACHE_TTL_SEC = int(os.getenv("PHASE1_SCRAPE_CACHE_TTL_SEC", "3600"))
 
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
 if allowed_origins_env.strip():
@@ -173,6 +153,37 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/healthz")
+async def healthz():
+    return {
+        "status": "ok",
+        "service": "wonder-ai-backend",
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@app.get("/readyz")
+async def readyz():
+    checks = {
+        "mongodb": "unknown",
+    }
+    ready = True
+
+    try:
+        await mongo_client.admin.command("ping")
+        checks["mongodb"] = "ok"
+    except Exception as e:
+        ready = False
+        checks["mongodb"] = f"error:{type(e).__name__}"
+
+    return {
+        "status": "ok" if ready else "degraded",
+        "service": "wonder-ai-backend",
+        "checks": checks,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
 
 # Authentication Config
 SECRET_KEY = os.getenv("JWT_SECRET_KEY")
@@ -258,6 +269,8 @@ async def _log_ai_usage_event(event: dict):
             model_name = (os.getenv("OPENAI_MODEL_PHASE5") or "").strip() or None
         if not model_name and model_provider == "perplexity":
             model_name = (os.getenv("PERPLEXITY_MODEL_PHASE5") or "sonar-pro").strip()
+        if not model_name and model_provider in {"anthropic", "claude"}:
+            model_name = (os.getenv("ANTHROPIC_MODEL_PHASE5") or "claude-sonnet-4-5").strip()
 
         model_family = payload.get("model_family")
         lowered_model = str(model_name or "").lower()
@@ -268,6 +281,8 @@ async def _log_ai_usage_event(event: dict):
                 model_family = "gpt"
             elif model_provider == "perplexity":
                 model_family = "perplexity"
+            elif model_provider in {"anthropic", "claude"}:
+                model_family = "claude"
             elif "gemini" in lowered_model:
                 model_family = "gemini"
             elif any(tag in lowered_model for tag in ["gpt", "o1", "o3", "o4"]):
@@ -869,6 +884,8 @@ async def api_user_history(
                     models_ran.append("chatgpt")
                 if "gemini" in providers:
                     models_ran.append("gemini")
+                if "claude" in providers:
+                    models_ran.append("claude")
 
             if not models_ran:
                 model_name = str(run.get("model") or "").strip().lower()
@@ -877,7 +894,7 @@ async def api_user_history(
                 elif model_name in {"perplexity", "gemini", "claude"}:
                     models_ran = [model_name]
                 elif model_name == "multi":
-                    models_ran = ["perplexity", "chatgpt"]
+                    models_ran = ["perplexity", "chatgpt", "claude"]
 
             run["models_ran"] = models_ran
             phase5_runs.append(run)
@@ -992,6 +1009,8 @@ async def api_user_history_site_trend(site: str, range: str = "month", current_u
                 models_ran.append("chatgpt")
             if "gemini" in providers:
                 models_ran.append("gemini")
+            if "claude" in providers:
+                models_ran.append("claude")
         if not models_ran:
             model_name = str(run.get("model") or "").strip().lower()
             if model_name in {"openai", "chatgpt"}:
@@ -999,7 +1018,7 @@ async def api_user_history_site_trend(site: str, range: str = "month", current_u
             elif model_name in {"perplexity", "gemini", "claude"}:
                 models_ran = [model_name]
             elif model_name == "multi":
-                models_ran = ["perplexity", "chatgpt"]
+                models_ran = ["perplexity", "chatgpt", "claude"]
 
         points.append(
             {
@@ -1045,26 +1064,11 @@ async def api_user_history_site_trend(site: str, range: str = "month", current_u
 @app.post("/api/scrape", response_model=ScrapeResult)
 async def api_scrape(
     request: ScrapeRequest,
-    refresh: bool = False,
     current_user: dict = Depends(get_current_user_optional),
 ):
     try:
         started_at = datetime.utcnow()
         print(f"[API] /api/scrape started: {request.url}")
-        redis_client = getattr(app.state, "phase5_redis", None)
-        cache_key = ""
-        if redis_client is not None and not refresh:
-            normalized_url = _normalize_cache_url(request.url)
-            if normalized_url:
-                cache_key = f"phase1:scrape:{normalized_url}"
-                try:
-                    cached = await redis_client.get(cache_key)
-                    if cached:
-                        cached_result = json.loads(cached.decode("utf-8"))
-                        if isinstance(cached_result, dict):
-                            return cached_result
-                except Exception as e:
-                    print(f"[Phase1] scrape cache read failed: {e}")
         try:
             doc = {
                 "url": request.url, 
@@ -1108,12 +1112,6 @@ async def api_scrape(
                 })
         elapsed = (datetime.utcnow() - started_at).total_seconds()
         print(f"[API] /api/scrape completed in {elapsed:.1f}s: {request.url}")
-        if redis_client is not None and cache_key and isinstance(result, dict):
-            try:
-                payload = json.dumps(result, ensure_ascii=True).encode("utf-8")
-                await redis_client.setex(cache_key, PHASE1_SCRAPE_CACHE_TTL_SEC, payload)
-            except Exception as e:
-                print(f"[Phase1] scrape cache write failed: {e}")
         return result
     except asyncio.TimeoutError:
         print(f"[API] /api/scrape timeout: {request.url}")
@@ -1607,31 +1605,10 @@ async def admin_clear_ai_usage(admin: dict = Depends(get_current_admin_user)):
 @app.post("/api/phase5/generate-questions", response_model=Phase5QuestionsResponse)
 async def api_phase5_generate_questions(
     req: Phase5QuestionsRequest,
-    refresh: bool = False,
     current_user: dict = Depends(get_current_user_optional),
 ):
     try:
-        redis_client = getattr(app.state, "phase5_redis", None)
-        normalized_domain = _normalize_domain(req.url)
-        cache_key = f"phase5:questions:{normalized_domain}" if normalized_domain else ""
-
-        if redis_client is not None and cache_key and not refresh:
-            try:
-                cached = await redis_client.get(cache_key)
-                if cached:
-                    cached_questions = json.loads(cached.decode("utf-8"))
-                    if isinstance(cached_questions, list) and cached_questions:
-                        return {"questions": cached_questions}
-            except Exception as e:
-                print(f"[Phase5] question cache read failed: {e}")
-
         questions = await generate_brand_questions(req.url)
-        if redis_client is not None and cache_key and isinstance(questions, list) and questions:
-            try:
-                payload = json.dumps(questions, ensure_ascii=True).encode("utf-8")
-                await redis_client.setex(cache_key, PHASE5_QUESTIONS_CACHE_TTL_SEC, payload)
-            except Exception as e:
-                print(f"[Phase5] question cache write failed: {e}")
         configured_model = (os.getenv("PERPLEXITY_MODEL_PHASE5") or "sonar-pro").strip() or None
         await _log_ai_usage_event({
             "feature": "phase5_generate_questions",
@@ -1651,13 +1628,13 @@ async def api_phase5_generate_questions(
         print(f"[Phase5] generate-questions validation failed: {str(e)}")
         raise HTTPException(
             status_code=503,
-            detail="Questions cannot be generated at this moment. Please try again or refresh.",
+            detail="Questions cannot be generated at this moment. Please try again.",
         )
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(
             status_code=503,
-            detail="Questions cannot be generated at this moment. Please try again or refresh.",
+            detail="Questions cannot be generated at this moment. Please try again.",
         )
 
 @app.post("/api/phase5/analyze", response_model=Phase5AnalyzeResponse)
@@ -1719,14 +1696,14 @@ async def _process_phase5_job(job_doc: dict):
     job_id = job_doc["job_id"]
     job_type = job_doc.get("job_type", "core")
     model_provider = str(job_doc.get("model", "perplexity") or "perplexity").strip().lower()
-    if model_provider == "gemini":
+    if model_provider == "gemini" and not PHASE5_ENABLE_GEMINI:
         await phase5_jobs_col.update_one(
             {"job_id": job_id},
             {
                 "$set": {
                     "status": "failed",
                     "current_question_id": None,
-                    "error": "Gemini is temporarily disabled for Phase 5. Use OpenAI or Perplexity.",
+                    "error": "Gemini is temporarily disabled for Phase 5. Use OpenAI, Perplexity, or Claude.",
                     "updated_at": datetime.utcnow().isoformat(),
                 }
             },
@@ -1743,7 +1720,9 @@ async def _process_phase5_job(job_doc: dict):
             return not latest or latest.get("status") == "cancelled"
 
         def _compute_provider_scores(results_map: dict[str, dict]) -> tuple[dict, float | None]:
-            providers = ["perplexity", "chatgpt"]
+            providers = ["perplexity", "chatgpt", "claude"]
+            if PHASE5_ENABLE_GEMINI:
+                providers.append("gemini")
             score_map: dict[str, dict] = {}
             for provider_name in providers:
                 score_map[provider_name] = compute_provider_score(results_map, provider_name)
@@ -1865,10 +1844,13 @@ async def _process_phase5_job(job_doc: dict):
                     per_question_timeout = PHASE5_QUESTION_TIMEOUT_OPENAI_SEC
                 elif provider_for_q == "perplexity":
                     per_question_timeout = PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC
+                elif provider_for_q == "claude":
+                    per_question_timeout = PHASE5_QUESTION_TIMEOUT_ANTHROPIC_SEC
                 elif provider_for_q == "multi":
                     per_question_timeout = max(
                         PHASE5_QUESTION_TIMEOUT_OPENAI_SEC,
                         PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC,
+                        PHASE5_QUESTION_TIMEOUT_ANTHROPIC_SEC,
                         PHASE5_QUESTION_TIMEOUT_GEMINI_SEC,
                     )
                 else:
@@ -1917,6 +1899,7 @@ async def _process_phase5_job(job_doc: dict):
                                 "gemini": {"mentioned": False, "position": None, "sources": [], "cited": False, "status": "Not Mentioned"},
                                 "perplexity": {"mentioned": False, "position": None, "sources": [], "cited": False, "status": "Not Mentioned"},
                                 "chatgpt": {"mentioned": False, "position": None, "sources": [], "cited": False, "status": "Not Mentioned"},
+                                "claude": {"mentioned": False, "position": None, "sources": [], "cited": False, "status": "Not Mentioned"},
                             },
                         }
 
@@ -2098,38 +2081,18 @@ async def _process_phase5_job(job_doc: dict):
 async def _phase5_worker_loop():
     while True:
         try:
-            redis_client = getattr(app.state, "phase5_redis", None)
-
-            claimed = None
-            if redis_client is not None:
-                queue_item = await redis_client.blpop(PHASE5_REDIS_QUEUE_KEY, timeout=5)
-                if queue_item:
-                    _, raw_job_id = queue_item
-                    queued_job_id = raw_job_id.decode("utf-8")
-                    claimed = await phase5_jobs_col.find_one_and_update(
-                        {"job_id": queued_job_id, "status": "queued"},
-                        {
-                            "$set": {
-                                "status": "running",
-                                "worker_id": PHASE5_WORKER_ID,
-                                "updated_at": datetime.utcnow().isoformat(),
-                            }
-                        },
-                        return_document=ReturnDocument.AFTER,
-                    )
-            if claimed is None:
-                claimed = await phase5_jobs_col.find_one_and_update(
-                    {"status": "queued"},
-                    {
-                        "$set": {
-                            "status": "running",
-                            "worker_id": PHASE5_WORKER_ID,
-                            "updated_at": datetime.utcnow().isoformat(),
-                        }
-                    },
-                    sort=[("queue_priority", 1), ("created_at", 1)],
-                    return_document=ReturnDocument.AFTER,
-                )
+            claimed = await phase5_jobs_col.find_one_and_update(
+                {"status": "queued"},
+                {
+                    "$set": {
+                        "status": "running",
+                        "worker_id": PHASE5_WORKER_ID,
+                        "updated_at": datetime.utcnow().isoformat(),
+                    }
+                },
+                sort=[("queue_priority", 1), ("created_at", 1)],
+                return_document=ReturnDocument.AFTER,
+            )
 
             if not claimed:
                 await asyncio.sleep(PHASE5_WORKER_POLL_INTERVAL)
@@ -2191,133 +2154,15 @@ async def _phase5_try_start_immediately(job_id: str) -> None:
         traceback.print_exc()
 
 
-def _phase5_request_hash(
-    url: str,
-    questions: list[dict],
-    job_type: str,
-    model: str,
-    seed_results: dict | None = None,
-) -> str:
-    normalized_questions = []
-    for q in questions:
-        qid = str((q or {}).get("id", "")).strip()
-        text = str((q or {}).get("text", "")).strip()
-        if not text:
-            continue
-        normalized_questions.append({"id": qid, "text": text})
-
-    normalized_questions.sort(key=lambda item: (item.get("id", ""), item.get("text", "")))
-
-    payload = {
-        "url": str(url or "").strip().lower(),
-        "job_type": str(job_type or "core").strip().lower(),
-        "model": str(model or "perplexity").strip().lower(),
-        "questions": normalized_questions,
-    }
-
-    if payload["job_type"] == "deep":
-        payload["seed_results"] = seed_results or {}
-
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _ts_within_cache_window(ts_value: str | None) -> bool:
-    if not ts_value:
-        return False
-    try:
-        updated_at = datetime.fromisoformat(ts_value)
-    except Exception:
-        return False
-    age_seconds = (datetime.utcnow() - updated_at).total_seconds()
-    return age_seconds <= max(60, PHASE5_CACHE_REUSE_SECONDS)
-
-
-async def _find_reusable_phase5_job(request_hash: str, job_type: str) -> dict | None:
-    if phase5_jobs_col is None:
-        return None
-
-    cursor = phase5_jobs_col.find(
-        {
-            "request_hash": request_hash,
-            "job_type": job_type,
-            "status": {"$in": ["queued", "running", "finalizing", "completed"]},
-        },
-        {"_id": 0},
-    ).sort("updated_at", -1).limit(5)
-
-    reusable_completed = None
-    async for job in cursor:
-        status = (job or {}).get("status")
-        if status in {"queued", "finalizing"}:
-            return job
-        if status == "running":
-            if _ts_within_cache_window(job.get("updated_at")):
-                return job
-            stale_job_id = job.get("job_id")
-            if PHASE5_RECOVER_STALE_RUNNING:
-                # Optional mode: recover stale running jobs by re-queueing them.
-                await phase5_jobs_col.update_one(
-                    {"job_id": stale_job_id, "status": "running"},
-                    {
-                        "$set": {
-                            "status": "queued",
-                            "worker_id": None,
-                            "current_question_id": None,
-                            "updated_at": datetime.utcnow().isoformat(),
-                        }
-                    },
-                )
-                refreshed = await phase5_jobs_col.find_one(
-                    {"job_id": stale_job_id},
-                    {"_id": 0},
-                )
-                if refreshed:
-                    print(f"[Phase5] requeued stale running job_id={refreshed.get('job_id')}")
-                    return refreshed
-            else:
-                # Default mode: mark stale running jobs failed so they don't flood workers after restart.
-                await phase5_jobs_col.update_one(
-                    {"job_id": stale_job_id, "status": "running"},
-                    {
-                        "$set": {
-                            "status": "failed",
-                            "current_question_id": None,
-                            "error": "stale_running_job_recovered_as_failed",
-                            "updated_at": datetime.utcnow().isoformat(),
-                        }
-                    },
-                )
-                print(f"[Phase5] marked stale running job_id={stale_job_id} as failed")
-            continue
-        if status == "completed" and _ts_within_cache_window(job.get("updated_at")):
-            reusable_completed = job
-            break
-
-    return reusable_completed
-
-
 @app.on_event("startup")
 async def _phase5_worker_startup():
     if phase5_jobs_col is None:
         app.state.phase5_worker_tasks = []
-        app.state.phase5_redis = None
         return
 
-    app.state.phase5_redis = None
     loop = asyncio.get_running_loop()
     app.state.phase5_executor = ThreadPoolExecutor(max_workers=max(4, PHASE5_MODEL_MAX_THREADS))
     loop.set_default_executor(app.state.phase5_executor)
-
-    if PHASE5_REDIS_URL:
-        try:
-            redis_client = aioredis.from_url(PHASE5_REDIS_URL, decode_responses=False)
-            await redis_client.ping()
-            app.state.phase5_redis = redis_client
-            print(f"[Phase5] Redis queue enabled at {PHASE5_REDIS_URL}")
-        except Exception:
-            print(f"[Phase5] Redis unavailable ({PHASE5_REDIS_URL}). Falling back to Mongo polling workers.")
-            app.state.phase5_redis = None
 
     # Indexes tuned to current Phase 5 query/update patterns.
     try:
@@ -2329,14 +2174,6 @@ async def _phase5_worker_startup():
             ("status", 1),
             ("queue_priority", 1),
             ("created_at", 1),
-        ])
-
-        # Reuse path: request hash + job type + status sorted by latest update.
-        await phase5_jobs_col.create_index([
-            ("request_hash", 1),
-            ("job_type", 1),
-            ("status", 1),
-            ("updated_at", -1),
         ])
 
         # User history and trend listing paths.
@@ -2355,9 +2192,6 @@ async def _phase5_worker_startup():
             ("status", 1),
             ("updated_at", 1),
         ])
-
-        # Existing standalone index kept for compatibility with older lookups.
-        await phase5_jobs_col.create_index("request_hash")
 
         # Related collections used by history endpoints.
         if urls_col is not None:
@@ -2393,26 +2227,27 @@ async def _phase5_worker_startup():
             traceback.print_exc()
 
     # Hard safety gate: while Gemini is disabled for Phase 5, fail stale Gemini jobs on startup.
-    try:
-        startup_gemini_failed = await phase5_jobs_col.update_many(
-            {
-                "model": "gemini",
-                "status": {"$in": ["queued", "running", "finalizing"]},
-            },
-            {
-                "$set": {
-                    "status": "failed",
-                    "worker_id": None,
-                    "current_question_id": None,
-                    "error": "gemini_disabled_phase5",
-                    "updated_at": datetime.utcnow().isoformat(),
-                }
-            },
-        )
-        if int(startup_gemini_failed.modified_count or 0) > 0:
-            print(f"[Phase5] startup failed stale gemini jobs={startup_gemini_failed.modified_count}")
-    except Exception:
-        traceback.print_exc()
+    if not PHASE5_ENABLE_GEMINI:
+        try:
+            startup_gemini_failed = await phase5_jobs_col.update_many(
+                {
+                    "model": "gemini",
+                    "status": {"$in": ["queued", "running", "finalizing"]},
+                },
+                {
+                    "$set": {
+                        "status": "failed",
+                        "worker_id": None,
+                        "current_question_id": None,
+                        "error": "gemini_disabled_phase5",
+                        "updated_at": datetime.utcnow().isoformat(),
+                    }
+                },
+            )
+            if int(startup_gemini_failed.modified_count or 0) > 0:
+                print(f"[Phase5] startup failed stale gemini jobs={startup_gemini_failed.modified_count}")
+        except Exception:
+            traceback.print_exc()
 
     stale_running_cutoff_iso = (datetime.utcnow() - timedelta(seconds=max(30, PHASE5_STALE_RUNNING_SECONDS))).isoformat()
     stale_queued_cutoff_iso = (datetime.utcnow() - timedelta(seconds=max(120, PHASE5_STALE_QUEUED_SECONDS))).isoformat()
@@ -2466,11 +2301,13 @@ async def _phase5_worker_startup():
         f"[Phase5] startup workers={max(1, PHASE5_WORKER_CONCURRENCY)} "
         f"parallelism={PHASE5_JOB_PARALLELISM} timeout_gemini={PHASE5_QUESTION_TIMEOUT_GEMINI_SEC}s "
         f"timeout_openai={PHASE5_QUESTION_TIMEOUT_OPENAI_SEC}s "
-        f"timeout_perplexity={PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC}s"
+        f"timeout_perplexity={PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC}s "
+        f"timeout_anthropic={PHASE5_QUESTION_TIMEOUT_ANTHROPIC_SEC}s"
     )
     print(
         f"[Phase5] providers openai_model={(os.getenv('OPENAI_MODEL_PHASE5') or 'unset').strip() or 'unset'} "
-        f"perplexity_model={(os.getenv('PERPLEXITY_MODEL_PHASE5') or 'sonar-pro').strip() or 'sonar-pro'}"
+        f"perplexity_model={(os.getenv('PERPLEXITY_MODEL_PHASE5') or 'sonar-pro').strip() or 'sonar-pro'} "
+        f"anthropic_model={(os.getenv('ANTHROPIC_MODEL_PHASE5') or 'claude-sonnet-4-5').strip() or 'claude-sonnet-4-5'}"
     )
     app.state.phase5_worker_tasks = [
         asyncio.create_task(_phase5_worker_loop())
@@ -2488,13 +2325,6 @@ async def _phase5_worker_shutdown():
             await t
         except asyncio.CancelledError:
             pass
-        except Exception:
-            pass
-
-    redis_client = getattr(app.state, "phase5_redis", None)
-    if redis_client is not None:
-        try:
-            await redis_client.close()
         except Exception:
             pass
 
@@ -2516,25 +2346,10 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
             raise HTTPException(status_code=400, detail="questions cannot be empty")
         model_provider = "multi"
 
-        request_hash = _phase5_request_hash(
-            url=req.url,
-            questions=questions_dicts,
-            job_type="core",
-            model=model_provider,
-        )
-        reusable = await _find_reusable_phase5_job(request_hash, "core")
-        if reusable:
-            return {
-                "job_id": reusable["job_id"],
-                "status": reusable.get("status", "queued"),
-                "total": reusable.get("total", len(questions_dicts)),
-            }
-
         job_id = uuid.uuid4().hex
         now_iso = datetime.utcnow().isoformat()
         job_doc = {
             "job_id": job_id,
-            "request_hash": request_hash,
             "job_type": "core",
             "model": model_provider,
             "queue_priority": 0,
@@ -2555,13 +2370,6 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
             "updated_at": now_iso,
         }
         await phase5_jobs_col.insert_one(job_doc)
-
-        redis_client = getattr(app.state, "phase5_redis", None)
-        if redis_client is not None:
-            try:
-                await redis_client.rpush(PHASE5_REDIS_QUEUE_KEY, job_id.encode("utf-8"))
-            except Exception:
-                print("[Phase5] Redis enqueue failed. Job remains queued in Mongo and will be picked by polling worker.")
 
         print(
             f"[Phase5] queued job_id={job_id} provider={model_provider} "
@@ -2593,7 +2401,7 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
                 "job_id": job_id,
                 "job_type": "core",
                 "model_provider": model_provider,
-                "providers": ["gemini", "perplexity", "chatgpt"],
+                "providers": ["gemini", "perplexity", "chatgpt", "claude"],
                 "question_count": len(questions_dicts),
             },
         })
@@ -2619,31 +2427,15 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
         if not questions_dicts:
             raise HTTPException(status_code=400, detail="questions cannot be empty")
         model_provider = str(req.model or "perplexity").strip().lower()
-        if model_provider == "gemini":
+        if model_provider == "gemini" and not PHASE5_ENABLE_GEMINI:
             raise HTTPException(status_code=400, detail="Gemini is temporarily disabled for Phase 5")
-        if model_provider not in {"openai", "perplexity"}:
+        if model_provider not in {"openai", "perplexity", "claude", "gemini"}:
             raise HTTPException(status_code=400, detail="unsupported model provider")
-
-        request_hash = _phase5_request_hash(
-            url=req.url,
-            questions=questions_dicts,
-            job_type="deep",
-            model=model_provider,
-            seed_results=req.seed_results or {},
-        )
-        reusable = await _find_reusable_phase5_job(request_hash, "deep")
-        if reusable:
-            return {
-                "job_id": reusable["job_id"],
-                "status": reusable.get("status", "queued"),
-                "total": reusable.get("total", len(questions_dicts)),
-            }
 
         job_id = uuid.uuid4().hex
         now_iso = datetime.utcnow().isoformat()
         job_doc = {
             "job_id": job_id,
-            "request_hash": request_hash,
             "job_type": "deep",
             "model": model_provider,
             "queue_priority": 0 if model_provider in {"openai", "perplexity"} else 1,
@@ -2664,13 +2456,6 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
             "updated_at": now_iso,
         }
         await phase5_jobs_col.insert_one(job_doc)
-
-        redis_client = getattr(app.state, "phase5_redis", None)
-        if redis_client is not None:
-            try:
-                await redis_client.rpush(PHASE5_REDIS_QUEUE_KEY, job_id.encode("utf-8"))
-            except Exception:
-                print("[Phase5] Redis enqueue failed. Job remains queued in Mongo and will be picked by polling worker.")
 
         print(
             f"[Phase5] queued job_id={job_id} provider={model_provider} "

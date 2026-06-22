@@ -229,7 +229,7 @@ def _flatten_multi_result(r: dict) -> dict:
         "reasoning": "",
     }
 
-    for prov in ["perplexity", "chatgpt", "gemini"]:
+    for prov in ["perplexity", "chatgpt", "claude", "gemini"]:
         d = p.get(prov, {})
         if isinstance(d, dict) and d.get("status") == "Mentioned":
             flat["status"] = "Mentioned"

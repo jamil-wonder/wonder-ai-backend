@@ -6,6 +6,7 @@ from google.genai import types
 from utils.gemini_utils import generate_with_fallback
 
 from .config import (
+    ANTHROPIC_PHASE5_TIMEOUT_SEC,
     OPENAI_PHASE5_TIMEOUT_SEC,
     PERPLEXITY_PHASE5_TIMEOUT_SEC,
     PHASE5_MODEL_CALL_TIMEOUT_SEC,
@@ -61,6 +62,17 @@ def get_perplexity_api_key() -> str:
     if not api_key:
         raise ValueError("PERPLEXITY_API_KEY environment variable not set")
     return api_key
+
+
+def get_anthropic_api_key() -> str:
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY environment variable not set")
+    return api_key
+
+
+def get_anthropic_model_name() -> str:
+    return (os.getenv("ANTHROPIC_MODEL_PHASE5") or "claude-sonnet-4-5").strip()
 
 
 def _extract_grounding_signals(response, target_domain: str) -> tuple[list[str], list[str], bool, int | None]:
@@ -383,6 +395,86 @@ async def _call_perplexity_chat_json(prompt: str, timeout_sec: int | None = None
         return None
 
 
+async def _call_claude_chat_json(prompt: str, timeout_sec: int | None = None) -> dict | None:
+    api_key = get_anthropic_api_key()
+    model = get_anthropic_model_name()
+    anthropic_version = (os.getenv("ANTHROPIC_VERSION") or "2023-06-01").strip()
+    effective_timeout = max(8, timeout_sec if isinstance(timeout_sec, int) else ANTHROPIC_PHASE5_TIMEOUT_SEC)
+
+    payload = {
+        "model": model,
+        "max_tokens": 900,
+        "temperature": 0,
+        "system": "You are a strict JSON assistant. Return only valid JSON.",
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+    }
+
+    try:
+        started = asyncio.get_running_loop().time()
+        _log_provider_started_once("Claude", model)
+        async with httpx.AsyncClient(timeout=effective_timeout) as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": anthropic_version,
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        if response.status_code == 429:
+            raise Phase5RateLimitError("Claude rate limit reached. Please retry shortly.")
+        response.raise_for_status()
+        body = response.json()
+
+        parts: list[str] = []
+        if isinstance(body, dict):
+            content = body.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text)
+            elif isinstance(content, str) and content.strip():
+                parts.append(content)
+        text = "\n".join(parts).strip()
+
+        parsed = _safe_json_parse(text)
+        parsed_dict = parsed if isinstance(parsed, dict) else {}
+        if text:
+            parsed_dict["_meta_response_text"] = text[:4000]
+            text_domains = _extract_domains_from_text(text)
+            if text_domains:
+                parsed_dict["_meta_source_domains"] = list(dict.fromkeys(text_domains))
+        elapsed = asyncio.get_running_loop().time() - started
+        _log_provider_healthy_once("Claude", model, elapsed)
+        return parsed_dict
+    except Phase5RateLimitError:
+        raise
+    except Exception as e:
+        if _is_rate_limited_error(e):
+            raise Phase5RateLimitError("Claude rate limit reached. Please retry shortly.") from e
+        try:
+            elapsed = asyncio.get_running_loop().time() - started
+            print(f"[Phase5][Claude] model={model} failed in {elapsed:.2f}s: {type(e).__name__}")
+        except Exception:
+            pass
+        if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+            try:
+                print(f"[Phase5][Claude] error body: {e.response.text[:500]}")
+            except Exception:
+                pass
+        print(f"[Phase5][Claude] call failed: {e}")
+        return None
+
+
 async def _call_openai_with_retry(prompt: str, retry_once: bool = True, timeout_sec: int | None = None) -> dict | None:
     first = await _call_openai_chat_json(prompt, timeout_sec=timeout_sec)
     if first is not None:
@@ -399,3 +491,12 @@ async def _call_perplexity_with_retry(prompt: str, retry_once: bool = True, time
     if not retry_once:
         return None
     return await _call_perplexity_chat_json(prompt, timeout_sec=timeout_sec)
+
+
+async def _call_claude_with_retry(prompt: str, retry_once: bool = True, timeout_sec: int | None = None) -> dict | None:
+    first = await _call_claude_chat_json(prompt, timeout_sec=timeout_sec)
+    if first is not None:
+        return first
+    if not retry_once:
+        return None
+    return await _call_claude_chat_json(prompt, timeout_sec=timeout_sec)
