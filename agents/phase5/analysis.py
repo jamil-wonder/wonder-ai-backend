@@ -805,7 +805,8 @@ async def analyze_single_question(
             }},
             "references": ["<domain1.com>", "<domain2.com>", "... up to 20"],
             "idea_candidates": ["<potential-competitor-domain.com>", "... up to 8"],
-            "reasoning": "1 short sentence"
+            "reasoning": "1 short sentence",
+            "concise_answer": "Natural user-facing answer to the query (90-180 words), mentioning top options and practical guidance."
         }}
 
         Rules:
@@ -813,6 +814,8 @@ async def analyze_single_question(
         - 'idea_candidates' should contain possible direct competitor domains inferred from this query context.
         - Do not include target domain in idea_candidates.
         - Output raw JSON only. No markdown.
+        - concise_answer must sound like a real assistant reply to the query (no analytics wording, no "mentioned/not mentioned" wording).
+        - concise_answer should be compact but useful: top picks, brief why, and one practical tip.
         """
     elif PHASE5_FAST_MODE:
         prompt = f"""
@@ -824,9 +827,12 @@ async def analyze_single_question(
             "references": ["domain1.com", "domain2.com"],
             "idea_candidates": ["competitor.com"],
             "ranked_competitors": [{{"domain": "competitor.com", "position": 1, "evidence": "short reason"}}],
-            "reasoning": "short sentence"
+            "reasoning": "short sentence",
+            "concise_answer": "Natural user-facing answer to the query (90-180 words), mentioning top options and practical guidance."
         }}
         Rules: no markdown, no prose, max 5 competitors, do not include target in competitors.
+        - concise_answer must sound like a real assistant reply to the query (no analytics wording, no "mentioned/not mentioned" wording).
+        - concise_answer should be compact but useful: top picks, brief why, and one practical tip.
         """
     else:
         prompt = f"""
@@ -848,7 +854,8 @@ async def analyze_single_question(
             "ranked_competitors": [
                 {{"domain": "<competitor.com>", "position": <1-10>, "evidence": "short reason"}}
             ],
-            "reasoning": "1 short sentence"
+            "reasoning": "1 short sentence",
+            "concise_answer": "Natural user-facing answer to the query (90-180 words), mentioning top options and practical guidance."
         }}
 
         Rules:
@@ -856,6 +863,8 @@ async def analyze_single_question(
         - Do not include the target domain in ranked_competitors.
         - Keep ranked_competitors to max 5 entries.
         - Output raw JSON only. No markdown.
+        - concise_answer must sound like a real assistant reply to the query (no analytics wording, no "mentioned/not mentioned" wording).
+        - concise_answer should be compact but useful: top picks, brief why, and one practical tip.
         """
 
     try:
@@ -1088,6 +1097,21 @@ async def analyze_single_question(
                 f"response_none={response is None} probed={should_probe}"
             )
 
+        concise_answer = str(data.get("concise_answer", "") if isinstance(data, dict) else "").strip()
+        answer_text = (
+            concise_answer[:4000]
+            if concise_answer
+            else _build_fallback_concise_answer(
+                question_text=str(question.get("text") or "").strip(),
+                status=status,
+                position=position,
+                references=clean_references,
+                sources=clean_sources,
+                competitor_scores=competitor_scores,
+                domain=domain,
+            )[:4000]
+        )
+
         result_payload = {
             "id": question["id"],
             "status": status,
@@ -1099,7 +1123,7 @@ async def analyze_single_question(
             "competitors": competitors[:5],
             "competitor_scores": competitor_scores[:5],
             "reasoning": reasoning or None,
-            "llm_response": ((response.text or "")[:4000] if response is not None and getattr(response, "text", None) else None),
+            "llm_response": answer_text,
         }
         return result_payload
 
