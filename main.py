@@ -1721,8 +1721,6 @@ async def _process_phase5_job(job_doc: dict):
 
         def _compute_provider_scores(results_map: dict[str, dict]) -> tuple[dict, float | None]:
             providers = ["perplexity", "chatgpt", "claude"]
-            if PHASE5_ENABLE_GEMINI:
-                providers.append("gemini")
             score_map: dict[str, dict] = {}
             for provider_name in providers:
                 score_map[provider_name] = compute_provider_score(results_map, provider_name)
@@ -1851,7 +1849,6 @@ async def _process_phase5_job(job_doc: dict):
                         PHASE5_QUESTION_TIMEOUT_OPENAI_SEC,
                         PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC,
                         PHASE5_QUESTION_TIMEOUT_ANTHROPIC_SEC,
-                        PHASE5_QUESTION_TIMEOUT_GEMINI_SEC,
                     )
                 else:
                     per_question_timeout = PHASE5_QUESTION_TIMEOUT_GEMINI_SEC
@@ -1896,7 +1893,6 @@ async def _process_phase5_job(job_doc: dict):
                         result = {
                             "id": qid,
                             "providers": {
-                                "gemini": {"mentioned": False, "position": None, "sources": [], "cited": False, "status": "Not Mentioned"},
                                 "perplexity": {"mentioned": False, "position": None, "sources": [], "cited": False, "status": "Not Mentioned"},
                                 "chatgpt": {"mentioned": False, "position": None, "sources": [], "cited": False, "status": "Not Mentioned"},
                                 "claude": {"mentioned": False, "position": None, "sources": [], "cited": False, "status": "Not Mentioned"},
@@ -2299,7 +2295,7 @@ async def _phase5_worker_startup():
 
     print(
         f"[Phase5] startup workers={max(1, PHASE5_WORKER_CONCURRENCY)} "
-        f"parallelism={PHASE5_JOB_PARALLELISM} timeout_gemini={PHASE5_QUESTION_TIMEOUT_GEMINI_SEC}s "
+        f"parallelism={PHASE5_JOB_PARALLELISM} gemini_enabled={PHASE5_ENABLE_GEMINI} "
         f"timeout_openai={PHASE5_QUESTION_TIMEOUT_OPENAI_SEC}s "
         f"timeout_perplexity={PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC}s "
         f"timeout_anthropic={PHASE5_QUESTION_TIMEOUT_ANTHROPIC_SEC}s"
@@ -2401,7 +2397,7 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
                 "job_id": job_id,
                 "job_type": "core",
                 "model_provider": model_provider,
-                "providers": ["gemini", "perplexity", "chatgpt", "claude"],
+                "providers": ["perplexity", "chatgpt", "claude"],
                 "question_count": len(questions_dicts),
             },
         })

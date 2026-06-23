@@ -1262,13 +1262,11 @@ async def analyze_single_question_multi(
             include_competitors=include_competitors,
         )
 
-    gemini_call = _call_provider("gemini")
     perplexity_call = _call_provider("perplexity")
     openai_call = _call_provider("openai")
     claude_call = _call_provider("claude")
 
-    gemini_raw, perplexity_raw, openai_raw, claude_raw = await asyncio.gather(
-        gemini_call,
+    perplexity_raw, openai_raw, claude_raw = await asyncio.gather(
         perplexity_call,
         openai_call,
         claude_call,
@@ -1276,7 +1274,6 @@ async def analyze_single_question_multi(
     )
 
     providers = {
-        "gemini": _safe_provider_result(gemini_raw),
         "perplexity": _safe_provider_result(perplexity_raw),
         "chatgpt": _safe_provider_result(openai_raw),
         "claude": _safe_provider_result(claude_raw),
