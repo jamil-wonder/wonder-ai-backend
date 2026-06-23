@@ -37,6 +37,9 @@ AI_ENRICHMENT_CONFIDENCE_THRESHOLDS = {
     "bookingPath": 68,
 }
 
+LOGO_URL_HINT_RE = re.compile(r'(logo|brand|favicon|apple-touch-icon|site-icon|icon)', re.I)
+NON_LOGO_URL_HINT_RE = re.compile(r'(hero|slider|banner|cover|gallery|background|bg-|photo|image/site|home/slider)', re.I)
+
 PHASE1_AI_VISION_TIMEOUT_SECONDS = int(os.getenv("PHASE1_AI_VISION_TIMEOUT_SECONDS", "45"))
 PHASE1_AI_CONTACT_TIMEOUT_SECONDS = int(os.getenv("PHASE1_AI_CONTACT_TIMEOUT_SECONDS", "90"))
 PHASE1_AI_ENRICH_TIMEOUT_SECONDS = int(os.getenv("PHASE1_AI_ENRICH_TIMEOUT_SECONDS", "180"))
@@ -72,6 +75,75 @@ def get_grade(score: int) -> str:
     if score >= 60: return 'C'
     if score >= 50: return 'D'
     return 'F'
+
+def is_likely_logo_url(value: str) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    lowered = raw.lower()
+    if NON_LOGO_URL_HINT_RE.search(lowered) and not LOGO_URL_HINT_RE.search(lowered):
+        return False
+    return bool(LOGO_URL_HINT_RE.search(lowered))
+
+def resolve_asset_url(base_url: str, value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return urljoin(base_url, raw)
+
+def detect_logo_url(base_url: str, soups: List[BeautifulSoup], schemas: List[Dict[str, Any]]) -> Tuple[str | None, str | None]:
+    for s in schemas:
+        if not isinstance(s, dict):
+            continue
+        logo = s.get("logo")
+        candidate = None
+        if isinstance(logo, dict):
+            candidate = logo.get("url") or logo.get("@id")
+        elif isinstance(logo, str):
+            candidate = logo
+        candidate_url = resolve_asset_url(base_url, candidate or "")
+        if candidate_url and is_likely_logo_url(candidate_url):
+            return candidate_url, "schema.logo"
+
+    for s_doc in soups:
+        for img in s_doc.find_all("img"):
+            src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or ""
+            descriptor = " ".join(
+                [
+                    str(src),
+                    str(img.get("alt") or ""),
+                    str(img.get("class") or ""),
+                    str(img.get("id") or ""),
+                    str(img.get("aria-label") or ""),
+                ]
+            )
+            candidate_url = resolve_asset_url(base_url, src)
+            if candidate_url and LOGO_URL_HINT_RE.search(descriptor) and not NON_LOGO_URL_HINT_RE.search(descriptor):
+                return candidate_url, "image.logo"
+
+    for s_doc in soups:
+        icon_links = []
+        for link in s_doc.find_all("link", href=True):
+            rel = " ".join(link.get("rel") or [])
+            descriptor = f"{rel} {link.get('href') or ''}"
+            if re.search(r'\b(icon|shortcut icon|apple-touch-icon|mask-icon)\b', descriptor, re.I):
+                icon_links.append(link)
+
+        def icon_priority(link):
+            rel = " ".join(link.get("rel") or []).lower()
+            sizes = str(link.get("sizes") or "")
+            if "apple-touch-icon" in rel:
+                return 0
+            if re.search(r'(192|180|152|144|128|96|64)', sizes):
+                return 1
+            return 2
+
+        for link in sorted(icon_links, key=icon_priority):
+            candidate_url = resolve_asset_url(base_url, link.get("href") or "")
+            if candidate_url:
+                return candidate_url, "favicon"
+
+    return None, None
 
 def can_use_playwright_on_current_loop() -> bool:
     """
@@ -492,16 +564,7 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
                         social_links[platform] = href if href.startswith('http') else f"https://{href}"
             except: pass
 
-    logo_url = None
-    for s in schemas:
-        if not isinstance(s, dict): continue
-        if s.get('logo'):
-            l = s['logo']
-            if isinstance(l, dict): logo_url = l.get('url')
-            elif isinstance(l, str): logo_url = l
-            break
-    if not logo_url:
-        logo_url = raw_meta.get('og:image')
+    logo_url, logo_source = detect_logo_url(target_url, all_soups, schemas)
 
     html_tag = soup.find('html')
     language = (html_tag.get('lang') if html_tag else None) or raw_meta.get('language') or 'unknown'
@@ -603,7 +666,31 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
             "phones": [],
             "addresses": [],
             "openingHours": [],
+            "socialLinks": {},
+            "logoUrls": [],
+            "hasBookingPath": False,
             "confidence": {},
+        },
+        "contact_fallback": {
+            "emails": [],
+            "phones": [],
+            "addresses": [],
+            "openingHours": [],
+            "confidence": {},
+        },
+        "system_detected": {
+            "businessName": business_name,
+            "description": description,
+            "emails": clean_set(emails),
+            "phones": clean_set(phones),
+            "addresses": [x for x in addresses if x],
+            "openingHours": [str(x) for x in opening_hours],
+            "socialLinks": social_links.copy(),
+            "logoUrl": logo_url,
+            "logoSource": logo_source,
+            "language": str(language),
+            "canonicalUrl": canonical_url,
+            "schemas": schemas,
         },
         "confidence": {},
         "thresholds": AI_ENRICHMENT_CONFIDENCE_THRESHOLDS,
@@ -636,6 +723,13 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
             warnings.append(f"AI contact fallback failed: {str(cf_err)[:80]}")
         if isinstance(contact_fallback, dict):
             ai_debug["models"]["contact_fallback"] = contact_fallback.get("modelUsed")
+            ai_debug["contact_fallback"] = {
+                "emails": [str(v) for v in (contact_fallback.get("emails", []) or [])][:5],
+                "phones": [str(v) for v in (contact_fallback.get("phones", []) or [])][:5],
+                "addresses": [str(v) for v in (contact_fallback.get("addresses", []) or [])][:3],
+                "openingHours": [str(v) for v in (contact_fallback.get("openingHours", []) or [])][:5],
+                "confidence": contact_fallback.get("confidence", {}) if isinstance(contact_fallback.get("confidence"), dict) else {},
+            }
         cf_conf = contact_fallback.get("confidence", {}) if isinstance(contact_fallback.get("confidence"), dict) else {}
 
         def cf_ok(key: str, threshold: int = 65) -> bool:
@@ -680,6 +774,7 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
             "addresses": [x for x in addresses if x],
             "openingHours": [str(x) for x in opening_hours],
             "socialLinks": social_links,
+            "logoUrls": [logo_url] if logo_url else [],
         }
 
         perplexity_extract, deep_analysis = await asyncio.wait_for(
@@ -715,6 +810,9 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
             "phones": [str(v) for v in (perplexity_extract.get("phones", []) or [])][:5],
             "addresses": [str(v) for v in (perplexity_extract.get("addresses", []) or [])][:3],
             "openingHours": [str(v) for v in (perplexity_extract.get("openingHours", []) or [])][:5],
+            "socialLinks": perplexity_extract.get("socialLinks", {}) if isinstance(perplexity_extract.get("socialLinks"), dict) else {},
+            "logoUrls": [str(v) for v in (perplexity_extract.get("logoUrls", []) or [])][:4],
+            "hasBookingPath": bool(perplexity_extract.get("hasBookingPath", False)),
             "confidence": perplexity_extract.get("confidence", {}) if isinstance(perplexity_extract.get("confidence"), dict) else {},
         }
 

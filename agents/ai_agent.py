@@ -179,6 +179,7 @@ async def get_phase1_perplexity_contact_extraction(
         "addresses": current_data.get("addresses", [])[:6],
         "openingHours": current_data.get("openingHours", [])[:8],
         "socialLinks": current_data.get("socialLinks", {}),
+        "logoUrls": current_data.get("logoUrls", [])[:4],
     }
 
     prompt = f"""
@@ -671,6 +672,7 @@ async def get_phase1_enrichment(
       "addresses": ["221B Baker Street, London NW1 6XE"],
       "openingHours": ["Mon-Fri: 9:00-18:00"],
       "socialLinks": {{"instagram": "https://instagram.com/example"}},
+      "logoUrls": ["https://example.com/logo.png"],
       "hasBookingPath": false,
             "confidence": {{
                 "emails": 0,
@@ -678,6 +680,7 @@ async def get_phase1_enrichment(
                 "addresses": 0,
                 "openingHours": 0,
                 "socialLinks": 0,
+                "logoUrls": 0,
                 "bookingPath": 0
             }},
       "suggestions": {{
@@ -725,6 +728,7 @@ async def get_phase1_enrichment(
                 "addresses": [],
                 "openingHours": [],
                 "socialLinks": {},
+                "logoUrls": [],
                 "hasBookingPath": False,
                 "suggestions": {},
                 "modelUsed": model,
@@ -735,6 +739,7 @@ async def get_phase1_enrichment(
             "addresses": parsed.get("addresses", []) if isinstance(parsed.get("addresses"), list) else [],
             "openingHours": parsed.get("openingHours", []) if isinstance(parsed.get("openingHours"), list) else [],
             "socialLinks": parsed.get("socialLinks", {}) if isinstance(parsed.get("socialLinks"), dict) else {},
+            "logoUrls": parsed.get("logoUrls", []) if isinstance(parsed.get("logoUrls"), list) else [],
             "hasBookingPath": bool(parsed.get("hasBookingPath", False)),
             "confidence": parsed.get("confidence", {}) if isinstance(parsed.get("confidence"), dict) else {},
             "suggestions": parsed.get("suggestions", {}) if isinstance(parsed.get("suggestions"), dict) else {},
@@ -748,6 +753,7 @@ async def get_phase1_enrichment(
             "addresses": [],
             "openingHours": [],
             "socialLinks": {},
+            "logoUrls": [],
             "hasBookingPath": False,
             "confidence": {},
             "suggestions": {},
@@ -804,5 +810,4 @@ async def get_phase1_contact_fallback(url: str, business_name: str) -> dict:
     except Exception as e:
         print(f"Error in phase1 contact fallback: {e}")
         return {"emails": [], "phones": [], "addresses": [], "openingHours": [], "confidence": {}}
-
 
