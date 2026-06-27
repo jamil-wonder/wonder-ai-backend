@@ -63,9 +63,14 @@ class ScrapeResult(BaseModel):
     technologies: List[str] = Field(default_factory=list)
     aiSuggestions: Dict[str, str] = Field(default_factory=dict)
     aiDebug: Optional[Dict[str, Any]] = None
+    businessId: Optional[str] = None
+    businessProfile: Optional[Dict[str, Any]] = None
 
 class ScrapeRequest(BaseModel):
     url: str
+    category: Optional[str] = None
+    location: Optional[str] = None
+    business_id: Optional[str] = None
 
 class AiModelInsight(BaseModel):
     modelName: str
@@ -124,3 +129,39 @@ class Token(BaseModel):
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+
+class BusinessUpsertRequest(BaseModel):
+    url: str
+    business_id: Optional[str] = None
+    category: Optional[str] = None
+    location: Optional[str] = None
+    businessName: Optional[str] = None
+    logoUrl: Optional[str] = None
+    businessDescription: Optional[str] = None
+    aiDescription: Optional[str] = None
+    services: Optional[List[str]] = None
+    targetAudience: Optional[str] = None
+    competitors: Optional[List[str]] = None
+    trackedPages: Optional[List[str]] = None
+
+
+class BusinessResponse(BaseModel):
+    id: str
+    user_id: str
+    url: str
+    normalized_domain: str
+    businessName: Optional[str] = None
+    category: Optional[str] = None
+    location: Optional[str] = None
+    logoUrl: Optional[str] = None
+    businessDescription: Optional[str] = None
+    aiDescription: Optional[str] = None
+    services: List[str] = Field(default_factory=list)
+    targetAudience: Optional[str] = None
+    competitors: List[str] = Field(default_factory=list)
+    trackedPages: List[str] = Field(default_factory=list)
+    latest_phase1_score: Optional[int] = None
+    latest_phase5_score: Optional[float] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None

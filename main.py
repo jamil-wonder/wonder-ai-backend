@@ -54,6 +54,7 @@ from agents.phase5_agent import (
     _normalize_domain,
 )
 from models import UserCreate, UserResponse, Token, LoginRequest
+from models import BusinessResponse, BusinessUpsertRequest
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from pydantic import BaseModel
@@ -134,12 +135,14 @@ if not MONGO_URL:
 phase5_jobs_col = None
 ai_usage_col = None
 user_history_meta_col = None
+businesses_col = None
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
     db = mongo_client.get_database("wonderai")
     wishlist_col = db.get_collection("wishlist")
     urls_col = db.get_collection("urls")
     users_col = db.get_collection("users")
+    businesses_col = db.get_collection("businesses")
     phase5_jobs_col = db.get_collection("phase5_jobs")
     ai_usage_col = db.get_collection("ai_usage_events")
     user_history_meta_col = db.get_collection("user_history_meta")
@@ -343,6 +346,133 @@ def _normalize_site(value: str) -> str:
     if host.startswith("www."):
         host = host[4:]
     return host
+
+
+def _clean_optional_text(value) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _public_business_doc(doc: dict | None) -> dict | None:
+    if not doc:
+        return None
+    return {
+        "id": str(doc.get("_id")),
+        "user_id": str(doc.get("user_id") or ""),
+        "url": doc.get("url") or "",
+        "normalized_domain": doc.get("normalized_domain") or "",
+        "businessName": doc.get("businessName"),
+        "category": doc.get("category"),
+        "location": doc.get("location"),
+        "logoUrl": doc.get("logoUrl"),
+        "businessDescription": doc.get("businessDescription"),
+        "aiDescription": doc.get("aiDescription"),
+        "services": doc.get("services") if isinstance(doc.get("services"), list) else [],
+        "targetAudience": doc.get("targetAudience"),
+        "competitors": doc.get("competitors") if isinstance(doc.get("competitors"), list) else [],
+        "trackedPages": doc.get("trackedPages") if isinstance(doc.get("trackedPages"), list) else [],
+        "latest_phase1_score": doc.get("latest_phase1_score"),
+        "latest_phase5_score": doc.get("latest_phase5_score"),
+        "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at"),
+    }
+
+
+async def _upsert_user_business(
+    *,
+    current_user: dict | None,
+    url: str,
+    category: str | None = None,
+    location: str | None = None,
+    business_name: str | None = None,
+    logo_url: str | None = None,
+    business_description: str | None = None,
+    ai_description: str | None = None,
+    services: list[str] | None = None,
+    target_audience: str | None = None,
+    competitors: list[str] | None = None,
+    tracked_pages: list[str] | None = None,
+    phase1_score: int | None = None,
+    phase5_score: float | None = None,
+    business_id: str | None = None,
+) -> dict | None:
+    if not current_user or businesses_col is None:
+        return None
+
+    normalized_domain = _normalize_site(url)
+    if not normalized_domain:
+        return None
+
+    existing = None
+    if business_id:
+        try:
+            existing = await businesses_col.find_one({"_id": ObjectId(business_id), "user_id": current_user["id"]})
+        except:
+            pass
+    if not existing:
+        existing = await businesses_col.find_one({"user_id": current_user["id"], "normalized_domain": normalized_domain})
+
+    if not existing:
+        current_count = await businesses_col.count_documents({"user_id": current_user["id"]})
+        if current_count >= 3:
+            raise HTTPException(status_code=400, detail="You can save up to 3 business profiles for now")
+
+    now_iso = datetime.utcnow().isoformat()
+    set_fields = {
+        "user_id": current_user["id"],
+        "user_email": current_user.get("email"),
+        "url": url,
+        "normalized_domain": normalized_domain,
+        "updated_at": now_iso,
+    }
+
+    optional_pairs = {
+        "category": _clean_optional_text(category),
+        "location": _clean_optional_text(location),
+        "businessName": _clean_optional_text(business_name),
+        "logoUrl": _clean_optional_text(logo_url),
+        "businessDescription": _clean_optional_text(business_description),
+        "aiDescription": _clean_optional_text(ai_description),
+        "targetAudience": _clean_optional_text(target_audience),
+    }
+    for key, value in optional_pairs.items():
+        if value:
+            set_fields[key] = value
+    if phase1_score is not None:
+        set_fields["latest_phase1_score"] = int(phase1_score)
+        set_fields["latest_phase1_at"] = now_iso
+    if phase5_score is not None:
+        set_fields["latest_phase5_score"] = float(phase5_score)
+        set_fields["latest_phase5_at"] = now_iso
+    for key, values in {
+        "services": services,
+        "competitors": competitors,
+        "trackedPages": tracked_pages,
+    }.items():
+        if isinstance(values, list):
+            cleaned = [str(v).strip() for v in values if str(v or "").strip()]
+            set_fields[key] = cleaned
+
+    query: dict
+    if business_id:
+        try:
+            query = {"_id": ObjectId(business_id), "user_id": current_user["id"]}
+        except Exception:
+            query = {"user_id": current_user["id"], "normalized_domain": normalized_domain}
+    else:
+        query = {"user_id": current_user["id"], "normalized_domain": normalized_domain}
+
+    return await businesses_col.find_one_and_update(
+        query,
+        {
+            "$set": set_fields,
+            "$setOnInsert": {
+                "created_at": now_iso,
+            },
+        },
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
 
 
 def _iso_from_range(range_value: str) -> str | None:
@@ -790,6 +920,82 @@ async def api_user_change_password(request: UserPasswordChangeRequest, current_u
     return {"message": "Password updated successfully"}
 
 
+@app.get("/api/user/businesses", response_model=list[BusinessResponse])
+async def api_user_businesses(current_user: dict = Depends(get_current_user)):
+    if businesses_col is None:
+        raise HTTPException(status_code=503, detail="business storage unavailable")
+
+    cursor = businesses_col.find({"user_id": current_user["id"]}).sort("updated_at", -1).limit(100)
+    docs = await cursor.to_list(length=100)
+    return [_public_business_doc(doc) for doc in docs if _public_business_doc(doc)]
+
+
+@app.post("/api/user/businesses", response_model=BusinessResponse)
+async def api_user_business_upsert(
+    request: BusinessUpsertRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    if businesses_col is None:
+        raise HTTPException(status_code=503, detail="business storage unavailable")
+
+    normalized_domain = _normalize_site(request.url)
+    if not normalized_domain:
+        raise HTTPException(status_code=400, detail="A valid business URL is required")
+
+    existing = await businesses_col.find_one({
+        "user_id": current_user["id"],
+        "normalized_domain": normalized_domain,
+    })
+    if not existing and not request.business_id:
+        current_count = await businesses_col.count_documents({"user_id": current_user["id"]})
+        if current_count >= 3:
+            raise HTTPException(status_code=400, detail="You can save up to 3 business profiles for now")
+
+    business = await _upsert_user_business(
+        current_user=current_user,
+        url=request.url,
+        category=request.category,
+        location=request.location,
+        business_name=request.businessName,
+        logo_url=request.logoUrl,
+        business_description=request.businessDescription,
+        ai_description=request.aiDescription,
+        services=request.services,
+        target_audience=request.targetAudience,
+        competitors=request.competitors,
+        tracked_pages=request.trackedPages,
+        business_id=request.business_id,
+    )
+    public = _public_business_doc(business)
+    if not public:
+        raise HTTPException(status_code=400, detail="Could not save business")
+    return public
+
+
+@app.delete("/api/user/businesses/{business_id}")
+async def api_user_business_delete(
+    business_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    if businesses_col is None:
+        raise HTTPException(status_code=503, detail="business storage unavailable")
+
+    try:
+        oid = ObjectId(business_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid business ID format")
+
+    result = await businesses_col.delete_one({
+        "_id": oid,
+        "user_id": current_user["id"],
+    })
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Business profile not found")
+
+    return {"message": "Business profile deleted successfully"}
+
+
 @app.get("/api/user/history")
 async def api_user_history(
     page: int = 1,
@@ -1070,6 +1276,13 @@ async def api_scrape(
         started_at = datetime.utcnow()
         print(f"[API] /api/scrape started: {request.url}")
         try:
+            business = await _upsert_user_business(
+                current_user=current_user,
+                url=request.url,
+                category=request.category,
+                location=request.location,
+                business_id=request.business_id,
+            )
             doc = {
                 "url": request.url, 
                 "phase": "phase1", 
@@ -1078,6 +1291,12 @@ async def api_scrape(
             if current_user:
                 doc["user_id"] = current_user["id"]
                 doc["user_email"] = current_user["email"]
+            if request.category:
+                doc["category"] = request.category
+            if request.location:
+                doc["location"] = request.location
+            if business:
+                doc["business_id"] = str(business.get("_id"))
             await urls_col.insert_one(doc)
         except:
             pass
@@ -1087,6 +1306,24 @@ async def api_scrape(
             asyncio.to_thread(_run_scrape_worker, request.url),
             timeout=scrape_timeout_seconds,
         )
+        try:
+            if isinstance(result, dict):
+                business = await _upsert_user_business(
+                    current_user=current_user,
+                    url=request.url,
+                    category=request.category,
+                    location=request.location,
+                    business_name=result.get("businessName"),
+                    logo_url=result.get("logoUrl"),
+                    phase1_score=((result.get("scores") or {}).get("total") if isinstance(result.get("scores"), dict) else None),
+                    business_id=request.business_id,
+                )
+                public_business = _public_business_doc(business)
+                if public_business:
+                    result["businessId"] = public_business["id"]
+                    result["businessProfile"] = public_business
+        except Exception as business_error:
+            print(f"[Business] phase1 upsert failed: {business_error}")
 
         ai_debug = result.get("aiDebug", {}) if isinstance(result, dict) else {}
         ai_calls = ai_debug.get("calls", {}) if isinstance(ai_debug, dict) else {}
@@ -1124,6 +1361,23 @@ async def api_scrape(
                 warnings = fallback.get("warnings") if isinstance(fallback.get("warnings"), list) else []
                 warnings.append("Returned reduced analysis after full scrape timeout. AI enrichment was skipped.")
                 fallback["warnings"] = warnings
+                try:
+                    business = await _upsert_user_business(
+                        current_user=current_user,
+                        url=request.url,
+                        category=request.category,
+                        location=request.location,
+                        business_name=fallback.get("businessName"),
+                        logo_url=fallback.get("logoUrl"),
+                        phase1_score=((fallback.get("scores") or {}).get("total") if isinstance(fallback.get("scores"), dict) else None),
+                        business_id=request.business_id,
+                    )
+                    public_business = _public_business_doc(business)
+                    if public_business:
+                        fallback["businessId"] = public_business["id"]
+                        fallback["businessProfile"] = public_business
+                except Exception as business_error:
+                    print(f"[Business] phase1 fallback upsert failed: {business_error}")
             print(f"[API] /api/scrape reduced fallback returned: {request.url}")
             return fallback
         except Exception as fallback_error:
@@ -1769,6 +2023,14 @@ async def _process_phase5_job(job_doc: dict):
                             }
                         },
                     )
+                    try:
+                        await _upsert_user_business(
+                            current_user={"id": job_doc.get("user_id"), "email": job_doc.get("user_email")} if job_doc.get("user_id") else None,
+                            url=job_doc["url"],
+                            business_id=job_doc.get("business_id"),
+                        )
+                    except Exception as business_error:
+                        print(f"[Business] phase5 deep summary upsert failed: {business_error}")
                 except Exception:
                     traceback.print_exc()
 
@@ -1995,6 +2257,15 @@ async def _process_phase5_job(job_doc: dict):
                 }
             },
         )
+        try:
+            await _upsert_user_business(
+                current_user={"id": job_doc.get("user_id"), "email": job_doc.get("user_email")} if job_doc.get("user_id") else None,
+                url=job_doc["url"],
+                phase5_score=final_overall,
+                business_id=job_doc.get("business_id"),
+            )
+        except Exception as business_error:
+            print(f"[Business] phase5 upsert failed: {business_error}")
         print(f"[Phase5] worker completed job_id={job_id} provider={model_provider}")
 
         await _log_ai_usage_event({
@@ -2344,6 +2615,12 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
 
         job_id = uuid.uuid4().hex
         now_iso = datetime.utcnow().isoformat()
+        business = await _upsert_user_business(
+            current_user=current_user,
+            url=req.url,
+            business_id=getattr(req, "business_id", None),
+        )
+        public_business = _public_business_doc(business)
         job_doc = {
             "job_id": job_id,
             "job_type": "core",
@@ -2352,6 +2629,7 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
             "url": req.url,
             "user_id": current_user.get("id") if current_user else None,
             "user_email": current_user.get("email") if current_user else None,
+            "business_id": public_business["id"] if public_business else None,
             "questions": questions_dicts,
             "seed_results": {},
             "status": "queued",
@@ -2430,6 +2708,12 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
 
         job_id = uuid.uuid4().hex
         now_iso = datetime.utcnow().isoformat()
+        business = await _upsert_user_business(
+            current_user=current_user,
+            url=req.url,
+            business_id=getattr(req, "business_id", None),
+        )
+        public_business = _public_business_doc(business)
         job_doc = {
             "job_id": job_id,
             "job_type": "deep",
@@ -2438,6 +2722,7 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
             "url": req.url,
             "user_id": current_user.get("id") if current_user else None,
             "user_email": current_user.get("email") if current_user else None,
+            "business_id": public_business["id"] if public_business else None,
             "questions": questions_dicts,
             "seed_results": req.seed_results or {},
             "status": "queued",

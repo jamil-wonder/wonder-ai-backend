@@ -45,6 +45,7 @@ class Phase5StartJobRequest(BaseModel):
     questions: List[QuestionItem]
     seed_results: Optional[dict] = None
     model: Optional[str] = "perplexity"
+    business_id: Optional[str] = None
 
 
 class Phase5StartJobResponse(BaseModel):
