@@ -90,6 +90,17 @@ def _openai_api_key() -> str:
     return api_key
 
 
+def _anthropic_model_name() -> str:
+    return (os.getenv("ANTHROPIC_MODEL_PHASE5") or "claude-sonnet-4-5").strip()
+
+
+def _anthropic_api_key() -> str:
+    api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY is not configured")
+    return api_key
+
+
 async def _openai_chat_json(
     *,
     prompt: str,
@@ -164,6 +175,76 @@ async def _openai_chat_json(
 
     parsed = _safe_json_parse(content)
     return (parsed if isinstance(parsed, dict) else {}), model
+
+
+async def _anthropic_chat_json(
+    *,
+    prompt: str,
+    timeout_seconds: int = 80,
+    max_tokens: int = 4500,
+) -> tuple[dict, str]:
+    api_key = _anthropic_api_key()
+    model = _anthropic_model_name()
+    anthropic_version = (os.getenv("ANTHROPIC_VERSION") or "2023-06-01").strip()
+
+    async with httpx.AsyncClient(timeout=timeout_seconds) as http:
+        res = await http.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": anthropic_version,
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": max_tokens,
+                "system": "Return valid JSON only.",
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+        res.raise_for_status()
+        data = res.json()
+
+    parts: list[str] = []
+    for item in data.get("content") or []:
+        if isinstance(item, dict) and item.get("type") == "text":
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text)
+    parsed = _safe_json_parse("\n".join(parts))
+    return (parsed if isinstance(parsed, dict) else {}), model
+
+
+async def _blog_model_json(
+    *,
+    provider: str,
+    prompt: str,
+    timeout_seconds: int = 100,
+    max_tokens: int = 4500,
+) -> tuple[dict, str, str]:
+    normalized = (provider or "chatgpt").strip().lower()
+    if normalized in {"chatgpt", "openai", "gpt"}:
+        parsed, model = await _openai_chat_json(
+            prompt=prompt,
+            timeout_seconds=timeout_seconds,
+            temperature=0.35,
+            max_tokens=max_tokens,
+        )
+        return parsed, model, "openai"
+    if normalized == "perplexity":
+        parsed, model = await _perplexity_response_json(
+            prompt=prompt,
+            timeout_seconds=timeout_seconds,
+        )
+        return parsed, model, "perplexity"
+    if normalized in {"claude", "anthropic"}:
+        parsed, model = await _anthropic_chat_json(
+            prompt=prompt,
+            timeout_seconds=timeout_seconds,
+            max_tokens=max_tokens,
+        )
+        return parsed, model, "anthropic"
+    raise ValueError("Unsupported blog model. Choose chatgpt, perplexity, or claude.")
 
 
 async def get_phase1_perplexity_contact_extraction(
@@ -631,6 +712,158 @@ async def get_blog_analysis_perplexity(text: str, metrics: dict) -> dict:
         return {}
 
 
+def _normalize_blog_sections(sections: list) -> list[dict]:
+    normalized: list[dict] = []
+    fallback_labels = ["Introduction", "Main benefits", "How it works", "Buying guide", "FAQ", "Conclusion"]
+    for idx, section in enumerate(sections if isinstance(sections, list) else []):
+        if not isinstance(section, dict):
+            continue
+        heading = str(section.get("heading") or section.get("label") or fallback_labels[min(idx, len(fallback_labels) - 1)]).strip()
+        content = str(section.get("content") or "").strip()
+        if not heading or not content:
+            continue
+        normalized.append({
+            "id": str(section.get("id") or f"section-{idx + 1}").strip() or f"section-{idx + 1}",
+            "label": str(section.get("label") or heading).strip()[:80],
+            "heading": heading[:140],
+            "content": content,
+        })
+    return normalized
+
+
+def _count_words(text: str) -> int:
+    return len([word for word in re.split(r"\s+", text or "") if word.strip()])
+
+
+async def generate_seo_blog(
+    *,
+    title: str,
+    target_words: int,
+    primary_keyword: str | None = None,
+    audience: str | None = None,
+    tone: str | None = None,
+    key_features: list[str] | None = None,
+    selling_points: list[str] | None = None,
+    internal_links: list[str] | None = None,
+    selected_model: str = "chatgpt",
+) -> dict:
+    safe_words = max(700, min(int(target_words or 1200), 1500))
+    min_words = max(650, min(1000, safe_words - 180))
+    max_words = min(1500, max(1000, safe_words + 120))
+    prompt = f"""
+    You are an expert SEO blog strategist and conversion copywriter.
+    Create a complete SEO-friendly blog article as structured JSON.
+
+    Blog brief:
+    - Title: {title}
+    - Target word count: {safe_words} words
+    - Primary keyword: {primary_keyword or "infer from title"}
+    - Audience: {audience or "qualified readers searching this topic"}
+    - Tone: {tone or "clear, authoritative, helpful"}
+    - Key features: {json.dumps(key_features or [])}
+    - Selling points: {json.dumps(selling_points or [])}
+    - Internal links to naturally mention: {json.dumps(internal_links or [])}
+
+    Return strict JSON only with this exact shape:
+    {{
+      "title": "optimized H1 title",
+      "metaTitle": "SEO title, 50-60 characters",
+      "metaDescription": "SEO meta description, 140-160 characters",
+      "slug": "short-kebab-case-slug",
+      "excerpt": "short blog excerpt",
+      "keywords": ["primary", "secondary"],
+      "sections": [
+        {{"id": "intro", "label": "Intro", "heading": "Introduction heading", "content": "section text"}},
+        {{"id": "section-1", "label": "Section label", "heading": "H2 heading", "content": "section text"}}
+      ]
+    }}
+
+    Rules:
+    - Total article body must be between {min_words} and {max_words} words, never over 1500 words.
+    - Use helpful H2-style section headings and include one FAQ section if relevant.
+    - Make it SEO-friendly without keyword stuffing.
+    - Include specific benefits, features, selling points, and next steps from the brief.
+    - Do not include markdown fences. JSON only.
+    """
+
+    parsed, model, provider = await _blog_model_json(
+        provider=selected_model,
+        prompt=prompt,
+        timeout_seconds=120,
+        max_tokens=5200,
+    )
+    sections = _normalize_blog_sections(parsed.get("sections") if isinstance(parsed, dict) else [])
+    body_text = "\n\n".join(f"{s['heading']}\n{s['content']}" for s in sections)
+    return {
+        "title": str(parsed.get("title") or title).strip(),
+        "metaTitle": str(parsed.get("metaTitle") or title).strip()[:90],
+        "metaDescription": str(parsed.get("metaDescription") or "").strip()[:220],
+        "slug": str(parsed.get("slug") or re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")).strip(),
+        "excerpt": str(parsed.get("excerpt") or "").strip(),
+        "keywords": [str(k).strip() for k in (parsed.get("keywords") if isinstance(parsed.get("keywords"), list) else []) if str(k).strip()],
+        "sections": sections,
+        "wordCount": _count_words(body_text),
+        "modelUsed": model,
+        "provider": provider,
+    }
+
+
+async def rewrite_blog_section(
+    *,
+    title: str,
+    section: dict,
+    full_blog_context: list[dict] | None = None,
+    selected_model: str = "chatgpt",
+    instruction: str | None = None,
+    target_words: int | None = None,
+) -> dict:
+    safe_target = max(90, min(int(target_words or _count_words(section.get("content", "")) or 180), 450))
+    context = [
+        {
+            "heading": str(item.get("heading") or ""),
+            "content": str(item.get("content") or "")[:1200],
+        }
+        for item in (full_blog_context or [])
+        if isinstance(item, dict)
+    ]
+    prompt = f"""
+    Rewrite one section of an SEO blog while preserving the article strategy.
+
+    Article title: {title}
+    Full blog context: {json.dumps(context)[:10000]}
+    Section to rewrite: {json.dumps(section)}
+    Extra instruction: {instruction or "Improve clarity, SEO intent coverage, and conversion value."}
+    Target section length: about {safe_target} words.
+
+    Return strict JSON only:
+    {{
+      "heading": "section heading",
+      "content": "rewritten section body"
+    }}
+
+    Rules:
+    - Keep the rewritten section consistent with surrounding sections.
+    - Do not duplicate the full blog.
+    - Do not include markdown fences. JSON only.
+    """
+    parsed, model, provider = await _blog_model_json(
+        provider=selected_model,
+        prompt=prompt,
+        timeout_seconds=90,
+        max_tokens=1800,
+    )
+    heading = str(parsed.get("heading") or section.get("heading") or section.get("label") or "Updated section").strip()
+    content = str(parsed.get("content") or section.get("content") or "").strip()
+    return {
+        "id": str(section.get("id") or "section"),
+        "label": str(section.get("label") or heading).strip()[:80],
+        "heading": heading[:140],
+        "content": content,
+        "modelUsed": model,
+        "provider": provider,
+    }
+
+
 async def get_phase1_enrichment(
     url: str,
     business_name: str,
@@ -810,4 +1043,3 @@ async def get_phase1_contact_fallback(url: str, business_name: str) -> dict:
     except Exception as e:
         print(f"Error in phase1 contact fallback: {e}")
         return {"emails": [], "phones": [], "addresses": [], "openingHours": [], "confidence": {}}
-

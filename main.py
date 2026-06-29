@@ -20,9 +20,21 @@ from models import (
     BlogAnalyzeRequest,
     BlogAnalysisResponse,
     BlogAnalysis,
+    BlogGenerateRequest,
+    BlogGenerateResponse,
+    BlogGenerateResult,
+    BlogRewriteSectionRequest,
+    BlogRewriteSectionResponse,
+    BlogSection,
+    BlogUsageResponse,
 )
 from scraping.scraper import scrape_website
-from agents.ai_agent import get_ai_insights_multi, get_blog_analysis_perplexity
+from agents.ai_agent import (
+    get_ai_insights_multi,
+    get_blog_analysis_perplexity,
+    generate_seo_blog,
+    rewrite_blog_section,
+)
 from models.phase2_models import CompareRequest, CompareResult
 from engines.competitor_engine import run_competitor_analysis
 from models.phase3_models import ContentAnalysisRequest, ContentAnalysisResponse
@@ -1558,6 +1570,178 @@ async def api_blogs_analyze(request: BlogAnalyzeRequest, current_user: dict = De
         print(f"[API] blog usage logging failed: {e}")
 
     return BlogAnalysisResponse(success=True, result=result)
+
+
+BLOG_WEEKLY_LIMIT = 2
+
+
+def _blog_week_window(now: datetime | None = None) -> tuple[datetime, datetime]:
+    current = now or datetime.utcnow()
+    start = current - timedelta(days=current.weekday())
+    start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=7)
+    return start, end
+
+
+async def _blog_generation_usage(current_user: dict) -> dict:
+    start, end = _blog_week_window()
+    used = 0
+    if ai_usage_col is not None:
+        used = await ai_usage_col.count_documents({
+            "user_id": current_user["id"],
+            "feature": "blog_seo_generator",
+            "timestamp": {"$gte": start, "$lt": end},
+        })
+    remaining = max(0, BLOG_WEEKLY_LIMIT - int(used or 0))
+    return {
+        "limit": BLOG_WEEKLY_LIMIT,
+        "used": int(used or 0),
+        "remaining": remaining,
+        "periodStart": start.isoformat(),
+        "periodEnd": end.isoformat(),
+    }
+
+
+def _clean_blog_list(values: list[str] | None, max_items: int = 8) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    cleaned = []
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            cleaned.append(text[:220])
+        if len(cleaned) >= max_items:
+            break
+    return cleaned
+
+
+@app.get("/api/blogs/usage", response_model=BlogUsageResponse)
+async def api_blogs_usage(current_user: dict = Depends(get_current_user)):
+    return await _blog_generation_usage(current_user)
+
+
+@app.post("/api/blogs/generate", response_model=BlogGenerateResponse)
+async def api_blogs_generate(request: BlogGenerateRequest, current_user: dict = Depends(get_current_user)):
+    usage = await _blog_generation_usage(current_user)
+    if usage["remaining"] <= 0:
+        return BlogGenerateResponse(success=False, usage=usage, error="You have used both blog generations for this week.")
+
+    title = str(request.title or "").strip()
+    if len(title) < 4:
+        return BlogGenerateResponse(success=False, usage=usage, error="A clear blog title is required.")
+
+    selected_model = (request.selected_model or "chatgpt").strip().lower()
+    if selected_model not in {"chatgpt", "perplexity", "claude"}:
+        raise HTTPException(status_code=400, detail="Choose chatgpt, perplexity, or claude.")
+
+    target_words = max(1000, min(int(request.target_words or 1200), 1500))
+    try:
+        generated = await generate_seo_blog(
+            title=title,
+            target_words=target_words,
+            primary_keyword=_clean_optional_text(request.primary_keyword),
+            audience=_clean_optional_text(request.audience),
+            tone=_clean_optional_text(request.tone),
+            key_features=_clean_blog_list(request.key_features, 10),
+            selling_points=_clean_blog_list(request.selling_points, 10),
+            internal_links=_clean_blog_list(request.internal_links, 8),
+            selected_model=selected_model,
+        )
+    except Exception as e:
+        print(f"[API] blog generation error: {e}")
+        return BlogGenerateResponse(success=False, usage=usage, error=str(e) or "Blog generation failed.")
+
+    sections = [
+        BlogSection(
+            id=str(section.get("id") or f"section-{idx + 1}"),
+            label=str(section.get("label") or section.get("heading") or f"Section {idx + 1}"),
+            heading=str(section.get("heading") or f"Section {idx + 1}"),
+            content=str(section.get("content") or ""),
+        )
+        for idx, section in enumerate(generated.get("sections") or [])
+        if str(section.get("content") or "").strip()
+    ]
+    if not sections:
+        return BlogGenerateResponse(success=False, usage=usage, error="The selected model did not return usable blog sections.")
+
+    result = BlogGenerateResult(
+        title=str(generated.get("title") or title),
+        metaTitle=str(generated.get("metaTitle") or title),
+        metaDescription=str(generated.get("metaDescription") or ""),
+        slug=str(generated.get("slug") or ""),
+        excerpt=str(generated.get("excerpt") or ""),
+        keywords=[str(k) for k in generated.get("keywords", []) if str(k).strip()],
+        sections=sections,
+        wordCount=int(generated.get("wordCount") or 0),
+        modelUsed=str(generated.get("modelUsed") or selected_model),
+    )
+
+    try:
+        await _log_ai_usage_event({
+            "feature": "blog_seo_generator",
+            "endpoint": "/api/blogs/generate",
+            "user_id": current_user.get("id"),
+            "user_email": current_user.get("email"),
+            "model_name": result.modelUsed,
+            "model_provider": generated.get("provider") or selected_model,
+            "ai_calls_estimate": 1,
+            "details": {
+                "title": result.title,
+                "word_count": result.wordCount,
+                "target_words": target_words,
+            },
+        })
+    except Exception as e:
+        print(f"[API] blog generation usage logging failed: {e}")
+
+    next_usage = await _blog_generation_usage(current_user)
+    return BlogGenerateResponse(success=True, result=result, usage=next_usage)
+
+
+@app.post("/api/blogs/rewrite-section", response_model=BlogRewriteSectionResponse)
+async def api_blogs_rewrite_section(request: BlogRewriteSectionRequest, current_user: dict = Depends(get_current_user)):
+    selected_model = (request.selected_model or "chatgpt").strip().lower()
+    if selected_model not in {"chatgpt", "perplexity", "claude"}:
+        raise HTTPException(status_code=400, detail="Choose chatgpt, perplexity, or claude.")
+
+    try:
+        rewritten = await rewrite_blog_section(
+            title=str(request.title or "SEO blog"),
+            section=request.section.model_dump(),
+            full_blog_context=[section.model_dump() for section in request.full_blog_context],
+            selected_model=selected_model,
+            instruction=_clean_optional_text(request.instruction),
+            target_words=request.target_words,
+        )
+    except Exception as e:
+        print(f"[API] blog section rewrite error: {e}")
+        return BlogRewriteSectionResponse(success=False, error=str(e) or "Section rewrite failed.")
+
+    section = BlogSection(
+        id=str(rewritten.get("id") or request.section.id),
+        label=str(rewritten.get("label") or request.section.label),
+        heading=str(rewritten.get("heading") or request.section.heading),
+        content=str(rewritten.get("content") or request.section.content),
+    )
+
+    try:
+        await _log_ai_usage_event({
+            "feature": "blog_section_rewrite",
+            "endpoint": "/api/blogs/rewrite-section",
+            "user_id": current_user.get("id"),
+            "user_email": current_user.get("email"),
+            "model_name": rewritten.get("modelUsed"),
+            "model_provider": rewritten.get("provider") or selected_model,
+            "ai_calls_estimate": 1,
+            "details": {
+                "title": request.title,
+                "section_id": section.id,
+            },
+        })
+    except Exception as e:
+        print(f"[API] blog rewrite usage logging failed: {e}")
+
+    return BlogRewriteSectionResponse(success=True, section=section, modelUsed=str(rewritten.get("modelUsed") or selected_model))
 @app.post("/api/wishlist")
 async def api_add_wishlist(request: WishlistRequest):
     try:
