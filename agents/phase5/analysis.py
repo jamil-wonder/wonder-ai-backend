@@ -18,6 +18,7 @@ from .config import (
     PHASE5_VALIDATE_COMPETITORS,
     NON_COMPETITOR_DOMAINS,
 )
+from .context import _fetch_page_context
 from .helpers import (
     _align_reasoning_with_status,
     _build_fallback_concise_answer,
@@ -36,6 +37,99 @@ from .providers import (
     _extract_grounding_signals,
     get_client,
 )
+
+
+def _target_site_context_block(url: str, ctx: dict | None) -> str:
+    ctx = ctx or {}
+    lines = [f"Target website: {url}"]
+    if ctx.get("name"):
+        lines.append(f"Name: {str(ctx.get('name'))[:120]}")
+    if ctx.get("category"):
+        lines.append(f"Category: {str(ctx.get('category'))[:80]}")
+    if ctx.get("location"):
+        lines.append(f"Location: {str(ctx.get('location'))[:80]}")
+    if ctx.get("description"):
+        lines.append(f"Description: {str(ctx.get('description'))[:400]}")
+    services = ctx.get("services") or []
+    if isinstance(services, list) and services:
+        lines.append(f"Visible services/topics: {', '.join([str(s)[:80] for s in services[:10]])}")
+    return "\n".join(lines)
+
+
+def _target_site_relevance_fallback(
+    url: str,
+    question_text: str,
+    ctx: dict | None,
+    raw_check: dict | None = None,
+) -> dict:
+    domain_match = re.search(r"(?:https?://)?(?:www\.)?([^/]+)", url)
+    domain = _normalize_domain(domain_match.group(1).lower() if domain_match else url.lower())
+    ctx = ctx or {}
+    raw_check = raw_check if isinstance(raw_check, dict) else {}
+
+    raw_status = str(raw_check.get("status") or raw_check.get("relevance") or "").strip().lower()
+    if raw_status in {"matched", "match", "relevant", "yes"}:
+        status = "matched"
+    elif raw_status in {"partial", "partially_relevant", "some"}:
+        status = "partial"
+    elif raw_status in {"no_match", "not_relevant", "none", "no"}:
+        status = "no_match"
+    else:
+        content_parts = [
+            str(ctx.get("name") or ""),
+            str(ctx.get("category") or ""),
+            str(ctx.get("location") or ""),
+            str(ctx.get("description") or ""),
+            " ".join([str(s) for s in (ctx.get("services") or []) if s]),
+        ]
+        haystack = re.sub(r"[^a-z0-9\s]", " ", " ".join(content_parts).lower())
+        tokens = [
+            t
+            for t in re.findall(r"[a-z0-9]{4,}", question_text.lower())
+            if t not in {"where", "what", "which", "with", "near", "best", "find", "does", "have", "that", "this", "from", "for"}
+        ]
+        matches = []
+        for token in tokens:
+            if token in haystack and token not in matches:
+                matches.append(token)
+        if len(matches) >= 3:
+            status = "matched"
+        elif matches:
+            status = "partial"
+        else:
+            status = "no_match"
+
+    matched_facts = raw_check.get("matched_facts") if isinstance(raw_check.get("matched_facts"), list) else []
+    missing_facts = raw_check.get("missing_facts") if isinstance(raw_check.get("missing_facts"), list) else []
+    summary = str(raw_check.get("summary") or "").strip()
+
+    if not matched_facts:
+        if ctx.get("category"):
+            matched_facts.append(str(ctx.get("category"))[:120])
+        if ctx.get("location"):
+            matched_facts.append(str(ctx.get("location"))[:120])
+        services = ctx.get("services") or []
+        if isinstance(services, list):
+            matched_facts.extend([str(s)[:120] for s in services[:3]])
+    if not missing_facts and status != "matched":
+        missing_facts = ["Clearer page content for this exact search intent"]
+    if not summary:
+        if status == "matched":
+            summary = "The target site appears to contain content that supports this prompt."
+        elif status == "partial":
+            summary = "The target site has some related signals, but the intent is not fully covered."
+        else:
+            summary = "The target site does not show strong visible content for this prompt yet."
+
+    return {
+        "checked": True,
+        "status": status,
+        "source_domain": domain,
+        "source_url": url,
+        "matched_facts": [str(x).strip()[:180] for x in matched_facts if str(x).strip()][:5],
+        "missing_facts": [str(x).strip()[:180] for x in missing_facts if str(x).strip()][:5],
+        "summary": summary[:360],
+    }
 
 
 async def _validate_direct_competitors(
@@ -146,16 +240,20 @@ async def _analyze_single_question_openai(
     question: dict,
     include_competitors: bool = False,
     provider_name: str = "openai",
+    target_context: dict | None = None,
 ) -> dict:
     domain_match = re.search(r"(?:https?://)?(?:www\.)?([^/]+)", url)
     raw_domain = domain_match.group(1).lower() if domain_match else url.lower()
     domain = _normalize_domain(raw_domain)
+    target_context_block = _target_site_context_block(url, target_context)
 
     prompt = f"""
     Analyze this user-intent query for brand visibility using your general web/search understanding.
 
     Query: '{question['text']}'
     Target domain: '{domain}'
+    Target site context to check separately:
+    {target_context_block}
 
     Return strict JSON only with this schema:
     {{
@@ -170,14 +268,21 @@ async def _analyze_single_question_openai(
         {{"domain": "competitor.com", "position": 1, "evidence": "short reason"}}
       ],
       "reasoning": "1 short sentence",
-      "concise_answer": "Natural user-facing answer to the query (90-180 words), mentioning top options and practical guidance."
+      "concise_answer": "Natural user-facing answer to the query (90-180 words), mentioning top options and practical guidance.",
+      "target_site_check": {{
+        "status": "matched | partial | no_match",
+        "matched_facts": ["facts from target site context that relate to the query"],
+        "missing_facts": ["important facts missing from target site context"],
+        "summary": "short explanation of whether the target site supports this query"
+      }}
     }}
 
     Rules:
     - Keep lists short and realistic.
-    - If target appears in results, set target.mentioned=true and include a realistic position.
-    - It is okay to include the target domain once in references when it appears in results.
+    - target.mentioned must be true ONLY if the target appears in organic answer/search evidence, not because target site context was provided.
     - Sources/references must be third-party domains only.
+    - Do not count the provided target site context as organic visibility.
+    - Evaluate target_site_check only from the provided target site context.
     - Do not include target domain in competitors.
     - position must be 1..10 or null.
     - concise_answer must sound like a real assistant reply to the query (no analytics wording, no "mentioned/not mentioned" wording).
@@ -343,6 +448,12 @@ async def _analyze_single_question_openai(
             domain=domain,
         )[:4000]
     )
+    target_site = _target_site_relevance_fallback(
+        url=url,
+        question_text=str(question.get("text") or ""),
+        ctx=target_context,
+        raw_check=data.get("target_site_check") if isinstance(data, dict) else None,
+    )
 
     return {
         "id": question["id"],
@@ -356,19 +467,28 @@ async def _analyze_single_question_openai(
         "competitor_scores": competitor_scores[:5],
         "reasoning": reasoning or None,
         "llm_response": answer_text,
+        "target_site": target_site,
     }
 
 
-async def _analyze_single_question_perplexity(url: str, question: dict, include_competitors: bool = False) -> dict:
+async def _analyze_single_question_perplexity(
+    url: str,
+    question: dict,
+    include_competitors: bool = False,
+    target_context: dict | None = None,
+) -> dict:
     domain_match = re.search(r"(?:https?://)?(?:www\.)?([^/]+)", url)
     raw_domain = domain_match.group(1).lower() if domain_match else url.lower()
     domain = _normalize_domain(raw_domain)
+    target_context_block = _target_site_context_block(url, target_context)
 
     prompt = f"""
     Analyze this user-intent query for brand visibility using web-aware reasoning.
 
     Query: '{question['text']}'
     Target domain: '{domain}'
+    Target site context to check separately:
+    {target_context_block}
 
     Return strict JSON only with this schema:
     {{
@@ -383,13 +503,21 @@ async def _analyze_single_question_perplexity(url: str, question: dict, include_
         {{"domain": "competitor.com", "position": 1, "evidence": "short reason"}}
       ],
       "reasoning": "1 short sentence",
-      "concise_answer": "Natural user-facing answer to the query (90-180 words), mentioning top options and practical guidance."
+      "concise_answer": "Natural user-facing answer to the query (90-180 words), mentioning top options and practical guidance.",
+      "target_site_check": {{
+        "status": "matched | partial | no_match",
+        "matched_facts": ["facts from target site context that relate to the query"],
+        "missing_facts": ["important facts missing from target site context"],
+        "summary": "short explanation of whether the target site supports this query"
+      }}
     }}
 
     Rules:
     - Keep lists short and realistic.
-    - Never use the target domain as a source or reference.
-    - Sources/references must be third-party domains only.
+    - target.mentioned must be true ONLY if the target appears in organic answer/search evidence, not because target site context was provided.
+    - Third-party sources/references must not include the target domain.
+    - Do not count the provided target site context as organic visibility.
+    - Evaluate target_site_check only from the provided target site context.
     - Do not include target domain in competitors.
     - position must be 1..10 or null.
     - concise_answer must sound like a real assistant reply to the query (no analytics wording, no "mentioned/not mentioned" wording).
@@ -555,6 +683,12 @@ async def _analyze_single_question_perplexity(url: str, question: dict, include_
             domain=domain,
         )[:4000]
     )
+    target_site = _target_site_relevance_fallback(
+        url=url,
+        question_text=str(question.get("text") or ""),
+        ctx=target_context,
+        raw_check=data.get("target_site_check") if isinstance(data, dict) else None,
+    )
 
     return {
         "id": question["id"],
@@ -568,6 +702,7 @@ async def _analyze_single_question_perplexity(url: str, question: dict, include_
         "competitor_scores": competitor_scores[:5],
         "reasoning": reasoning or None,
         "llm_response": answer_text,
+        "target_site": target_site,
     }
 
 
@@ -576,12 +711,15 @@ async def analyze_single_question(
     question: dict,
     model_provider: str = "perplexity",
     include_competitors: bool = False,
+    target_context: dict | None = None,
 ) -> dict:
     """
     Analyzes a single question using Gemini with Google Search Grounding.
     Returns status, position, sources, and competitors dynamically.
     """
     normalized_provider = str(model_provider or "perplexity").strip().lower()
+    if target_context is None:
+        target_context = await _fetch_page_context(url)
     if normalized_provider == "gemini" and not PHASE5_ENABLE_GEMINI:
         return {
             "id": question["id"],
@@ -595,12 +733,18 @@ async def analyze_single_question(
             "competitor_scores": [],
             "reasoning": "Gemini is temporarily disabled for Phase 5.",
             "llm_response": None,
+            "target_site": _target_site_relevance_fallback(
+                url=url,
+                question_text=str(question.get("text") or ""),
+                ctx=target_context,
+            ),
         }
     if normalized_provider == "openai":
         return await _analyze_single_question_openai(
             url=url,
             question=question,
             include_competitors=include_competitors,
+            target_context=target_context,
         )
     if normalized_provider == "claude":
         return await _analyze_single_question_openai(
@@ -608,12 +752,14 @@ async def analyze_single_question(
             question=question,
             include_competitors=include_competitors,
             provider_name="claude",
+            target_context=target_context,
         )
     if normalized_provider == "perplexity":
         return await _analyze_single_question_perplexity(
             url=url,
             question=question,
             include_competitors=include_competitors,
+            target_context=target_context,
         )
 
     client = get_client()
@@ -621,6 +767,7 @@ async def analyze_single_question(
     domain_match = re.search(r"(?:https?://)?(?:www\.)?([^/]+)", url)
     raw_domain = domain_match.group(1).lower() if domain_match else url.lower()
     domain = _normalize_domain(raw_domain)
+    target_context_block = _target_site_context_block(url, target_context)
 
     def score_from_position(pos: int | None) -> int:
         if not pos or pos < 1:
@@ -795,6 +942,8 @@ async def analyze_single_question(
         '{question['text']}'
 
         Target brand domain: '{domain}'
+        Target site context to check separately:
+        {target_context_block}
 
         Return strict JSON only:
         {{
@@ -806,13 +955,22 @@ async def analyze_single_question(
             "references": ["<domain1.com>", "<domain2.com>", "... up to 20"],
             "idea_candidates": ["<potential-competitor-domain.com>", "... up to 8"],
             "reasoning": "1 short sentence",
-            "concise_answer": "Natural user-facing answer to the query (90-180 words), mentioning top options and practical guidance."
+            "concise_answer": "Natural user-facing answer to the query (90-180 words), mentioning top options and practical guidance.",
+            "target_site_check": {{
+                "status": "matched | partial | no_match",
+                "matched_facts": ["facts from target site context that relate to the query"],
+                "missing_facts": ["important facts missing from target site context"],
+                "summary": "short explanation of whether the target site supports this query"
+            }}
         }}
 
         Rules:
         - 'references' must contain real web domains from observed evidence.
         - 'idea_candidates' should contain possible direct competitor domains inferred from this query context.
+        - target.mentioned must be true ONLY if the target appears in organic search evidence, not because target site context was provided.
         - Do not include target domain in idea_candidates.
+        - Do not count the provided target site context as organic visibility.
+        - Evaluate target_site_check only from the provided target site context.
         - Output raw JSON only. No markdown.
         - concise_answer must sound like a real assistant reply to the query (no analytics wording, no "mentioned/not mentioned" wording).
         - concise_answer should be compact but useful: top picks, brief why, and one practical tip.
@@ -822,15 +980,21 @@ async def analyze_single_question(
         Use live Google Search and return JSON only.
         Query: '{question['text']}'
         Target domain: '{domain}'
+        Target site context:
+        {target_context_block}
         {{
             "target": {{"mentioned": true or false, "position": <1-10 or null>, "source_domains": ["domain.com"]}},
             "references": ["domain1.com", "domain2.com"],
             "idea_candidates": ["competitor.com"],
             "ranked_competitors": [{{"domain": "competitor.com", "position": 1, "evidence": "short reason"}}],
             "reasoning": "short sentence",
-            "concise_answer": "Natural user-facing answer to the query (90-180 words), mentioning top options and practical guidance."
+            "concise_answer": "Natural user-facing answer to the query (90-180 words), mentioning top options and practical guidance.",
+            "target_site_check": {{"status": "matched | partial | no_match", "matched_facts": [], "missing_facts": [], "summary": "short"}}
         }}
         Rules: no markdown, no prose, max 5 competitors, do not include target in competitors.
+        - target.mentioned must be true ONLY if the target appears in organic search evidence, not because target site context was provided.
+        - Do not count the provided target site context as organic visibility.
+        - Evaluate target_site_check only from the provided target site context.
         - concise_answer must sound like a real assistant reply to the query (no analytics wording, no "mentioned/not mentioned" wording).
         - concise_answer should be compact but useful: top picks, brief why, and one practical tip.
         """
@@ -840,6 +1004,8 @@ async def analyze_single_question(
         '{question['text']}'
 
         Target brand domain: '{domain}' (brand token: '{domain.split('.')[0]}').
+        Target site context to check separately:
+        {target_context_block}
         Evaluate top search evidence and produce strict JSON only.
 
         JSON schema:
@@ -855,12 +1021,21 @@ async def analyze_single_question(
                 {{"domain": "<competitor.com>", "position": <1-10>, "evidence": "short reason"}}
             ],
             "reasoning": "1 short sentence",
-            "concise_answer": "Natural user-facing answer to the query (90-180 words), mentioning top options and practical guidance."
+            "concise_answer": "Natural user-facing answer to the query (90-180 words), mentioning top options and practical guidance.",
+            "target_site_check": {{
+                "status": "matched | partial | no_match",
+                "matched_facts": ["facts from target site context that relate to the query"],
+                "missing_facts": ["important facts missing from target site context"],
+                "summary": "short explanation of whether the target site supports this query"
+            }}
         }}
 
         Rules:
         - 'references' must contain real web domains from observed evidence.
+        - target.mentioned must be true ONLY if the target appears in organic search evidence, not because target site context was provided.
         - Do not include the target domain in ranked_competitors.
+        - Do not count the provided target site context as organic visibility.
+        - Evaluate target_site_check only from the provided target site context.
         - Keep ranked_competitors to max 5 entries.
         - Output raw JSON only. No markdown.
         - concise_answer must sound like a real assistant reply to the query (no analytics wording, no "mentioned/not mentioned" wording).
@@ -1111,6 +1286,12 @@ async def analyze_single_question(
                 domain=domain,
             )[:4000]
         )
+        target_site = _target_site_relevance_fallback(
+            url=url,
+            question_text=str(question.get("text") or ""),
+            ctx=target_context,
+            raw_check=data.get("target_site_check") if isinstance(data, dict) else None,
+        )
 
         result_payload = {
             "id": question["id"],
@@ -1124,6 +1305,7 @@ async def analyze_single_question(
             "competitor_scores": competitor_scores[:5],
             "reasoning": reasoning or None,
             "llm_response": answer_text,
+            "target_site": target_site,
         }
         return result_payload
 
@@ -1142,6 +1324,11 @@ async def analyze_single_question(
             "competitor_scores": [],
             "reasoning": None,
             "llm_response": None,
+            "target_site": _target_site_relevance_fallback(
+                url=url,
+                question_text=str(question.get("text") or ""),
+                ctx=target_context,
+            ),
         }
 
 
@@ -1150,9 +1337,12 @@ async def _run_with_backoff(
     question: dict,
     model_provider: str = "perplexity",
     include_competitors: bool = False,
+    target_context: dict | None = None,
 ) -> dict:
     """Wrap analyze_single_question with exponential backoff for provider rate limits."""
     provider = str(model_provider or "perplexity").strip().lower()
+    if target_context is None:
+        target_context = await _fetch_page_context(url)
     if provider == "gemini" and not PHASE5_ENABLE_GEMINI:
         return {
             "id": question["id"],
@@ -1166,6 +1356,11 @@ async def _run_with_backoff(
             "competitor_scores": [],
             "reasoning": "Gemini is temporarily disabled for Phase 5.",
             "llm_response": None,
+            "target_site": _target_site_relevance_fallback(
+                url=url,
+                question_text=str(question.get("text") or ""),
+                ctx=target_context,
+            ),
         }
     if provider == "openai":
         retries = max(1, OPENAI_PHASE5_MAX_RETRIES)
@@ -1182,6 +1377,7 @@ async def _run_with_backoff(
                 question=question,
                 model_provider=model_provider,
                 include_competitors=include_competitors,
+                target_context=target_context,
             )
         except Phase5RateLimitError:
             if attempt == retries - 1:
@@ -1206,6 +1402,7 @@ def _empty_provider_result(error: str | None = None) -> dict:
         "competitor_scores": [],
         "reasoning": None,
         "llm_response": None,
+        "target_site": None,
         "cited": False,
         "status": "Not Mentioned",
     }
@@ -1230,6 +1427,7 @@ def _safe_provider_result(raw: dict | Exception | None) -> dict:
     competitor_scores = raw.get("competitor_scores") if isinstance(raw.get("competitor_scores"), list) else []
     reasoning = raw.get("reasoning")
     llm_response = raw.get("llm_response")
+    target_site = raw.get("target_site") if isinstance(raw.get("target_site"), dict) else None
     mentioned = status == "Mentioned" or position is not None
     cited = bool(sources or references or source_urls)
 
@@ -1244,6 +1442,7 @@ def _safe_provider_result(raw: dict | Exception | None) -> dict:
         "competitor_scores": competitor_scores,
         "reasoning": reasoning if isinstance(reasoning, str) and reasoning.strip() else None,
         "llm_response": llm_response if isinstance(llm_response, str) and llm_response.strip() else None,
+        "target_site": target_site,
         "cited": cited,
         "status": "Mentioned" if mentioned else "Not Mentioned",
     }
@@ -1254,12 +1453,15 @@ async def analyze_single_question_multi(
     question: dict,
     include_competitors: bool = False,
 ) -> dict:
+    target_context = await _fetch_page_context(url)
+
     async def _call_provider(provider: str):
         return await _run_with_backoff(
             url=url,
             question=question,
             model_provider=provider,
             include_competitors=include_competitors,
+            target_context=target_context,
         )
 
     perplexity_call = _call_provider("perplexity")

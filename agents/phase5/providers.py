@@ -374,12 +374,15 @@ async def _call_perplexity_chat_json(prompt: str, timeout_sec: int | None = None
         elapsed = asyncio.get_running_loop().time() - started
         _log_provider_healthy_once("Perplexity", model, elapsed)
         parsed_dict = parsed if isinstance(parsed, dict) else {}
+        if text:
+            parsed_dict["_meta_response_text"] = text[:4000]
+            text_domains = _extract_domains_from_text(text)
+            if text_domains:
+                citation_domains.extend(text_domains)
         if citation_domains:
             parsed_dict["_meta_source_domains"] = list(dict.fromkeys(citation_domains))
         if citation_urls:
             parsed_dict["_meta_source_urls"] = list(dict.fromkeys(citation_urls))
-        if text:
-            parsed_dict["_meta_response_text"] = text[:4000]
         return parsed_dict
     except Phase5RateLimitError:
         raise
