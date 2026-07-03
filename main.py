@@ -82,6 +82,7 @@ import os
 import uuid
 import json
 import re
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
@@ -148,6 +149,7 @@ phase5_jobs_col = None
 ai_usage_col = None
 user_history_meta_col = None
 businesses_col = None
+public_rate_limits_col = None
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
     db = mongo_client.get_database("wonderai")
@@ -158,6 +160,7 @@ try:
     phase5_jobs_col = db.get_collection("phase5_jobs")
     ai_usage_col = db.get_collection("ai_usage_events")
     user_history_meta_col = db.get_collection("user_history_meta")
+    public_rate_limits_col = db.get_collection("public_rate_limits")
 except Exception as e:
     print(f"[API] Error connecting to MongoDB: {type(e).__name__}")
 
@@ -349,6 +352,25 @@ class UserPasswordChangeRequest(BaseModel):
     new_password: str
 
 
+class PublicCompetitorsRequest(BaseModel):
+    url: str
+    businessName: str | None = None
+    category: str | None = None
+    location: str | None = None
+    description: str | None = None
+
+
+class PublicCompetitorsResponse(BaseModel):
+    success: bool
+    competitors: list[dict] = []
+    error: str | None = None
+
+
+PUBLIC_PREVIEW_ATTEMPT_LIMIT = int(os.getenv("PUBLIC_PREVIEW_ATTEMPT_LIMIT", "3"))
+PUBLIC_PREVIEW_SUCCESS_LIMIT = int(os.getenv("PUBLIC_PREVIEW_SUCCESS_LIMIT", "1"))
+PUBLIC_PREVIEW_WINDOW_HOURS = int(os.getenv("PUBLIC_PREVIEW_WINDOW_HOURS", "24"))
+
+
 def _normalize_site(value: str) -> str:
     raw = (value or "").strip().lower()
     if not raw:
@@ -358,6 +380,153 @@ def _normalize_site(value: str) -> str:
     if host.startswith("www."):
         host = host[4:]
     return host
+
+
+def _get_public_client_ip(request: Request) -> str:
+    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    return (
+        forwarded
+        or request.headers.get("cf-connecting-ip")
+        or request.headers.get("x-real-ip")
+        or (request.client.host if request.client else "")
+        or "unknown"
+    )
+
+
+def _get_public_device_id(request: Request) -> str:
+    raw = (request.headers.get("x-wonder-device-id") or "").strip()
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "", raw)[:96]
+    return safe or "unknown-device"
+
+
+def _get_public_scan_id(request: Request) -> str:
+    raw = (request.headers.get("x-wonder-scan-id") or "").strip()
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "", raw)[:96]
+    return safe or uuid.uuid4().hex
+
+
+def _public_limit_key(request: Request) -> str:
+    fingerprint = f"{_get_public_client_ip(request)}|{_get_public_device_id(request)}"
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
+
+async def _get_public_limit_doc(request: Request) -> dict:
+    now = datetime.utcnow()
+    key = _public_limit_key(request)
+    reset_at = now + timedelta(hours=PUBLIC_PREVIEW_WINDOW_HOURS)
+    default_doc = {
+        "key": key,
+        "attempt_count": 0,
+        "preview_success_count": 0,
+        "allowed_scan_ids": [],
+        "endpoint_counts": {},
+        "created_at": now,
+        "reset_at": reset_at,
+        "last_ip": _get_public_client_ip(request),
+        "last_device_id": _get_public_device_id(request),
+    }
+
+    if public_rate_limits_col is None:
+        return default_doc
+
+    doc = await public_rate_limits_col.find_one({"key": key})
+    existing_reset_at = doc.get("reset_at") if doc else None
+    if not doc or not isinstance(existing_reset_at, datetime) or existing_reset_at <= now:
+        await public_rate_limits_col.replace_one({"key": key}, default_doc, upsert=True)
+        return default_doc
+    return doc
+
+
+def _raise_public_limit(doc: dict):
+    reset_at = doc.get("reset_at")
+    reset_text = reset_at.isoformat() if isinstance(reset_at, datetime) else None
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "code": "public_preview_limit_reached",
+            "message": "You have used today's free Wonder Score preview. Please sign up or try again after the limit resets.",
+            "resetAt": reset_text,
+        },
+    )
+
+
+async def _reserve_public_preview_attempt(
+    *,
+    request: Request,
+    current_user: dict | None,
+    url: str,
+) -> dict | None:
+    if current_user:
+        return None
+
+    doc = await _get_public_limit_doc(request)
+    if (
+        int(doc.get("attempt_count") or 0) >= PUBLIC_PREVIEW_ATTEMPT_LIMIT
+        or int(doc.get("preview_success_count") or 0) >= PUBLIC_PREVIEW_SUCCESS_LIMIT
+    ):
+        _raise_public_limit(doc)
+
+    scan_id = _get_public_scan_id(request)
+    domain = _normalize_site(url)
+    if public_rate_limits_col is not None:
+        await public_rate_limits_col.update_one(
+            {"key": doc["key"]},
+            {
+                "$inc": {"attempt_count": 1},
+                "$set": {
+                    "last_attempt_at": datetime.utcnow(),
+                    "last_domain": domain,
+                    "last_ip": _get_public_client_ip(request),
+                    "last_device_id": _get_public_device_id(request),
+                },
+                "$addToSet": {"attempted_domains": domain},
+            },
+        )
+    return {"key": doc["key"], "scan_id": scan_id}
+
+
+async def _mark_public_preview_success(context: dict | None):
+    if not context or public_rate_limits_col is None:
+        return
+    await public_rate_limits_col.update_one(
+        {"key": context["key"]},
+        {
+            "$inc": {"preview_success_count": 1},
+            "$set": {"last_success_at": datetime.utcnow()},
+            "$addToSet": {"allowed_scan_ids": context["scan_id"]},
+        },
+    )
+
+
+async def _enforce_public_child_call(
+    *,
+    request: Request,
+    current_user: dict | None,
+    endpoint_key: str,
+    max_calls: int = 1,
+):
+    if current_user:
+        return
+
+    doc = await _get_public_limit_doc(request)
+    scan_id = _get_public_scan_id(request)
+    allowed = doc.get("allowed_scan_ids") if isinstance(doc.get("allowed_scan_ids"), list) else []
+    if scan_id not in allowed:
+        _raise_public_limit(doc)
+
+    endpoint_counts = doc.get("endpoint_counts") if isinstance(doc.get("endpoint_counts"), dict) else {}
+    count_key = f"{endpoint_key}_{scan_id}"
+    if int(endpoint_counts.get(count_key) or 0) >= max_calls:
+        _raise_public_limit(doc)
+
+    if public_rate_limits_col is not None:
+        await public_rate_limits_col.update_one(
+            {"key": doc["key"]},
+            {
+                "$inc": {f"endpoint_counts.{count_key}": 1},
+                "$set": {"last_child_call_at": datetime.utcnow()},
+            },
+        )
 
 
 def _clean_optional_text(value) -> str | None:
@@ -1282,8 +1451,14 @@ async def api_user_history_site_trend(site: str, range: str = "month", current_u
 @app.post("/api/scrape", response_model=ScrapeResult)
 async def api_scrape(
     request: ScrapeRequest,
+    http_request: Request,
     current_user: dict = Depends(get_current_user_optional),
 ):
+    public_preview_context = await _reserve_public_preview_attempt(
+        request=http_request,
+        current_user=current_user,
+        url=request.url,
+    )
     try:
         started_at = datetime.utcnow()
         print(f"[API] /api/scrape started: {request.url}")
@@ -1361,6 +1536,7 @@ async def api_scrape(
                 })
         elapsed = (datetime.utcnow() - started_at).total_seconds()
         print(f"[API] /api/scrape completed in {elapsed:.1f}s: {request.url}")
+        await _mark_public_preview_success(public_preview_context)
         return result
     except asyncio.TimeoutError:
         print(f"[API] /api/scrape timeout: {request.url}")
@@ -1391,6 +1567,7 @@ async def api_scrape(
                 except Exception as business_error:
                     print(f"[Business] phase1 fallback upsert failed: {business_error}")
             print(f"[API] /api/scrape reduced fallback returned: {request.url}")
+            await _mark_public_preview_success(public_preview_context)
             return fallback
         except Exception as fallback_error:
             print(f"[API] /api/scrape fallback failed: {fallback_error}")
@@ -1436,8 +1613,18 @@ async def api_scan_compare(request: CompareRequest, current_user: dict = Depends
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/ai-insights", response_model=AiInsightsResult)
-async def api_ai_insights(request: AiInsightsRequest, current_user: dict = Depends(get_current_user_optional)):
+async def api_ai_insights(
+    request: AiInsightsRequest,
+    http_request: Request,
+    current_user: dict = Depends(get_current_user_optional),
+):
     try:
+        await _enforce_public_child_call(
+            request=http_request,
+            current_user=current_user,
+            endpoint_key="ai_insights",
+            max_calls=1,
+        )
         started_at = datetime.utcnow()
         print(f"[API] /api/ai-insights started: {request.url}")
         insights = await asyncio.wait_for(get_ai_insights_multi(request.businessName, request.url), timeout=120)
@@ -1473,9 +1660,118 @@ async def api_ai_insights(request: AiInsightsRequest, current_user: dict = Depen
     except asyncio.TimeoutError:
         print(f"[API] /api/ai-insights timeout: {request.url}")
         return AiInsightsResult(success=False, insights=[], error="AI insights timed out. Please retry.")
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         return AiInsightsResult(success=False, insights=[], error=str(e))
+
+
+def _build_public_competitor_questions(request: PublicCompetitorsRequest) -> list[dict]:
+    category = (request.category or "business").strip()
+    location = (request.location or "nearby").strip()
+    name = (request.businessName or "").strip()
+    description = (request.description or "").strip()
+    context_hint = f"{category} in {location}".strip()
+
+    raw_questions = [
+        f"Best {context_hint}?",
+        f"Top rated {context_hint}?",
+        f"Where should I book a {category} in {location}?",
+        f"Recommended {category} near {location}?",
+        f"Popular {category} for customers in {location}?",
+        f"Which {category} has the best reviews in {location}?",
+        f"Alternatives to {name}?" if name else f"Best alternatives for a {category} in {location}?",
+        f"{description[:90]} competitors?" if description else f"Trusted {category} options in {location}?",
+    ]
+
+    questions = []
+    seen = set()
+    for text in raw_questions:
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        key = cleaned.lower().rstrip("?.!")
+        if len(cleaned) < 8 or key in seen:
+            continue
+        seen.add(key)
+        questions.append({"id": f"public_competitor_{len(questions) + 1}", "text": cleaned if cleaned.endswith("?") else f"{cleaned}?"})
+    return questions[:8]
+
+
+@app.post("/api/public/competitors", response_model=PublicCompetitorsResponse)
+async def api_public_competitors(
+    request: PublicCompetitorsRequest,
+    http_request: Request,
+    current_user: dict = Depends(get_current_user_optional),
+):
+    try:
+        await _enforce_public_child_call(
+            request=http_request,
+            current_user=current_user,
+            endpoint_key="competitors",
+            max_calls=1,
+        )
+        target_domain = _normalize_domain(request.url)
+        questions = _build_public_competitor_questions(request)
+        print(f"[API] /api/public/competitors started: {request.url} questions={len(questions)}")
+
+        raw_competitors = await asyncio.wait_for(
+            generate_deep_competitor_scores(request.url, questions, {}),
+            timeout=90,
+        )
+
+        competitors: list[dict] = []
+        seen = set()
+        for item in raw_competitors if isinstance(raw_competitors, list) else []:
+            if not isinstance(item, dict):
+                continue
+            domain = _normalize_domain(str(item.get("domain") or ""))
+            evidence = str(item.get("evidence") or "").strip()
+            confidence = str(item.get("confidence") or "").strip().lower()
+            if (
+                not domain
+                or domain == target_domain
+                or domain in seen
+                or confidence == "generated"
+                or "auto-generated fallback" in evidence.lower()
+            ):
+                continue
+            seen.add(domain)
+            competitors.append({
+                "domain": domain,
+                "position": item.get("position"),
+                "score": item.get("score"),
+                "evidence": evidence,
+                "confidence": confidence or "validated",
+                "faviconUrl": f"https://www.google.com/s2/favicons?domain={domain}&sz=64",
+            })
+            if len(competitors) >= 4:
+                break
+
+        await _log_ai_usage_event({
+            "feature": "public_competitor_lookup",
+            "endpoint": "/api/public/competitors",
+            "url": request.url,
+            "user_id": current_user.get("id") if current_user else None,
+            "user_email": current_user.get("email") if current_user else None,
+            "model_provider": "perplexity",
+            "ai_calls_estimate": 2,
+            "details": {
+                "question_count": len(questions),
+                "competitor_count": len(competitors),
+            },
+        })
+
+        print(f"[API] /api/public/competitors completed: {request.url} competitors={len(competitors)}")
+        return PublicCompetitorsResponse(success=True, competitors=competitors)
+    except asyncio.TimeoutError:
+        print(f"[API] /api/public/competitors timeout: {request.url}")
+        return PublicCompetitorsResponse(success=False, competitors=[], error="Competitor lookup timed out. Please retry.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        return PublicCompetitorsResponse(success=False, competitors=[], error=str(e))
+
 
 @app.post("/api/scan/content", response_model=ContentAnalysisResponse)
 async def api_scan_content(request: ContentAnalysisRequest, current_user: dict = Depends(get_current_user_optional)):
@@ -2652,6 +2948,9 @@ async def _phase5_worker_startup():
             ])
         if user_history_meta_col is not None:
             await user_history_meta_col.create_index("user_id", unique=True)
+        if public_rate_limits_col is not None:
+            await public_rate_limits_col.create_index("key", unique=True)
+            await public_rate_limits_col.create_index("reset_at")
     except Exception:
         print("[Phase5] warning: index creation failed; continuing without blocking startup")
         traceback.print_exc()
