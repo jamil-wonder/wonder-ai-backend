@@ -144,6 +144,7 @@ class BusinessUpsertRequest(BaseModel):
     targetAudience: Optional[str] = None
     competitors: Optional[List[str]] = None
     trackedPages: Optional[List[str]] = None
+    latest_scrape_result: Optional[Dict[str, Any]] = None
 
 
 class BusinessResponse(BaseModel):
@@ -165,3 +166,4 @@ class BusinessResponse(BaseModel):
     latest_phase5_score: Optional[float] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    latest_scrape_result: Optional[Dict[str, Any]] = None

@@ -556,6 +556,7 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "latest_phase5_score": doc.get("latest_phase5_score"),
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
+        "latest_scrape_result": doc.get("latest_scrape_result"),
     }
 
 
@@ -576,6 +577,7 @@ async def _upsert_user_business(
     phase1_score: int | None = None,
     phase5_score: float | None = None,
     business_id: str | None = None,
+    scrape_result: dict | None = None,
 ) -> dict | None:
     if not current_user or businesses_col is None:
         return None
@@ -625,6 +627,8 @@ async def _upsert_user_business(
     if phase5_score is not None:
         set_fields["latest_phase5_score"] = float(phase5_score)
         set_fields["latest_phase5_at"] = now_iso
+    if scrape_result is not None:
+        set_fields["latest_scrape_result"] = scrape_result
     for key, values in {
         "services": services,
         "competitors": competitors,
@@ -1146,6 +1150,7 @@ async def api_user_business_upsert(
         competitors=request.competitors,
         tracked_pages=request.trackedPages,
         business_id=request.business_id,
+        scrape_result=request.latest_scrape_result,
     )
     public = _public_business_doc(business)
     if not public:
@@ -1504,6 +1509,7 @@ async def api_scrape(
                     logo_url=result.get("logoUrl"),
                     phase1_score=((result.get("scores") or {}).get("total") if isinstance(result.get("scores"), dict) else None),
                     business_id=request.business_id,
+                    scrape_result=result,
                 )
                 public_business = _public_business_doc(business)
                 if public_business:
@@ -1559,6 +1565,7 @@ async def api_scrape(
                         logo_url=fallback.get("logoUrl"),
                         phase1_score=((fallback.get("scores") or {}).get("total") if isinstance(fallback.get("scores"), dict) else None),
                         business_id=request.business_id,
+                        scrape_result=fallback,
                     )
                     public_business = _public_business_doc(business)
                     if public_business:
