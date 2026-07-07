@@ -13,9 +13,68 @@ from .helpers import (
     _safe_json_parse,
 )
 from .providers import _call_perplexity_with_retry
+from .providers import _call_claude_web_search_with_retry
 
 
-async def _validate_same_niche_competitors_perplexity(
+def _canonical_site_url(value: str) -> str:
+    domain = _normalize_domain(value)
+    return f"https://{domain}/" if domain else ""
+
+
+def _clean_business_name(value: str, domain: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    text = re.sub(r"\s+[|-]\s+.*$", "", text).strip()
+    if text and len(text) <= 80 and "." not in text:
+        return text
+    root = str(domain or "").split(".")[0].replace("-", " ").strip()
+    return root.title() if root else domain
+
+
+def _normalize_competitor_item(item: dict, target_domain: str) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+
+    raw_url = str(item.get("url") or item.get("homepage_url") or item.get("source_url") or "").strip()
+    raw_domain = str(item.get("domain") or raw_url or "").strip()
+    domain = _normalize_domain(raw_domain)
+    if (
+        not domain
+        or domain == target_domain
+        or _is_non_competitor_domain(domain)
+        or _looks_like_platform_domain(domain)
+    ):
+        return None
+
+    url = raw_url if raw_url.startswith(("http://", "https://")) else _canonical_site_url(domain)
+    url_domain = _normalize_domain(url)
+    if url_domain and url_domain != domain:
+        url = _canonical_site_url(domain)
+
+    pos = item.get("position")
+    if not isinstance(pos, int) or pos < 1 or pos > 10:
+        pos = None
+
+    score = item.get("score")
+    if not isinstance(score, int):
+        score = item.get("confidence_score")
+    if not isinstance(score, int):
+        score = 60
+
+    name = _clean_business_name(str(item.get("name") or item.get("business_name") or ""), domain)
+    evidence = str(item.get("evidence") or item.get("reason") or "").strip()
+
+    return {
+        "domain": domain,
+        "url": url or _canonical_site_url(domain),
+        "name": name,
+        "position": pos,
+        "score": max(0, min(100, score)),
+        "evidence": evidence[:220],
+        "confidence": str(item.get("confidence") or "high").strip().lower(),
+    }
+
+
+async def _validate_same_niche_competitors_claude(
     *,
     target_domain: str,
     target_context: dict,
@@ -34,7 +93,7 @@ async def _validate_same_niche_competitors_perplexity(
 
     prompt = f"""
         You are a strict competitor validation analyst.
-        Use live web search with Perplexity and validate only TRUE direct competitors.
+        Use live web search and validate only TRUE direct competitors.
 
     Target domain: {target_domain}
     Target context: {json.dumps(compact_context)}
@@ -46,6 +105,8 @@ async def _validate_same_niche_competitors_perplexity(
       "competitors": [
         {{
           "domain": "example.com",
+          "url": "https://example.com/",
+          "name": "Business name",
           "is_direct_competitor": true,
           "competitor_type": "independent_business",
           "niche_match": 0,
@@ -66,7 +127,8 @@ async def _validate_same_niche_competitors_perplexity(
             independent_business, marketplace, directory, social_profile, review_listing, media, other
         - Prefer independent_business.
         - Reject platforms/profiles/listings when they are not actual competing businesses.
-        - Do NOT base validation solely on Perplexity's returned `citations` or `search_results` lists; inspect live page context and exclude directories/OTAs/profiles unless they are genuine independent businesses.
+        - Use search results to verify the actual business homepage and business name.
+        - url must be the official homepage or best official business page, not a directory/profile route.
     - Exclude the target domain.
     - Max 5 domains.
         - is_direct_competitor must be true only for real same-niche alternatives.
@@ -76,10 +138,11 @@ async def _validate_same_niche_competitors_perplexity(
     - JSON only.
     """
 
-    response = await _call_perplexity_with_retry(
+    response = await _call_claude_web_search_with_retry(
         prompt,
         retry_once=False,
-        timeout_sec=12,
+        timeout_sec=28,
+        max_uses=5,
     )
     if not isinstance(response, dict):
         return []
@@ -99,18 +162,15 @@ async def _validate_same_niche_competitors_perplexity(
     for item in raw:
         if not isinstance(item, dict):
             continue
-        d = _normalize_domain(item.get("domain", ""))
+        normalized = _normalize_competitor_item(item, target_domain)
+        if not normalized:
+            continue
+        d = normalized["domain"]
         is_direct = bool(item.get("is_direct_competitor", False))
         competitor_type = str(item.get("competitor_type", "")).strip().lower()
         niche_match = item.get("niche_match") if isinstance(item.get("niche_match"), int) else 0
         model_match = item.get("business_model_match") if isinstance(item.get("business_model_match"), int) else 0
-        if (
-            not d
-            or d == target_domain
-            or _is_non_competitor_domain(d)
-            or _looks_like_platform_domain(d)
-            or d in seen
-        ):
+        if d in seen:
             continue
         if not is_direct:
             continue
@@ -118,21 +178,9 @@ async def _validate_same_niche_competitors_perplexity(
             continue
         if niche_match < 70 or model_match < 70:
             continue
-        score = item.get("score")
-        if not isinstance(score, int):
-            score = 60
-        score = max(0, min(100, score))
-        pos = item.get("position")
-        if not isinstance(pos, int) or pos < 1 or pos > 10:
-            pos = None
-        out.append(
-            {
-                "domain": d,
-                "position": pos,
-                "score": score,
-                "evidence": str(item.get("evidence", "")).strip()[:180],
-            }
-        )
+        normalized["score"] = max(normalized["score"], 55)
+        normalized["confidence"] = "verified"
+        out.append(normalized)
         seen.add(d)
         if len(out) >= 5:
             break
@@ -309,13 +357,15 @@ async def generate_deep_competitor_scores(
     if len(top_candidates) < 3:
         probe_text = " ; ".join([q.get("text", "") for q in questions[:5]])
         probe_prompt = (
-            f"Use Google Search and list domains that appear for these intents: {probe_text}. "
-            f"Target domain is {domain}. Return short text with domains only."
+            f"Use web search and list official business domains that are direct competitors for these intents: {probe_text}. "
+            f"Target domain is {domain}. Return JSON only: "
+            '{"competitors":[{"domain":"example.com","url":"https://example.com/","name":"Business name","evidence":"short reason"}]}'
         )
-        probe_response = await _call_perplexity_with_retry(
+        probe_response = await _call_claude_web_search_with_retry(
             probe_prompt,
             retry_once=False,
-            timeout_sec=10,
+            timeout_sec=24,
+            max_uses=4,
         )
         probe_domains = []
         if probe_response is not None:
@@ -349,7 +399,7 @@ async def generate_deep_competitor_scores(
     compact_questions = [q.get("text", "") for q in questions[:20]]
     prompt = f"""
     You are a market intelligence analyst.
-    Use live Google Search and these user-intent queries to identify direct competitors for the target.
+    Use live web search and these user-intent queries to identify direct competitors for the target.
 
     Target domain: '{domain}'
     Queries: {json.dumps(compact_questions)}
@@ -359,9 +409,12 @@ async def generate_deep_competitor_scores(
     {{
       "competitors": [
         {{
+          "name": "Business name",
           "domain": "example.com",
+          "url": "https://example.com/",
           "position": 1,
           "score": 0,
+          "confidence": "high",
           "evidence": "short reason"
         }}
       ]
@@ -371,30 +424,37 @@ async def generate_deep_competitor_scores(
     - Max 5 competitors.
     - Direct competitors only (same intent/category overlap).
     - Prefer independent business websites that users can choose instead of the target.
+    - Use the official business homepage or best official business URL.
+    - Do not return review/listing/profile/article URLs as competitor URLs.
     - Avoid platform/profile/listing style domains when they are not actual competing businesses.
     - Exclude target domain.
+    - name must be the competitor's public business name, not a route title.
+    - url must match the returned domain.
     - score must be integer 0..100.
     - position must be 1..10 or null.
     - JSON only.
     """
 
-    response = await _call_perplexity_with_retry(
+    response = await _call_claude_web_search_with_retry(
         prompt,
         retry_once=False,
-        timeout_sec=10,
+        timeout_sec=30,
+        max_uses=6,
     )
 
     if response is None:
         target_score = _estimate_target_visibility_score(seed_results)
         return [
-            *heuristic_scores,
             {
                 "domain": domain,
+                "url": _canonical_site_url(domain),
+                "name": _clean_business_name("", domain),
                 "position": None,
                 "score": target_score,
                 "evidence": "Your site score from visibility and rank consistency across analyzed prompts.",
+                "confidence": "target",
             },
-        ][:6]
+        ]
 
     parsed = response if isinstance(response, dict) else {}
     if not isinstance(parsed.get("competitors"), list):
@@ -403,44 +463,39 @@ async def generate_deep_competitor_scores(
             parsed = maybe
     raw = parsed.get("competitors", []) if isinstance(parsed, dict) else []
     if not isinstance(raw, list):
-        return heuristic_scores
+        target_score = _estimate_target_visibility_score(seed_results)
+        return [
+            {
+                "domain": domain,
+                "url": _canonical_site_url(domain),
+                "name": _clean_business_name("", domain),
+                "position": None,
+                "score": target_score,
+                "evidence": "Your site score from visibility and rank consistency across analyzed prompts.",
+                "confidence": "target",
+            },
+        ]
 
     out: list[dict] = []
     seen = set()
     for item in raw:
         if not isinstance(item, dict):
             continue
-        d = _normalize_domain(item.get("domain", ""))
-        if (
-            not d
-            or d == domain
-            or _is_non_competitor_domain(d)
-            or d in seen
-        ):
+        normalized = _normalize_competitor_item(item, domain)
+        if not normalized:
+            continue
+        d = normalized["domain"]
+        if d in seen:
             continue
         seen.add(d)
-        pos = item.get("position")
-        if not isinstance(pos, int) or pos < 1 or pos > 10:
-            pos = None
-        score = item.get("score")
-        if not isinstance(score, int):
-            score = 55
-        score = max(0, min(100, score))
-        out.append(
-            {
-                "domain": d,
-                "position": pos,
-                "score": score,
-                "evidence": str(item.get("evidence", "")).strip()[:180],
-            }
-        )
+        out.append(normalized)
         if len(out) >= 5:
             break
 
     combined_pool = list(dict.fromkeys([*top_candidates, *[c.get("domain", "") for c in out], *[h.get("domain", "") for h in heuristic_scores]]))
     combined_pool = [d for d in combined_pool if isinstance(d, str) and d and d != domain and not _is_non_competitor_domain(d) and not _looks_like_platform_domain(d)][:30]
 
-    validated = await _validate_same_niche_competitors_perplexity(
+    validated = await _validate_same_niche_competitors_claude(
         target_domain=domain,
         target_context=await _fetch_page_context(url),
         query_texts=compact_questions,
@@ -450,21 +505,10 @@ async def generate_deep_competitor_scores(
     validated_filtered: list[dict] = []
     if isinstance(validated, list):
         for v in validated:
-            if not isinstance(v, dict):
-                continue
-            try:
-                niche = int(v.get("niche_match", 0))
-                bm = int(v.get("business_model_match", 0))
-            except Exception:
-                niche = int(v.get("niche_match", 0) or 0)
-                bm = int(v.get("business_model_match", 0) or 0)
-            if v.get("is_direct_competitor") and niche >= 70 and bm >= 70:
-                validated_filtered.append({
-                    "domain": _normalize_domain(v.get("domain", "")),
-                    "position": v.get("position"),
-                    "score": max(0, min(100, int(v.get("score", 60) or 60))),
-                    "evidence": str(v.get("evidence", "")).strip()[:200],
-                })
+            normalized = _normalize_competitor_item(v, domain)
+            if normalized:
+                normalized["confidence"] = v.get("confidence") or "verified"
+                validated_filtered.append(normalized)
 
     desired_external = 4
     final_competitors: list[dict] = []
@@ -472,110 +516,31 @@ async def generate_deep_competitor_scores(
     if validated_filtered:
         final_competitors = validated_filtered[:desired_external]
     else:
-        def _pick_from_pool(pool: list[dict], limit: int) -> list[dict]:
-            picked: list[dict] = []
-            for item in (pool or []):
-                if not isinstance(item, dict):
-                    continue
-                d = _normalize_domain(item.get("domain", "") or "")
-                if not d or d == domain or _is_non_competitor_domain(d) or _looks_like_platform_domain(d):
-                    continue
-                entry = dict(item)
-                if "confidence" not in entry:
-                    entry["confidence"] = "low"
-                entry["evidence"] = (str(entry.get("evidence", "")).strip() + " (low confidence, unvalidated)").strip()
-                if d in [c.get("domain") for c in picked]:
-                    continue
-                picked.append(entry)
-                if len(picked) >= limit:
-                    break
-            return picked
-
-        final_competitors.extend(_pick_from_pool(out, desired_external))
-        if len(final_competitors) < desired_external:
-            final_competitors.extend(_pick_from_pool(heuristic_scores, desired_external - len(final_competitors)))
-
-        if len(final_competitors) < desired_external:
-            for cand in top_candidates:
-                if len(final_competitors) >= desired_external:
-                    break
-                if not cand:
-                    continue
-                nd = _normalize_domain(cand)
-                if not nd or nd == domain or _is_non_competitor_domain(nd) or _looks_like_platform_domain(nd):
-                    continue
-                if nd in [c.get("domain") for c in final_competitors]:
-                    continue
-                final_competitors.append({
-                    "domain": nd,
-                    "position": None,
-                    "score": 50,
-                    "evidence": "Appeared in first-pass visibility signals (low confidence)",
-                    "confidence": "low",
-                })
-
-    final_competitors = final_competitors[:desired_external]
-
-    if len(final_competitors) < desired_external:
-        need = desired_external - len(final_competitors)
-        probe_prompt = (
-            f"List up to {need} domains (one per line) that are direct competitors for the "
-            f"target '{domain}' given these user-intent queries: {json.dumps(compact_questions[:8])}. "
-            "Return domains only, short text."
-        )
-        probe_resp = await _call_perplexity_with_retry(probe_prompt, retry_once=False, timeout_sec=8)
-        new_domains: list[str] = []
-        if probe_resp is not None:
-            if isinstance(probe_resp, dict):
-                new_domains.extend(probe_resp.get("_meta_source_domains", []) or [])
-                new_domains.extend(_extract_domains_from_text(str(probe_resp.get("_meta_response_text") or "")))
-            else:
-                new_domains.extend(_extract_domains_from_text(str(probe_resp)))
-
-        for nd in new_domains:
-            ndn = _normalize_domain(nd)
-            if not ndn or ndn == domain or _is_non_competitor_domain(ndn) or _looks_like_platform_domain(ndn):
+        for item in out:
+            if not isinstance(item, dict):
                 continue
-            if ndn in [c.get("domain") for c in final_competitors]:
+            normalized = _normalize_competitor_item(item, domain)
+            if not normalized:
                 continue
-            final_competitors.append({
-                "domain": ndn,
-                "position": None,
-                "score": 45,
-                "evidence": "Discovered by additional probe fallback (low confidence)",
-                "confidence": "low",
-            })
+            normalized["confidence"] = normalized.get("confidence") or "claude-discovered"
+            if normalized["domain"] in [c.get("domain") for c in final_competitors]:
+                continue
+            final_competitors.append(normalized)
             if len(final_competitors) >= desired_external:
                 break
 
-    if len(final_competitors) < desired_external:
-        need = desired_external - len(final_competitors)
-        root = (domain.split(".")[0] if domain else "competitor")
-        i = 1
-        while need > 0:
-            gen = f"{root}-alt-{i}.com"
-            i += 1
-            gnd = _normalize_domain(gen)
-            if not gnd or gnd == domain or _is_non_competitor_domain(gnd) or _looks_like_platform_domain(gnd):
-                continue
-            if gnd in [c.get("domain") for c in final_competitors]:
-                continue
-            final_competitors.append({
-                "domain": gnd,
-                "position": None,
-                "score": 30,
-                "evidence": "Auto-generated fallback (very low confidence)",
-                "confidence": "generated",
-            })
-            need -= 1
+    final_competitors = final_competitors[:desired_external]
 
     target_score = _estimate_target_visibility_score(seed_results)
     final_competitors.append(
         {
             "domain": domain,
+            "url": _canonical_site_url(domain),
+            "name": _clean_business_name("", domain),
             "position": None,
             "score": target_score,
             "evidence": "Your site score from visibility and rank consistency across analyzed prompts.",
+            "confidence": "target",
         }
     )
 

@@ -2774,9 +2774,12 @@ async def _process_phase5_job(job_doc: dict):
         # Append target site with the fully accurate score
         deep_competitors.append({
             "domain": domain,
+            "url": f"https://{domain}/" if domain else job_doc["url"],
+            "name": domain.split(".")[0].replace("-", " ").title() if domain else "Your site",
             "position": None,
             "score": target_score,
             "evidence": "Your site score from visibility and rank consistency across analyzed prompts.",
+            "confidence": "target",
         })
 
         # Generate accurate brand summary now that questions are finished

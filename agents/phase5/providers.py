@@ -478,6 +478,121 @@ async def _call_claude_chat_json(prompt: str, timeout_sec: int | None = None) ->
         return None
 
 
+async def _call_claude_web_search_json(
+    prompt: str,
+    timeout_sec: int | None = None,
+    max_uses: int = 5,
+) -> dict | None:
+    api_key = get_anthropic_api_key()
+    model = get_anthropic_model_name()
+    anthropic_version = (os.getenv("ANTHROPIC_VERSION") or "2023-06-01").strip()
+    effective_timeout = max(12, timeout_sec if isinstance(timeout_sec, int) else ANTHROPIC_PHASE5_TIMEOUT_SEC)
+
+    payload = {
+        "model": model,
+        "max_tokens": 1400,
+        "temperature": 0,
+        "system": "You are a strict JSON market research assistant. Search the web when needed. Return only valid JSON.",
+        "messages": [{"role": "user", "content": prompt}],
+        "tools": [
+            {
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": max(1, min(10, int(max_uses or 5))),
+            }
+        ],
+    }
+
+    try:
+        started = asyncio.get_running_loop().time()
+        _log_provider_started_once("Claude Web Search", model)
+        async with httpx.AsyncClient(timeout=effective_timeout) as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": anthropic_version,
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        if response.status_code == 429:
+            raise Phase5RateLimitError("Claude rate limit reached. Please retry shortly.")
+        response.raise_for_status()
+        body = response.json()
+
+        parts: list[str] = []
+        citation_urls: list[str] = []
+        citation_domains: list[str] = []
+
+        content = body.get("content") if isinstance(body, dict) else None
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type == "text":
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text)
+                    citations = item.get("citations")
+                    if isinstance(citations, list):
+                        for citation in citations:
+                            if not isinstance(citation, dict):
+                                continue
+                            url = str(citation.get("url") or "").strip()
+                            if url.startswith("http://") or url.startswith("https://"):
+                                citation_urls.append(url)
+                                d = _normalize_domain(url)
+                                if d:
+                                    citation_domains.append(d)
+                elif item_type == "web_search_tool_result":
+                    results = item.get("content")
+                    if isinstance(results, list):
+                        for result in results:
+                            if not isinstance(result, dict):
+                                continue
+                            url = str(result.get("url") or "").strip()
+                            if url.startswith("http://") or url.startswith("https://"):
+                                citation_urls.append(url)
+                                d = _normalize_domain(url)
+                                if d:
+                                    citation_domains.append(d)
+
+        text = "\n".join(parts).strip()
+        parsed = _safe_json_parse(text)
+        parsed_dict = parsed if isinstance(parsed, dict) else {}
+        if text:
+            parsed_dict["_meta_response_text"] = text[:5000]
+            text_domains = _extract_domains_from_text(text)
+            if text_domains:
+                citation_domains.extend(text_domains)
+        if citation_domains:
+            parsed_dict["_meta_source_domains"] = list(dict.fromkeys(citation_domains))
+        if citation_urls:
+            parsed_dict["_meta_source_urls"] = list(dict.fromkeys(citation_urls))
+        elapsed = asyncio.get_running_loop().time() - started
+        _log_provider_healthy_once("Claude Web Search", model, elapsed)
+        return parsed_dict
+    except Phase5RateLimitError:
+        raise
+    except Exception as e:
+        if _is_rate_limited_error(e):
+            raise Phase5RateLimitError("Claude rate limit reached. Please retry shortly.") from e
+        try:
+            elapsed = asyncio.get_running_loop().time() - started
+            print(f"[Phase5][Claude Web Search] model={model} failed in {elapsed:.2f}s: {type(e).__name__}")
+        except Exception:
+            pass
+        if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+            try:
+                print(f"[Phase5][Claude Web Search] error body: {e.response.text[:500]}")
+            except Exception:
+                pass
+        print(f"[Phase5][Claude Web Search] call failed: {e}")
+        return None
+
+
 async def _call_openai_with_retry(prompt: str, retry_once: bool = True, timeout_sec: int | None = None) -> dict | None:
     first = await _call_openai_chat_json(prompt, timeout_sec=timeout_sec)
     if first is not None:
@@ -503,3 +618,17 @@ async def _call_claude_with_retry(prompt: str, retry_once: bool = True, timeout_
     if not retry_once:
         return None
     return await _call_claude_chat_json(prompt, timeout_sec=timeout_sec)
+
+
+async def _call_claude_web_search_with_retry(
+    prompt: str,
+    retry_once: bool = True,
+    timeout_sec: int | None = None,
+    max_uses: int = 5,
+) -> dict | None:
+    first = await _call_claude_web_search_json(prompt, timeout_sec=timeout_sec, max_uses=max_uses)
+    if first is not None:
+        return first
+    if not retry_once:
+        return None
+    return await _call_claude_web_search_json(prompt, timeout_sec=timeout_sec, max_uses=max_uses)
