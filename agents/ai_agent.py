@@ -598,14 +598,67 @@ async def get_ai_insights_openai(business_name: str, url: str) -> dict:
         }, fallback_model)
 
 
+async def get_ai_insights_claude(business_name: str, url: str) -> dict:
+    prompt = f"""
+    You are an AI research assistant. A user has a local business or website and wants to know what is known online.
+    The business name is "{business_name}" and website is "{url}".
+
+    Respond in valid JSON with this exact shape:
+    {{
+      "modelName": "Claude",
+      "isKnown": true or false,
+      "summary": "3-4 sentences summarizing what is known.",
+      "sentiment": "Positive" | "Neutral" | "Negative" | "Mixed" | "Unknown",
+      "platforms": ["Google", "Reddit", "YouTube", "Wikipedia"],
+      "evidence": ["4-8 bullet points with specific external facts or mentions"]
+    }}
+
+    Rules:
+    - Keep summary and evidence at medium detail, matching a concise analyst brief.
+    - Prefer externally verifiable mentions over generic claims.
+    - Return exactly 4-8 evidence bullets.
+    - JSON only.
+    """
+    try:
+        parsed, model = await _anthropic_chat_json(
+            prompt=prompt,
+            timeout_seconds=90,
+        )
+        if not isinstance(parsed, dict):
+            parsed = {}
+        return _normalize_insight_payload(parsed, model)
+    except Exception as e:
+        print(f"Error fetching Claude insights: {e}")
+        fallback_model = _anthropic_model_name()
+        return _normalize_insight_payload({
+            "isKnown": False,
+            "summary": "Failed to fetch AI insights.",
+            "sentiment": "Unknown",
+            "platforms": [],
+            "evidence": [],
+        }, fallback_model)
+
+
 async def get_ai_insights_multi(business_name: str, url: str) -> list[dict]:
     perplexity_task = get_ai_insights(business_name, url)
     gpt_task = get_ai_insights_openai(business_name, url)
-    results = await asyncio.gather(perplexity_task, gpt_task, return_exceptions=True)
+    claude_task = get_ai_insights_claude(business_name, url)
+    results = await asyncio.gather(perplexity_task, gpt_task, claude_task, return_exceptions=True)
     insights: list[dict] = []
     for r in results:
         if isinstance(r, dict):
             insights.append(r)
+    
+    # Append Gemini as a disabled placeholder
+    insights.append({
+        "modelName": "Gemini",
+        "isKnown": False,
+        "summary": "Google Gemini integration is temporarily offline for maintenance.",
+        "sentiment": "Unknown",
+        "platforms": [],
+        "evidence": [],
+        "status": "disabled"
+    })
     return insights
 
 async def get_vision_extraction(screenshot_bytes: bytes) -> dict:

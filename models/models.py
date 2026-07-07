@@ -167,3 +167,4 @@ class BusinessResponse(BaseModel):
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     latest_scrape_result: Optional[Dict[str, Any]] = None
+    scores_history: Optional[List[Dict[str, Any]]] = None

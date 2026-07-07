@@ -557,6 +557,7 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
         "latest_scrape_result": doc.get("latest_scrape_result"),
+        "scores_history": doc.get("scores_history") or [],
     }
 
 
@@ -647,14 +648,23 @@ async def _upsert_user_business(
     else:
         query = {"user_id": current_user["id"], "normalized_domain": normalized_domain}
 
+    update_doc = {
+        "$set": set_fields,
+        "$setOnInsert": {
+            "created_at": now_iso,
+        },
+    }
+    if phase1_score is not None:
+        update_doc["$push"] = {
+            "scores_history": {
+                "timestamp": now_iso,
+                "score": int(phase1_score)
+            }
+        }
+
     return await businesses_col.find_one_and_update(
         query,
-        {
-            "$set": set_fields,
-            "$setOnInsert": {
-                "created_at": now_iso,
-            },
-        },
+        update_doc,
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
@@ -1645,6 +1655,8 @@ async def api_ai_insights(
                 provider_hint = "openai"
             elif any(k in lowered_model for k in ["pplx", "sonar", "perplexity"]):
                 provider_hint = "perplexity"
+            elif "claude" in lowered_model:
+                provider_hint = "anthropic"
             else:
                 provider_hint = "gemini"
             await _log_ai_usage_event({
@@ -2908,8 +2920,83 @@ async def _phase5_try_start_immediately(job_id: str) -> None:
         traceback.print_exc()
 
 
+def seconds_until_next_sunday_4am() -> float:
+    now = datetime.now()
+    days_until_sunday = 6 - now.weekday()
+    if days_until_sunday == 0:
+        if now.hour >= 4:
+            days_until_sunday = 7
+            
+    target = datetime(
+        now.year, now.month, now.day, 4, 0, 0, 0
+    ) + timedelta(days=days_until_sunday)
+    
+    diff = target - now
+    return max(1.0, diff.total_seconds())
+
+
+async def sunday_analyzer_scheduler():
+    print("[Scheduler] Weekly Sunday 4:00 AM analyzer task started")
+    await asyncio.sleep(15)
+    while True:
+        sleep_sec = seconds_until_next_sunday_4am()
+        hours_val = round(sleep_sec / 3600.0, 2)
+        print(f"[Scheduler] Sleeping for {sleep_sec} seconds (approx {hours_val} hours) until next Sunday 4:00 AM")
+        await asyncio.sleep(sleep_sec)
+        
+        print("[Scheduler] It is Sunday 4:00 AM. Starting sequential Phase 1 crawl queue...")
+        try:
+            if businesses_col is not None:
+                cursor = businesses_col.find({})
+                all_businesses = await cursor.to_list(length=10000)
+                print(f"[Scheduler] Found {len(all_businesses)} businesses to crawl.")
+                
+                for biz_doc in all_businesses:
+                    url = biz_doc.get("url")
+                    user_id = biz_doc.get("user_id")
+                    business_id = str(biz_doc.get("_id"))
+                    
+                    if not url or not user_id:
+                        continue
+                        
+                    user_mock = {
+                        "id": user_id,
+                        "email": biz_doc.get("user_email") or ""
+                    }
+                    
+                    print(f"[Scheduler] Running auto scrape for {url} (user: {user_id}, business: {business_id})...")
+                    try:
+                        result = await asyncio.wait_for(
+                            asyncio.to_thread(_run_scrape_worker, url),
+                            timeout=420
+                        )
+                        if isinstance(result, dict):
+                            await _upsert_user_business(
+                                current_user=user_mock,
+                                url=url,
+                                category=biz_doc.get("category"),
+                                location=biz_doc.get("location"),
+                                business_name=result.get("businessName"),
+                                logo_url=result.get("logoUrl"),
+                                phase1_score=((result.get("scores") or {}).get("total") if isinstance(result.get("scores"), dict) else None),
+                                business_id=business_id,
+                                scrape_result=result,
+                            )
+                            print(f"[Scheduler] Completed auto scrape for {url}")
+                    except Exception as scrape_err:
+                        print(f"[Scheduler] Auto scrape failed for {url}: {scrape_err}")
+                        
+                    await asyncio.sleep(5)
+            else:
+                print("[Scheduler] businesses_col is None, skipping cron crawl")
+        except Exception as run_err:
+            print(f"[Scheduler] Exception in auto crawler queue execution: {run_err}")
+
+
 @app.on_event("startup")
 async def _phase5_worker_startup():
+    asyncio.create_task(sunday_analyzer_scheduler())
+
     if phase5_jobs_col is None:
         app.state.phase5_worker_tasks = []
         return
