@@ -2361,7 +2361,52 @@ async def api_phase5_generate_questions(
     current_user: dict = Depends(get_current_user_optional),
 ):
     try:
-        questions = await generate_brand_questions(req.url)
+        business_doc = None
+        if current_user and businesses_col is not None and req.business_id:
+            try:
+                business_doc = await businesses_col.find_one({
+                    "_id": ObjectId(req.business_id),
+                    "user_id": current_user["id"],
+                })
+            except Exception:
+                business_doc = None
+
+        def _first_text(*values):
+            for value in values:
+                text = str(value or "").strip()
+                if text:
+                    return text
+            return ""
+
+        business_context = {
+            "name": _first_text(
+                req.businessName,
+                business_doc.get("businessName") if business_doc else "",
+                business_doc.get("name") if business_doc else "",
+                business_doc.get("normalized_domain") if business_doc else "",
+            ),
+            "category": _first_text(
+                req.category,
+                business_doc.get("category") if business_doc else "",
+            ),
+            "location": _first_text(
+                req.location,
+                business_doc.get("location") if business_doc else "",
+            ),
+            "description": _first_text(
+                req.description,
+                business_doc.get("businessDescription") if business_doc else "",
+                business_doc.get("aiDescription") if business_doc else "",
+                business_doc.get("description") if business_doc else "",
+            ),
+            "services": (
+                req.services
+                or (business_doc.get("services") if business_doc else [])
+                or []
+            ),
+        }
+
+        questions = await generate_brand_questions(req.url, business_context=business_context)
         configured_model = (os.getenv("PERPLEXITY_MODEL_PHASE5") or "sonar-pro").strip() or None
         await _log_ai_usage_event({
             "feature": "phase5_generate_questions",
@@ -2374,6 +2419,12 @@ async def api_phase5_generate_questions(
             "ai_calls_estimate": 1,
             "details": {
                 "questions_count": len(questions or []),
+                "branded_questions_count": 5,
+                "non_branded_questions_count": 15,
+                "business_id": req.business_id,
+                "has_saved_business_context": bool(business_doc),
+                "has_category": bool(business_context.get("category")),
+                "has_location": bool(business_context.get("location")),
             },
         })
         return {"questions": questions}
@@ -2381,7 +2432,7 @@ async def api_phase5_generate_questions(
         print(f"[Phase5] generate-questions validation failed: {str(e)}")
         raise HTTPException(
             status_code=503,
-            detail="Questions cannot be generated at this moment. Please try again.",
+            detail=str(e),
         )
     except Exception as e:
         traceback.print_exc()

@@ -20,7 +20,13 @@ def compute_provider_score(results: dict, provider: str) -> dict:
         pdata = pdata if isinstance(pdata, dict) else {}
 
         status = str(pdata.get("status") or "")
-        mentioned = bool(pdata.get("mentioned") or status == "Mentioned")
+        target_site = pdata.get("target_site") if isinstance(pdata.get("target_site"), dict) else {}
+        target_site_status = str(target_site.get("status") or "").strip().lower()
+        mentioned = bool(
+            pdata.get("mentioned")
+            or status == "Mentioned"
+            or target_site_status == "matched"
+        )
         position_raw = pdata.get("position")
         position = position_raw if isinstance(position_raw, int) else None
         cited = bool(

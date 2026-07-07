@@ -1,8 +1,14 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 
 class Phase5QuestionsRequest(BaseModel):
     url: str
+    businessName: Optional[str] = None
+    category: Optional[str] = None
+    location: Optional[str] = None
+    description: Optional[str] = None
+    services: List[str] = Field(default_factory=list)
+    business_id: Optional[str] = None
 
 class Phase5QuestionsResponse(BaseModel):
     questions: List[str]
