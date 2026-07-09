@@ -418,6 +418,26 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
     business_name = re.sub(r'\s*[|\-–—]\s*.+$', '', business_name)
     business_name = re.sub(r'\s+(home|welcome|official site|official website)$', '', business_name, flags=re.I).strip()
 
+    # Clean up blocked/WAF titles or default page title errors (e.g. Access Denied, 403 Forbidden)
+    lower_name = business_name.lower().strip()
+    blocked_keywords = [
+        "access denied", "cloudflare", "403 forbidden", "forbidden", 
+        "page blocked", "attention required", "security check", 
+        "just a moment", "site block", "blocked", "access-denied",
+        "error 403", "403 error", "http error 403", "forbidden error",
+        "waf block", "ddos protection", "checking your browser"
+    ]
+    is_blocked = not business_name or any(kw in lower_name for kw in blocked_keywords)
+    if is_blocked:
+        domain_parts = base_domain.replace("www.", "").split(".")
+        if len(domain_parts) > 1:
+            guessed_name = domain_parts[0]
+            # Replace hyphens/underscores and capitalize words
+            guessed_name = " ".join(word.capitalize() for word in re.split(r'[-_]', guessed_name))
+        else:
+            guessed_name = "Business Profile"
+        business_name = guessed_name
+
     description = ""
     for s in schemas:
         if isinstance(s, dict) and s.get('description'):
@@ -425,6 +445,11 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
             break
     if not description:
         description = raw_meta.get('description') or raw_meta.get('og:description') or raw_meta.get('twitter:description') or ''
+
+    # Clean up description if WAF blocked or empty
+    lower_desc = description.lower().strip()
+    if not description or any(kw in lower_desc for kw in blocked_keywords):
+        description = f"Official website for {business_name}."
 
     phones = set()
     for s_doc in all_soups:
