@@ -442,9 +442,13 @@ async def generate_deep_competitor_scores(
         max_uses=6,
     )
 
-    if response is None:
+    def _with_target(items: list[dict]) -> list[dict]:
         target_score = _estimate_target_visibility_score(seed_results)
-        return [
+        final = [
+            item for item in items
+            if isinstance(item, dict) and _normalize_domain(item.get("domain", "")) != domain
+        ][:4]
+        final.append(
             {
                 "domain": domain,
                 "url": _canonical_site_url(domain),
@@ -453,8 +457,12 @@ async def generate_deep_competitor_scores(
                 "score": target_score,
                 "evidence": "Your site score from visibility and rank consistency across analyzed prompts.",
                 "confidence": "target",
-            },
-        ]
+            }
+        )
+        return final
+
+    if response is None:
+        return _with_target(heuristic_scores)
 
     parsed = response if isinstance(response, dict) else {}
     if not isinstance(parsed.get("competitors"), list):
@@ -463,18 +471,7 @@ async def generate_deep_competitor_scores(
             parsed = maybe
     raw = parsed.get("competitors", []) if isinstance(parsed, dict) else []
     if not isinstance(raw, list):
-        target_score = _estimate_target_visibility_score(seed_results)
-        return [
-            {
-                "domain": domain,
-                "url": _canonical_site_url(domain),
-                "name": _clean_business_name("", domain),
-                "position": None,
-                "score": target_score,
-                "evidence": "Your site score from visibility and rank consistency across analyzed prompts.",
-                "confidence": "target",
-            },
-        ]
+        return _with_target(heuristic_scores)
 
     out: list[dict] = []
     seen = set()

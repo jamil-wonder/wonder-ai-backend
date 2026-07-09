@@ -861,6 +861,140 @@ async def generate_seo_blog(
     }
 
 
+def _normalize_content_page_sections(sections: list) -> list[dict]:
+    normalized: list[dict] = []
+    fallback_headings = ["Overview", "Services", "Location", "Why choose this business", "Trust signals"]
+    for idx, section in enumerate(sections if isinstance(sections, list) else []):
+        if not isinstance(section, dict):
+            continue
+        heading = str(section.get("heading") or fallback_headings[min(idx, len(fallback_headings) - 1)]).strip()
+        body = str(section.get("body") or section.get("content") or "").strip()
+        if not heading or not body:
+            continue
+        normalized.append({
+            "heading": heading[:140],
+            "body": body,
+        })
+    return normalized
+
+
+def _normalize_content_page_faqs(faqs: list) -> list[dict]:
+    normalized: list[dict] = []
+    for faq in faqs if isinstance(faqs, list) else []:
+        if not isinstance(faq, dict):
+            continue
+        question = str(faq.get("question") or "").strip()
+        answer = str(faq.get("answer") or "").strip()
+        if question and answer:
+            normalized.append({"question": question[:180], "answer": answer})
+    return normalized[:6]
+
+
+async def generate_content_page(
+    *,
+    business_context: dict,
+    selected_model: str = "claude",
+) -> dict:
+    safe_context = {
+        "url": business_context.get("url"),
+        "businessName": business_context.get("businessName"),
+        "category": business_context.get("category"),
+        "location": business_context.get("location"),
+        "businessDescription": business_context.get("businessDescription"),
+        "aiDescription": business_context.get("aiDescription"),
+        "services": business_context.get("services") or [],
+        "targetAudience": business_context.get("targetAudience"),
+        "competitors": business_context.get("competitors") or [],
+        "scanData": business_context.get("scanData") or {},
+        "promptContext": business_context.get("promptContext") or {},
+    }
+    prompt = f"""
+    You are a senior SEO content strategist for Wonderscore.
+    Generate a useful, factual, extractability-optimized website page for this business.
+
+    Business and scan context:
+    {json.dumps(safe_context, ensure_ascii=False)[:18000]}
+
+    Return strict JSON only with this exact shape:
+    {{
+      "pageTitle": "clear H1 page title",
+      "metaTitle": "SEO title, 50-65 characters",
+      "metaDescription": "SEO meta description, 140-165 characters",
+      "sections": [
+        {{"heading": "H2 heading", "body": "plain-English section copy"}}
+      ],
+      "faqs": [
+        {{"question": "customer search question", "answer": "accurate answer based only on known facts"}}
+      ],
+      "factsUsed": ["fact from profile or scan"],
+      "warnings": ["fact-check warning or missing information note"]
+    }}
+
+    Rules:
+    - Write for non-technical customers and AI answer engines.
+    - Use the exact business location and category when available.
+    - Do not invent awards, prices, menus, facilities, opening hours, reviews, or claims.
+    - If a fact is missing, mention it in warnings instead of inventing it.
+    - Make the page specific enough to publish after human fact-checking.
+    - Include 4 to 6 sections and 3 to 5 FAQs.
+    - Keep section bodies concise, useful, and not salesy.
+    - Do not include markdown fences. JSON only.
+    """
+    parsed, model, provider = await _blog_model_json(
+        provider=selected_model,
+        prompt=prompt,
+        timeout_seconds=130,
+        max_tokens=5200,
+    )
+    sections = _normalize_content_page_sections(parsed.get("sections") if isinstance(parsed, dict) else [])
+    faqs = _normalize_content_page_faqs(parsed.get("faqs") if isinstance(parsed, dict) else [])
+    facts_used = [
+        str(item).strip()
+        for item in (parsed.get("factsUsed") if isinstance(parsed.get("factsUsed"), list) else [])
+        if str(item).strip()
+    ][:12]
+    warnings = [
+        str(item).strip()
+        for item in (parsed.get("warnings") if isinstance(parsed.get("warnings"), list) else [])
+        if str(item).strip()
+    ][:8]
+
+    business_name = str(safe_context.get("businessName") or safe_context.get("url") or "Business").strip()
+    page_title = str(parsed.get("pageTitle") or f"{business_name} guide").strip()
+    meta_title = str(parsed.get("metaTitle") or page_title).strip()[:90]
+    meta_description = str(parsed.get("metaDescription") or "").strip()[:220]
+    output_parts = [
+        f"Page title: {page_title}",
+        f"Meta title: {meta_title}",
+        f"Meta description: {meta_description}",
+        "",
+        "Fact-check before publishing:",
+        *(warnings or ["Review all business facts before publishing this page."]),
+        "",
+    ]
+    for section in sections:
+        output_parts.extend([f"## {section['heading']}", "", section["body"], ""])
+    if faqs:
+        output_parts.extend(["## FAQ", ""])
+        for faq in faqs:
+            output_parts.extend([f"### {faq['question']}", faq["answer"], ""])
+    if facts_used:
+        output_parts.extend(["Facts used:", *[f"- {fact}" for fact in facts_used]])
+
+    return {
+        "pageTitle": page_title,
+        "metaTitle": meta_title,
+        "metaDescription": meta_description,
+        "sections": sections,
+        "faqs": faqs,
+        "factsUsed": facts_used,
+        "warnings": warnings or ["Review all business facts before publishing this page."],
+        "outputText": "\n".join(output_parts).strip(),
+        "modelUsed": model,
+        "provider": provider,
+    }
+
+
 async def rewrite_blog_section(
     *,
     title: str,

@@ -27,12 +27,18 @@ from models import (
     BlogRewriteSectionResponse,
     BlogSection,
     BlogUsageResponse,
+    ContentPageGeneratorRequest,
+    ContentPageGeneratorResponse,
+    CompetitorTrackingRunRequest,
+    CompetitorTrackingRunResponse,
+    CompetitorTrackingStatusResponse,
 )
 from scraping.scraper import scrape_website
 from agents.ai_agent import (
     get_ai_insights_multi,
     get_blog_analysis_perplexity,
     generate_seo_blog,
+    generate_content_page,
     rewrite_blog_section,
 )
 from models.phase2_models import CompareRequest, CompareResult
@@ -150,6 +156,8 @@ ai_usage_col = None
 user_history_meta_col = None
 businesses_col = None
 public_rate_limits_col = None
+generated_content_pages_col = None
+competitor_tracking_runs_col = None
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
     db = mongo_client.get_database("wonderai")
@@ -157,6 +165,8 @@ try:
     urls_col = db.get_collection("urls")
     users_col = db.get_collection("users")
     businesses_col = db.get_collection("businesses")
+    generated_content_pages_col = db.get_collection("generated_content_pages")
+    competitor_tracking_runs_col = db.get_collection("competitor_tracking_runs")
     phase5_jobs_col = db.get_collection("phase5_jobs")
     ai_usage_col = db.get_collection("ai_usage_events")
     user_history_meta_col = db.get_collection("user_history_meta")
@@ -551,6 +561,7 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "services": doc.get("services") if isinstance(doc.get("services"), list) else [],
         "targetAudience": doc.get("targetAudience"),
         "competitors": doc.get("competitors") if isinstance(doc.get("competitors"), list) else [],
+        "systemCompetitors": doc.get("systemCompetitors") if isinstance(doc.get("systemCompetitors"), list) else [],
         "trackedPages": doc.get("trackedPages") if isinstance(doc.get("trackedPages"), list) else [],
         "latest_phase1_score": doc.get("latest_phase1_score"),
         "latest_phase5_score": doc.get("latest_phase5_score"),
@@ -559,6 +570,233 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "latest_scrape_result": doc.get("latest_scrape_result"),
         "scores_history": doc.get("scores_history") or [],
     }
+
+
+def _public_tracking_run_doc(doc: dict | None) -> dict | None:
+    if not doc:
+        return None
+    out = dict(doc)
+    out["id"] = str(out.pop("_id", ""))
+    out["business_id"] = str(out.get("business_id") or "")
+    out["competitors"] = out.get("competitors") if isinstance(out.get("competitors"), list) else []
+    out["tracked_competitors"] = out.get("tracked_competitors") if isinstance(out.get("tracked_competitors"), list) else []
+    out["questions"] = out.get("questions") if isinstance(out.get("questions"), list) else []
+    return out
+
+
+def _build_tracking_fallback_questions(business_doc: dict) -> list[dict]:
+    name = str(business_doc.get("businessName") or business_doc.get("normalized_domain") or "this business").strip()
+    category = str(business_doc.get("category") or "business").strip()
+    location = str(business_doc.get("location") or "local area").strip()
+    services = business_doc.get("services") if isinstance(business_doc.get("services"), list) else []
+    service_text = ", ".join([str(s).strip() for s in services if str(s).strip()][:3]) or category
+    raw_questions = [
+        f"What are the best {category} options in {location}?",
+        f"Which {category} in {location} is most recommended?",
+        f"Who offers {service_text} in {location}?",
+        f"Is {name} recommended for {category} in {location}?",
+        f"What do reviews say about {name}?",
+        f"Which businesses compete with {name} for {category} customers in {location}?",
+    ]
+    return [{"id": f"track-{idx + 1}", "text": text} for idx, text in enumerate(raw_questions)]
+
+
+async def _run_competitor_tracking_for_business(
+    *,
+    business_doc: dict,
+    current_user: dict,
+) -> dict:
+    if competitor_tracking_runs_col is None:
+        raise HTTPException(status_code=503, detail="competitor tracking storage unavailable")
+
+    business_id = str(business_doc["_id"])
+    url = business_doc.get("url") or business_doc.get("normalized_domain") or ""
+    target_domain = _normalize_site(url)
+    if not target_domain:
+        raise HTTPException(status_code=400, detail="Business URL is required before tracking competitors")
+
+    tracked_competitors = []
+    seen_tracked: set[str] = set()
+    for item in business_doc.get("competitors") or []:
+        domain = _normalize_site(str(item or ""))
+        if domain and domain != target_domain and domain not in seen_tracked:
+            seen_tracked.add(domain)
+            tracked_competitors.append(domain)
+        if len(tracked_competitors) >= 5:
+            break
+
+    business_context = {
+        "name": business_doc.get("businessName") or business_doc.get("normalized_domain") or target_domain,
+        "category": business_doc.get("category") or "",
+        "location": business_doc.get("location") or "",
+        "description": business_doc.get("aiDescription") or business_doc.get("businessDescription") or "",
+        "services": business_doc.get("services") if isinstance(business_doc.get("services"), list) else [],
+    }
+
+    questions: list[dict]
+    try:
+        generated_questions = await generate_brand_questions(url, business_context=business_context)
+        questions = [
+            {"id": f"track-{idx + 1}", "text": str(text)}
+            for idx, text in enumerate((generated_questions or [])[:20])
+            if str(text or "").strip()
+        ]
+    except Exception as e:
+        print(f"[CompetitorTracking] question generation fallback business_id={business_id}: {e}")
+        questions = _build_tracking_fallback_questions(business_doc)
+
+    started_at = datetime.utcnow().isoformat()
+    run_doc = {
+        "run_id": uuid.uuid4().hex,
+        "business_id": business_id,
+        "user_id": current_user["id"],
+        "user_email": current_user.get("email"),
+        "url": url,
+        "target_domain": target_domain,
+        "status": "running",
+        "tracked_competitors": tracked_competitors,
+        "questions": questions,
+        "created_at": started_at,
+        "updated_at": started_at,
+    }
+    insert_result = await competitor_tracking_runs_col.insert_one(run_doc)
+
+    try:
+        discovered = await generate_deep_competitor_scores(
+            url=url,
+            questions=questions,
+            seed_results={},
+        )
+
+        previous = await competitor_tracking_runs_col.find_one(
+            {
+                "business_id": business_id,
+                "user_id": current_user["id"],
+                "status": "completed",
+                "_id": {"$ne": insert_result.inserted_id},
+            },
+            sort=[("created_at", -1)],
+        )
+        previous_scores = {
+            _normalize_site(str(item.get("domain") or item.get("url") or "")): int(float(item.get("score") or 0))
+            for item in (previous or {}).get("competitors", [])
+            if isinstance(item, dict)
+        }
+
+        entries: dict[str, dict] = {}
+        for item in discovered or []:
+            if not isinstance(item, dict):
+                continue
+            domain = _normalize_site(str(item.get("domain") or item.get("url") or ""))
+            if not domain:
+                continue
+            score = int(max(0, min(100, round(float(item.get("score") or 0)))))
+            entries[domain] = {
+                "domain": domain,
+                "url": item.get("url") or f"https://{domain}/",
+                "name": _clean_optional_text(item.get("name")) or domain,
+                "score": score,
+                "position": item.get("position"),
+                "status": "Your site" if domain == target_domain else (_clean_optional_text(item.get("confidence")) or "AI evidence"),
+                "evidence": _clean_optional_text(item.get("evidence")) or "",
+                "isUser": domain == target_domain,
+                "isTracked": domain in tracked_competitors,
+            }
+
+        for domain in tracked_competitors:
+            if domain not in entries:
+                entries[domain] = {
+                    "domain": domain,
+                    "url": f"https://{domain}/",
+                    "name": domain.split(".")[0].replace("-", " ").title(),
+                    "score": 0,
+                    "position": None,
+                    "status": "Not found this run",
+                    "evidence": "This saved competitor was not returned by the latest AI competitor intelligence run.",
+                    "isUser": False,
+                    "isTracked": True,
+                }
+            else:
+                entries[domain]["isTracked"] = True
+
+        if target_domain not in entries:
+            entries[target_domain] = {
+                "domain": target_domain,
+                "url": f"https://{target_domain}/",
+                "name": business_doc.get("businessName") or target_domain,
+                "score": int(float(business_doc.get("latest_phase5_score") or business_doc.get("latest_phase1_score") or 0)),
+                "position": None,
+                "status": "Your site",
+                "evidence": "Your current saved visibility score was used because this tracking run did not return a target score.",
+                "isUser": True,
+                "isTracked": False,
+            }
+
+        competitor_rows = []
+        for entry in sorted(entries.values(), key=lambda item: float(item.get("score") or 0), reverse=True):
+            domain = entry["domain"]
+            previous_score = previous_scores.get(domain)
+            entry["weeklyChange"] = None if previous_score is None else int(entry["score"]) - previous_score
+            competitor_rows.append(entry)
+
+        completed_at = datetime.utcnow().isoformat()
+        await competitor_tracking_runs_col.update_one(
+            {"_id": insert_result.inserted_id},
+            {
+                "$set": {
+                    "status": "completed",
+                    "competitors": competitor_rows,
+                    "completed_at": completed_at,
+                    "updated_at": completed_at,
+                }
+            },
+        )
+
+        external_system_competitors = [
+            {
+                "domain": item["domain"],
+                "url": item["url"],
+                "name": item["name"],
+                "score": item["score"],
+                "status": item["status"],
+                "evidence": item["evidence"],
+            }
+            for item in competitor_rows
+            if not item.get("isUser") and int(item.get("score") or 0) > 0
+        ][:4]
+        await _upsert_user_business(
+            current_user=current_user,
+            url=url,
+            business_id=business_id,
+            system_competitors=external_system_competitors,
+        )
+        await businesses_col.update_one(
+            {"_id": ObjectId(business_id), "user_id": current_user["id"]},
+            {
+                "$set": {
+                    "latest_competitor_tracking_at": completed_at,
+                    "latest_competitor_tracking_run_id": str(insert_result.inserted_id),
+                    "updated_at": completed_at,
+                }
+            },
+        )
+
+        saved = await competitor_tracking_runs_col.find_one({"_id": insert_result.inserted_id})
+        return _public_tracking_run_doc(saved)
+    except Exception as e:
+        failed_at = datetime.utcnow().isoformat()
+        await competitor_tracking_runs_col.update_one(
+            {"_id": insert_result.inserted_id},
+            {
+                "$set": {
+                    "status": "failed",
+                    "error": str(e),
+                    "updated_at": failed_at,
+                }
+            },
+        )
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Competitor tracking failed: {str(e)}")
 
 
 async def _upsert_user_business(
@@ -574,6 +812,7 @@ async def _upsert_user_business(
     services: list[str] | None = None,
     target_audience: str | None = None,
     competitors: list[str] | None = None,
+    system_competitors: list[dict] | None = None,
     tracked_pages: list[str] | None = None,
     phase1_score: int | None = None,
     phase5_score: float | None = None,
@@ -638,6 +877,28 @@ async def _upsert_user_business(
         if isinstance(values, list):
             cleaned = [str(v).strip() for v in values if str(v or "").strip()]
             set_fields[key] = cleaned
+    if isinstance(system_competitors, list):
+        cleaned_system_competitors: list[dict] = []
+        seen_domains: set[str] = set()
+        for item in system_competitors:
+            if not isinstance(item, dict):
+                continue
+            domain = _normalize_site(str(item.get("domain") or item.get("url") or ""))
+            if not domain or domain in seen_domains:
+                continue
+            seen_domains.add(domain)
+            cleaned_system_competitors.append({
+                "domain": domain,
+                "url": item.get("url") or f"https://{domain}/",
+                "name": _clean_optional_text(item.get("name")) or domain,
+                "score": int(float(item.get("score") or 0)),
+                "status": _clean_optional_text(item.get("status")) or _clean_optional_text(item.get("confidence")) or "AI evidence",
+                "evidence": _clean_optional_text(item.get("evidence")) or "",
+                "updated_at": now_iso,
+            })
+            if len(cleaned_system_competitors) >= 4:
+                break
+        set_fields["systemCompetitors"] = cleaned_system_competitors
 
     query: dict
     if business_id:
@@ -1158,6 +1419,7 @@ async def api_user_business_upsert(
         services=request.services,
         target_audience=request.targetAudience,
         competitors=request.competitors,
+        system_competitors=request.systemCompetitors,
         tracked_pages=request.trackedPages,
         business_id=request.business_id,
         scrape_result=request.latest_scrape_result,
@@ -1190,6 +1452,84 @@ async def api_user_business_delete(
         raise HTTPException(status_code=404, detail="Business profile not found")
 
     return {"message": "Business profile deleted successfully"}
+
+
+@app.get(
+    "/api/user/businesses/{business_id}/competitor-tracking",
+    response_model=CompetitorTrackingStatusResponse,
+)
+async def api_competitor_tracking_status(
+    business_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    if businesses_col is None or competitor_tracking_runs_col is None:
+        raise HTTPException(status_code=503, detail="competitor tracking storage unavailable")
+    try:
+        oid = ObjectId(business_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid business ID format")
+
+    business = await businesses_col.find_one({"_id": oid, "user_id": current_user["id"]})
+    if not business:
+        raise HTTPException(status_code=404, detail="Business profile not found")
+
+    cursor = competitor_tracking_runs_col.find(
+        {"business_id": business_id, "user_id": current_user["id"]},
+        {"_id": 1, "run_id": 1, "business_id": 1, "status": 1, "url": 1, "target_domain": 1, "tracked_competitors": 1, "competitors": 1, "questions": 1, "created_at": 1, "completed_at": 1, "updated_at": 1, "error": 1},
+    ).sort("created_at", -1).limit(10)
+    docs = await cursor.to_list(length=10)
+    public_docs = [_public_tracking_run_doc(doc) for doc in docs]
+    public_docs = [doc for doc in public_docs if doc]
+    return {
+        "success": True,
+        "latest": public_docs[0] if public_docs else None,
+        "history": public_docs,
+    }
+
+
+@app.post(
+    "/api/user/businesses/{business_id}/competitor-tracking/run",
+    response_model=CompetitorTrackingRunResponse,
+)
+async def api_competitor_tracking_run(
+    business_id: str,
+    request: CompetitorTrackingRunRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    if businesses_col is None or competitor_tracking_runs_col is None:
+        raise HTTPException(status_code=503, detail="competitor tracking storage unavailable")
+    try:
+        oid = ObjectId(business_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid business ID format")
+
+    business = await businesses_col.find_one({"_id": oid, "user_id": current_user["id"]})
+    if not business:
+        raise HTTPException(status_code=404, detail="Business profile not found")
+
+    if not request.force:
+        running = await competitor_tracking_runs_col.find_one({
+            "business_id": business_id,
+            "user_id": current_user["id"],
+            "status": "running",
+        })
+        if running:
+            return {
+                "success": True,
+                "run": _public_tracking_run_doc(running),
+                "business": _public_business_doc(business),
+            }
+
+    run = await _run_competitor_tracking_for_business(
+        business_doc=business,
+        current_user=current_user,
+    )
+    fresh_business = await businesses_col.find_one({"_id": oid, "user_id": current_user["id"]})
+    return {
+        "success": True,
+        "run": run,
+        "business": _public_business_doc(fresh_business),
+    }
 
 
 @app.get("/api/user/history")
@@ -1814,6 +2154,94 @@ async def api_scan_content(request: ContentAnalysisRequest, current_user: dict =
         print(f"[API] ERROR in content analysis: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/content/page-generator", response_model=ContentPageGeneratorResponse)
+async def api_content_page_generator(
+    request: ContentPageGeneratorRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    if not request.url:
+        raise HTTPException(status_code=400, detail="A business URL is required")
+
+    saved_business = None
+    if request.business_id:
+        if businesses_col is None:
+            raise HTTPException(status_code=503, detail="business storage unavailable")
+        try:
+            saved_business = await businesses_col.find_one({
+                "_id": ObjectId(request.business_id),
+                "user_id": current_user["id"],
+            })
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid business ID format")
+        if not saved_business:
+            raise HTTPException(status_code=404, detail="Business profile not found")
+
+    latest_scan = request.scanData or {}
+    if saved_business and isinstance(saved_business.get("latest_scrape_result"), dict):
+        latest_scan = {**saved_business.get("latest_scrape_result", {}), **latest_scan}
+
+    business_context = {
+        "business_id": request.business_id,
+        "url": request.url or (saved_business or {}).get("url"),
+        "businessName": request.businessName or (saved_business or {}).get("businessName") or latest_scan.get("businessName"),
+        "category": request.category or (saved_business or {}).get("category"),
+        "location": request.location or (saved_business or {}).get("location"),
+        "businessDescription": request.businessDescription or (saved_business or {}).get("businessDescription"),
+        "aiDescription": request.aiDescription or (saved_business or {}).get("aiDescription"),
+        "services": request.services or (saved_business or {}).get("services") or [],
+        "targetAudience": request.targetAudience or (saved_business or {}).get("targetAudience"),
+        "competitors": request.competitors or (saved_business or {}).get("competitors") or [],
+        "scanData": latest_scan,
+        "promptContext": request.promptContext or {},
+    }
+
+    model = (request.model or "claude").strip().lower()
+    if model not in {"claude", "chatgpt", "openai"}:
+        raise HTTPException(status_code=400, detail="Use claude or chatgpt for page generation")
+
+    try:
+        generated = await generate_content_page(
+            business_context=business_context,
+            selected_model="chatgpt" if model == "openai" else model,
+        )
+    except Exception as e:
+        print(f"[API] content page generation error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail="Could not generate content page right now")
+
+    generated_at = datetime.utcnow().isoformat()
+    doc = {
+        "user_id": current_user["id"],
+        "user_email": current_user.get("email"),
+        "business_id": request.business_id,
+        "url": business_context["url"],
+        "business_context": business_context,
+        "result": generated,
+        "created_at": generated_at,
+        "updated_at": generated_at,
+    }
+    if generated_content_pages_col is not None:
+        try:
+            await generated_content_pages_col.insert_one(doc)
+        except Exception as e:
+            print(f"[API] failed to save generated content page: {e}")
+
+    return ContentPageGeneratorResponse(
+        success=True,
+        pageTitle=str(generated.get("pageTitle") or ""),
+        metaTitle=str(generated.get("metaTitle") or ""),
+        metaDescription=str(generated.get("metaDescription") or ""),
+        sections=generated.get("sections") or [],
+        faqs=generated.get("faqs") or [],
+        factsUsed=generated.get("factsUsed") or [],
+        warnings=generated.get("warnings") or [],
+        outputText=str(generated.get("outputText") or ""),
+        modelUsed=generated.get("modelUsed"),
+        provider=generated.get("provider"),
+        generatedAt=generated_at,
+    )
 
 
 @app.post("/api/blogs/analyze", response_model=BlogAnalysisResponse)
@@ -2745,10 +3173,35 @@ async def _process_phase5_job(job_doc: dict):
         # Ensure the background finalization task (started earlier) is finished
         if finalize_task:
             try:
-                # Give it a small extra timeout just in case, but it should be done.
-                deep_competitors = await asyncio.wait_for(finalize_task, timeout=40)
+                # Do not cancel competitor discovery if it needs more time. If
+                # it is still running after this wait, fall back below using the
+                # completed prompt results instead of completing with only the
+                # target site.
+                deep_competitors = await asyncio.wait_for(asyncio.shield(finalize_task), timeout=40)
+            except asyncio.TimeoutError:
+                print(f"[Phase5] background competitor finalization still running job_id={job_id}; using fallback generation")
             except Exception as e:
                 print(f"[Phase5] background finalization wait error: {e}")
+
+        external_deep_competitors = [
+            c for c in (deep_competitors or [])
+            if isinstance(c, dict) and c.get("domain") and c.get("confidence") != "target"
+        ]
+        if (always_run_deep or include_competitors) and not external_deep_competitors:
+            try:
+                print(f"[Phase5] final competitor fallback generation job_id={job_id}")
+                fallback_competitors = await asyncio.wait_for(
+                    generate_deep_competitor_scores(
+                        url=job_doc["url"],
+                        questions=questions,
+                        seed_results=accumulated_results,
+                    ),
+                    timeout=75,
+                )
+                if isinstance(fallback_competitors, list) and fallback_competitors:
+                    deep_competitors = fallback_competitors
+            except Exception as e:
+                print(f"[Phase5] final competitor fallback failed job_id={job_id}: {e}")
 
         processed_count = len(accumulated_results)
 
@@ -2811,11 +3264,30 @@ async def _process_phase5_job(job_doc: dict):
             },
         )
         try:
+            external_system_competitors = [
+                {
+                    "domain": c.get("domain"),
+                    "url": c.get("url"),
+                    "name": c.get("name"),
+                    "score": c.get("score"),
+                    "status": c.get("confidence") or "AI evidence",
+                    "evidence": c.get("evidence") or "",
+                }
+                for c in sorted(
+                    [
+                        c for c in (deep_competitors or [])
+                        if isinstance(c, dict) and c.get("domain") and c.get("domain") != domain
+                    ],
+                    key=lambda item: float(item.get("score") or 0),
+                    reverse=True,
+                )[:4]
+            ]
             await _upsert_user_business(
                 current_user={"id": job_doc.get("user_id"), "email": job_doc.get("user_email")} if job_doc.get("user_id") else None,
                 url=job_doc["url"],
                 phase5_score=final_overall,
                 business_id=job_doc.get("business_id"),
+                system_competitors=external_system_competitors,
             )
         except Exception as business_error:
             print(f"[Business] phase5 upsert failed: {business_error}")
@@ -3099,6 +3571,16 @@ async def _phase5_worker_startup():
         if public_rate_limits_col is not None:
             await public_rate_limits_col.create_index("key", unique=True)
             await public_rate_limits_col.create_index("reset_at")
+        if competitor_tracking_runs_col is not None:
+            await competitor_tracking_runs_col.create_index([
+                ("business_id", 1),
+                ("user_id", 1),
+                ("created_at", -1),
+            ])
+            await competitor_tracking_runs_col.create_index([
+                ("business_id", 1),
+                ("status", 1),
+            ])
     except Exception:
         print("[Phase5] warning: index creation failed; continuing without blocking startup")
         traceback.print_exc()

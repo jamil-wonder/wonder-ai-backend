@@ -143,6 +143,7 @@ class BusinessUpsertRequest(BaseModel):
     services: Optional[List[str]] = None
     targetAudience: Optional[str] = None
     competitors: Optional[List[str]] = None
+    systemCompetitors: Optional[List[Dict[str, Any]]] = None
     trackedPages: Optional[List[str]] = None
     latest_scrape_result: Optional[Dict[str, Any]] = None
 
@@ -161,6 +162,7 @@ class BusinessResponse(BaseModel):
     services: List[str] = Field(default_factory=list)
     targetAudience: Optional[str] = None
     competitors: List[str] = Field(default_factory=list)
+    systemCompetitors: List[Dict[str, Any]] = Field(default_factory=list)
     trackedPages: List[str] = Field(default_factory=list)
     latest_phase1_score: Optional[int] = None
     latest_phase5_score: Optional[float] = None
@@ -168,3 +170,61 @@ class BusinessResponse(BaseModel):
     updated_at: Optional[str] = None
     latest_scrape_result: Optional[Dict[str, Any]] = None
     scores_history: Optional[List[Dict[str, Any]]] = None
+
+
+class ContentPageSection(BaseModel):
+    heading: str
+    body: str
+
+
+class ContentPageFaq(BaseModel):
+    question: str
+    answer: str
+
+
+class ContentPageGeneratorRequest(BaseModel):
+    business_id: Optional[str] = None
+    url: str
+    businessName: Optional[str] = None
+    category: Optional[str] = None
+    location: Optional[str] = None
+    businessDescription: Optional[str] = None
+    aiDescription: Optional[str] = None
+    services: List[str] = Field(default_factory=list)
+    targetAudience: Optional[str] = None
+    competitors: List[str] = Field(default_factory=list)
+    scanData: Dict[str, Any] = Field(default_factory=dict)
+    promptContext: Dict[str, Any] = Field(default_factory=dict)
+    model: str = "claude"
+
+
+class ContentPageGeneratorResponse(BaseModel):
+    success: bool
+    pageTitle: str
+    metaTitle: str
+    metaDescription: str
+    sections: List[ContentPageSection] = Field(default_factory=list)
+    faqs: List[ContentPageFaq] = Field(default_factory=list)
+    factsUsed: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    outputText: str
+    modelUsed: Optional[str] = None
+    provider: Optional[str] = None
+    generatedAt: str
+    error: Optional[str] = None
+
+
+class CompetitorTrackingRunRequest(BaseModel):
+    force: bool = False
+
+
+class CompetitorTrackingRunResponse(BaseModel):
+    success: bool
+    run: Dict[str, Any]
+    business: Optional[BusinessResponse] = None
+
+
+class CompetitorTrackingStatusResponse(BaseModel):
+    success: bool
+    latest: Optional[Dict[str, Any]] = None
+    history: List[Dict[str, Any]] = Field(default_factory=list)
