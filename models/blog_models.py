@@ -95,3 +95,16 @@ class BlogUsageResponse(BaseModel):
     remaining: int
     periodStart: str
     periodEnd: str
+
+
+class BlogWeeklySetupRequest(BaseModel):
+    business_id: str
+    voice: Optional[str] = None
+    keywords: List[str] = []
+
+
+class BlogWeeklyEnsureRequest(BaseModel):
+    business_id: str
+    voice: Optional[str] = None
+    keywords: List[str] = []
+    force: bool = False

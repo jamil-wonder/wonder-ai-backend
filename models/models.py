@@ -142,6 +142,8 @@ class BusinessUpsertRequest(BaseModel):
     aiDescription: Optional[str] = None
     services: Optional[List[str]] = None
     targetAudience: Optional[str] = None
+    blogVoice: Optional[str] = None
+    blogKeywords: Optional[List[str]] = None
     competitors: Optional[List[str]] = None
     systemCompetitors: Optional[List[Dict[str, Any]]] = None
     trackedPages: Optional[List[str]] = None
@@ -161,6 +163,8 @@ class BusinessResponse(BaseModel):
     aiDescription: Optional[str] = None
     services: List[str] = Field(default_factory=list)
     targetAudience: Optional[str] = None
+    blogVoice: Optional[str] = None
+    blogKeywords: List[str] = Field(default_factory=list)
     competitors: List[str] = Field(default_factory=list)
     systemCompetitors: List[Dict[str, Any]] = Field(default_factory=list)
     trackedPages: List[str] = Field(default_factory=list)

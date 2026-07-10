@@ -27,6 +27,8 @@ from models import (
     BlogRewriteSectionResponse,
     BlogSection,
     BlogUsageResponse,
+    BlogWeeklySetupRequest,
+    BlogWeeklyEnsureRequest,
     ContentPageGeneratorRequest,
     ContentPageGeneratorResponse,
     CompetitorTrackingRunRequest,
@@ -38,6 +40,7 @@ from agents.ai_agent import (
     get_ai_insights_multi,
     get_blog_analysis_perplexity,
     generate_seo_blog,
+    generate_weekly_blog_ideas,
     generate_content_page,
     rewrite_blog_section,
 )
@@ -158,6 +161,7 @@ businesses_col = None
 public_rate_limits_col = None
 generated_content_pages_col = None
 competitor_tracking_runs_col = None
+weekly_blog_suggestions_col = None
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
     db = mongo_client.get_database("wonderai")
@@ -167,6 +171,7 @@ try:
     businesses_col = db.get_collection("businesses")
     generated_content_pages_col = db.get_collection("generated_content_pages")
     competitor_tracking_runs_col = db.get_collection("competitor_tracking_runs")
+    weekly_blog_suggestions_col = db.get_collection("weekly_blog_suggestions")
     phase5_jobs_col = db.get_collection("phase5_jobs")
     ai_usage_col = db.get_collection("ai_usage_events")
     user_history_meta_col = db.get_collection("user_history_meta")
@@ -560,11 +565,14 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "aiDescription": doc.get("aiDescription"),
         "services": doc.get("services") if isinstance(doc.get("services"), list) else [],
         "targetAudience": doc.get("targetAudience"),
+        "blogVoice": doc.get("blogVoice"),
+        "blogKeywords": doc.get("blogKeywords") if isinstance(doc.get("blogKeywords"), list) else [],
         "competitors": doc.get("competitors") if isinstance(doc.get("competitors"), list) else [],
         "systemCompetitors": doc.get("systemCompetitors") if isinstance(doc.get("systemCompetitors"), list) else [],
         "trackedPages": doc.get("trackedPages") if isinstance(doc.get("trackedPages"), list) else [],
         "latest_phase1_score": doc.get("latest_phase1_score"),
         "latest_phase5_score": doc.get("latest_phase5_score"),
+        "latest_weekly_blog_at": doc.get("latest_weekly_blog_at"),
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
         "latest_scrape_result": doc.get("latest_scrape_result"),
@@ -840,7 +848,7 @@ async def _upsert_user_business(
         if current_count >= 3:
             raise HTTPException(status_code=400, detail="You can save up to 3 business profiles for now")
 
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = datetime.utcnow().isoformat() + "Z" 
     set_fields = {
         "user_id": current_user["id"],
         "user_email": current_user.get("email"),
@@ -1427,6 +1435,14 @@ async def api_user_business_upsert(
     public = _public_business_doc(business)
     if not public:
         raise HTTPException(status_code=400, detail="Could not save business")
+    try:
+        asyncio.create_task(_build_weekly_blogs_for_business(
+            business_doc=business,
+            current_user=current_user,
+            force=False,
+        ))
+    except Exception as e:
+        print(f"[Blogs] failed to queue initial weekly blogs: {e}")
     return public
 
 
@@ -1682,7 +1698,7 @@ async def api_user_history_clear(current_user: dict = Depends(get_current_user))
     if user_history_meta_col is None:
         raise HTTPException(status_code=503, detail="history meta storage unavailable")
 
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = datetime.utcnow().isoformat() + "Z" 
     await user_history_meta_col.update_one(
         {"user_id": current_user["id"]},
         {
@@ -2349,18 +2365,309 @@ def _clean_blog_list(values: list[str] | None, max_items: int = 8) -> list[str]:
     if not isinstance(values, list):
         return []
     cleaned = []
+    seen = set()
     for value in values:
         text = str(value or "").strip()
         if text:
-            cleaned.append(text[:220])
+            lower_text = text.lower()
+            if lower_text not in seen:
+                seen.add(lower_text)
+                cleaned.append(text[:220])
         if len(cleaned) >= max_items:
             break
     return cleaned
 
 
+def _blog_week_id(now: datetime | None = None) -> str:
+    start, _ = _blog_week_window(now)
+    return start.strftime("%G-W%V")
+
+
+def _blog_text_from_generated(result: dict) -> str:
+    parts = [str(result.get("title") or ""), str(result.get("excerpt") or "")]
+    for section in result.get("sections") or []:
+        if isinstance(section, dict):
+            parts.append(str(section.get("heading") or ""))
+            parts.append(str(section.get("content") or ""))
+    return "\n\n".join(parts)
+
+
+def _humanized_blog_score(result: dict, voice: str | None = None) -> int:
+    text = _blog_text_from_generated(result)
+    words = [w for w in re.split(r"\s+", text or "") if w.strip()]
+    sentences = _blog_split_sentences(text)
+    avg_sentence = (len(words) / len(sentences)) if sentences else 0
+    score = 82
+    if voice and len(voice.strip()) > 20:
+        score += 8
+    if 10 <= avg_sentence <= 22:
+        score += 5
+    elif avg_sentence > 30:
+        score -= 10
+    ai_phrases = [
+        "in today's digital landscape",
+        "look no further",
+        "game-changer",
+        "unlock the power",
+        "comprehensive guide",
+        "it is important to note",
+    ]
+    lowered = text.lower()
+    score -= sum(6 for phrase in ai_phrases if phrase in lowered)
+    score += min(5, len(set(w.lower().strip(".,!?;:") for w in words)) // 180)
+    return _blog_clamp(score, 35, 98)
+
+
+async def _build_weekly_blogs_for_business(
+    *,
+    business_doc: dict,
+    current_user: dict,
+    force: bool = False,
+    voice: str | None = None,
+    keywords: list[str] | None = None,
+) -> dict:
+    if weekly_blog_suggestions_col is None or businesses_col is None:
+        raise HTTPException(status_code=503, detail="weekly blog storage unavailable")
+
+    business_id = str(business_doc["_id"])
+    week_id = _blog_week_id()
+    existing = await weekly_blog_suggestions_col.find_one({
+        "business_id": business_id,
+        "user_id": current_user["id"],
+        "week_id": week_id,
+    })
+    if existing and not force:
+        return existing
+
+    now_iso = datetime.utcnow().isoformat() + "Z" 
+    blog_voice = _clean_optional_text(voice) or _clean_optional_text(business_doc.get("blogVoice")) or _clean_optional_text(business_doc.get("aiDescription")) or _clean_optional_text(business_doc.get("businessDescription"))
+    preferred_keywords = _clean_blog_list(keywords, 12) or _clean_blog_list(business_doc.get("blogKeywords") if isinstance(business_doc.get("blogKeywords"), list) else [], 12)
+    services = business_doc.get("services") if isinstance(business_doc.get("services"), list) else []
+    business_name = business_doc.get("businessName") or business_doc.get("normalized_domain") or "Business"
+
+    ideas_payload = await generate_weekly_blog_ideas(
+        business_name=business_name,
+        category=business_doc.get("category"),
+        location=business_doc.get("location"),
+        services=services,
+        business_voice=blog_voice,
+        existing_keywords=preferred_keywords,
+        selected_model="claude",
+    )
+    suggested_keywords = _clean_blog_list(preferred_keywords + ideas_payload.get("keywords", []), 12)
+
+    ideas = ideas_payload.get("ideas") if isinstance(ideas_payload.get("ideas"), list) else []
+    if len(ideas) < 2:
+        category = business_doc.get("category") or "business"
+        location = business_doc.get("location") or "local customers"
+        ideas = [
+            {
+                "title": f"How to choose the right {category} in {location}",
+                "primaryKeyword": f"{category} in {location}",
+                "audience": "People comparing local options",
+                "angle": "High-intent local search topic",
+            },
+            {
+                "title": f"What makes {business_name} useful for {location} customers",
+                "primaryKeyword": f"{business_name} {category}",
+                "audience": "Potential customers researching the brand",
+                "angle": "Brand and service clarity topic",
+            },
+        ]
+
+    drafts = []
+    for idx, idea in enumerate(ideas[:2]):
+        generated = await generate_seo_blog(
+            title=str(idea.get("title") or f"Weekly blog idea {idx + 1}"),
+            target_words=1100,
+            primary_keyword=str(idea.get("primaryKeyword") or (suggested_keywords[0] if suggested_keywords else "")),
+            audience=str(idea.get("audience") or "Potential customers"),
+            tone=blog_voice or "clear, helpful, human, specific",
+            key_features=services[:8],
+            selling_points=[
+                str(idea.get("angle") or ""),
+                str(business_doc.get("category") or ""),
+                str(business_doc.get("location") or ""),
+            ],
+            internal_links=business_doc.get("trackedPages") if isinstance(business_doc.get("trackedPages"), list) else [],
+            selected_model="claude",
+        )
+        drafts.append({
+            **generated,
+            "id": f"{week_id}-blog-{idx + 1}",
+            "idea": idea,
+            "humanizedScore": _humanized_blog_score(generated, blog_voice),
+            "humanizeNote": "Edit a few details, add a real customer example, and adjust wording to match the business voice before publishing.",
+        })
+        try:
+            await _log_ai_usage_event({
+                "feature": "blog_seo_generator",
+                "endpoint": "/api/blogs/weekly/ensure",
+                "user_id": current_user.get("id"),
+                "user_email": current_user.get("email"),
+                "model_name": generated.get("modelUsed") or "claude",
+                "model_provider": generated.get("provider") or "claude",
+                "ai_calls_estimate": 1,
+                "details": {
+                    "title": generated.get("title"),
+                    "word_count": generated.get("wordCount"),
+                    "target_words": 1100,
+                },
+            })
+        except Exception as e:
+            print(f"[Weekly Suggestions] log usage event failed: {e}")
+
+    doc = {
+        "user_id": current_user["id"],
+        "user_email": current_user.get("email"),
+        "business_id": business_id,
+        "business_name": business_name,
+        "week_id": week_id,
+        "voice": blog_voice,
+        "keywords": suggested_keywords,
+        "drafts": drafts,
+        "modelUsed": "claude",
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+    await weekly_blog_suggestions_col.update_one(
+        {"business_id": business_id, "user_id": current_user["id"], "week_id": week_id},
+        {"$set": doc, "$setOnInsert": {"first_created_at": now_iso}},
+        upsert=True,
+    )
+    saved = await weekly_blog_suggestions_col.find_one({
+        "business_id": business_id,
+        "user_id": current_user["id"],
+        "week_id": week_id,
+    })
+    await businesses_col.update_one(
+        {"_id": ObjectId(business_id), "user_id": current_user["id"]},
+        {
+            "$set": {
+                "blogVoice": blog_voice,
+                "blogKeywords": suggested_keywords,
+                "latest_weekly_blog_at": now_iso,
+                "updated_at": now_iso,
+            }
+        },
+    )
+    return saved or doc
+
+
+def _public_weekly_blog_doc(doc: dict | None) -> dict | None:
+    if not doc:
+        return None
+    out = dict(doc)
+    out["id"] = str(out.pop("_id", ""))
+    return out
+
+
 @app.get("/api/blogs/usage", response_model=BlogUsageResponse)
 async def api_blogs_usage(current_user: dict = Depends(get_current_user)):
     return await _blog_generation_usage(current_user)
+
+
+@app.get("/api/blogs/weekly")
+async def api_blogs_weekly(
+    business_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    if businesses_col is None or weekly_blog_suggestions_col is None:
+        raise HTTPException(status_code=503, detail="weekly blog storage unavailable")
+    try:
+        business = await businesses_col.find_one({
+            "_id": ObjectId(business_id),
+            "user_id": current_user["id"],
+        })
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid business ID format")
+    if not business:
+        raise HTTPException(status_code=404, detail="Business profile not found")
+    week_id = _blog_week_id()
+    doc = await weekly_blog_suggestions_col.find_one({
+        "business_id": business_id,
+        "user_id": current_user["id"],
+        "week_id": week_id,
+    })
+    return {
+        "success": True,
+        "weekId": week_id,
+        "business": _public_business_doc(business),
+        "weekly": _public_weekly_blog_doc(doc),
+        "needsSetup": not bool(business.get("blogVoice")),
+        "voice": business.get("blogVoice") or "",
+        "keywords": business.get("blogKeywords") if isinstance(business.get("blogKeywords"), list) else [],
+    }
+
+
+@app.post("/api/blogs/weekly/setup")
+async def api_blogs_weekly_setup(
+    request: BlogWeeklySetupRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    if businesses_col is None:
+        raise HTTPException(status_code=503, detail="business storage unavailable")
+    try:
+        business = await businesses_col.find_one({
+            "_id": ObjectId(request.business_id),
+            "user_id": current_user["id"],
+        })
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid business ID format")
+    if not business:
+        raise HTTPException(status_code=404, detail="Business profile not found")
+    now_iso = datetime.utcnow().isoformat() + "Z" 
+    keywords = _clean_blog_list(request.keywords, 12)
+    await businesses_col.update_one(
+        {"_id": ObjectId(request.business_id), "user_id": current_user["id"]},
+        {
+            "$set": {
+                "blogVoice": _clean_optional_text(request.voice) or "",
+                "blogKeywords": keywords,
+                "updated_at": now_iso,
+            }
+        },
+    )
+    updated = await businesses_col.find_one({"_id": ObjectId(request.business_id), "user_id": current_user["id"]})
+    return {
+        "success": True,
+        "business": _public_business_doc(updated),
+    }
+
+
+@app.post("/api/blogs/weekly/ensure")
+async def api_blogs_weekly_ensure(
+    request: BlogWeeklyEnsureRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    if businesses_col is None or weekly_blog_suggestions_col is None:
+        raise HTTPException(status_code=503, detail="weekly blog storage unavailable")
+    try:
+        business = await businesses_col.find_one({
+            "_id": ObjectId(request.business_id),
+            "user_id": current_user["id"],
+        })
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid business ID format")
+    if not business:
+        raise HTTPException(status_code=404, detail="Business profile not found")
+    doc = await _build_weekly_blogs_for_business(
+        business_doc=business,
+        current_user=current_user,
+        force=bool(request.force),
+        voice=request.voice,
+        keywords=request.keywords,
+    )
+    # Fetch the updated business doc
+    updated_business = await businesses_col.find_one({
+        "_id": ObjectId(request.business_id),
+        "user_id": current_user["id"],
+    })
+    return {
+        "success": True,
+        "weekly": _public_weekly_blog_doc(doc),
+        "business": _public_business_doc(updated_business),
+    }
 
 
 @app.post("/api/blogs/generate", response_model=BlogGenerateResponse)
@@ -3509,6 +3816,15 @@ async def sunday_analyzer_scheduler():
                                 scrape_result=result,
                             )
                             print(f"[Scheduler] Completed auto scrape for {url}")
+                            try:
+                                await _build_weekly_blogs_for_business(
+                                    business_doc={**biz_doc, "businessName": result.get("businessName") or biz_doc.get("businessName"), "latest_scrape_result": result},
+                                    current_user=user_mock,
+                                    force=False,
+                                )
+                                print(f"[Scheduler] Weekly blogs ready for {url}")
+                            except Exception as blog_err:
+                                print(f"[Scheduler] Weekly blog generation failed for {url}: {blog_err}")
                     except Exception as scrape_err:
                         print(f"[Scheduler] Auto scrape failed for {url}: {scrape_err}")
                         
@@ -3580,6 +3896,16 @@ async def _phase5_worker_startup():
             await competitor_tracking_runs_col.create_index([
                 ("business_id", 1),
                 ("status", 1),
+            ])
+        if weekly_blog_suggestions_col is not None:
+            await weekly_blog_suggestions_col.create_index([
+                ("business_id", 1),
+                ("user_id", 1),
+                ("week_id", 1),
+            ], unique=True)
+            await weekly_blog_suggestions_col.create_index([
+                ("user_id", 1),
+                ("created_at", -1),
             ])
     except Exception:
         print("[Phase5] warning: index creation failed; continuing without blocking startup")
@@ -3727,7 +4053,7 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
         model_provider = "multi"
 
         job_id = uuid.uuid4().hex
-        now_iso = datetime.utcnow().isoformat()
+        now_iso = datetime.utcnow().isoformat() + "Z" 
         business = await _upsert_user_business(
             current_user=current_user,
             url=req.url,
@@ -3820,7 +4146,7 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
             raise HTTPException(status_code=400, detail="unsupported model provider")
 
         job_id = uuid.uuid4().hex
-        now_iso = datetime.utcnow().isoformat()
+        now_iso = datetime.utcnow().isoformat() + "Z" 
         business = await _upsert_user_business(
             current_user=current_user,
             url=req.url,

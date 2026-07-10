@@ -861,6 +861,86 @@ async def generate_seo_blog(
     }
 
 
+async def generate_weekly_blog_ideas(
+    *,
+    business_name: str,
+    category: str | None = None,
+    location: str | None = None,
+    services: list[str] | None = None,
+    business_voice: str | None = None,
+    existing_keywords: list[str] | None = None,
+    selected_model: str = "claude",
+) -> dict:
+    prompt = f"""
+    You are an SEO strategist for a business client.
+    Suggest the most useful weekly blog plan for this business.
+
+    Business:
+    - Name: {business_name}
+    - Category: {category or "not specified"}
+    - Location: {location or "not specified"}
+    - Services: {json.dumps(services or [])}
+    - Business voice: {business_voice or "not supplied yet"}
+    - Existing or preferred keywords: {json.dumps(existing_keywords or [])}
+
+    Return strict JSON only:
+    {{
+      "voiceSuggestion": "short suggested brand voice",
+      "keywords": ["keyword 1", "keyword 2", "keyword 3", "keyword 4", "keyword 5", "keyword 6"],
+      "ideas": [
+        {{
+          "title": "SEO blog title",
+          "primaryKeyword": "main keyword",
+          "audience": "who this is for",
+          "angle": "why this topic should help rankings"
+        }},
+        {{
+          "title": "SEO blog title",
+          "primaryKeyword": "main keyword",
+          "audience": "who this is for",
+          "angle": "why this topic should help rankings"
+        }}
+      ]
+    }}
+
+    Rules:
+    - Return exactly 2 ideas.
+    - Focus on likely ranking opportunities for the business niche and location.
+    - Avoid generic topics; include category, service, location, or buyer intent.
+    - Keywords must be natural search phrases.
+    - JSON only.
+    """
+    parsed, model, provider = await _blog_model_json(
+        provider=selected_model,
+        prompt=prompt,
+        timeout_seconds=90,
+        max_tokens=1800,
+    )
+    if not isinstance(parsed, dict):
+        parsed = {}
+    ideas = parsed.get("ideas") if isinstance(parsed.get("ideas"), list) else []
+    normalized_ideas = []
+    for idx, idea in enumerate(ideas[:2]):
+        if not isinstance(idea, dict):
+            continue
+        title = str(idea.get("title") or "").strip()
+        if not title:
+            continue
+        normalized_ideas.append({
+            "title": title,
+            "primaryKeyword": str(idea.get("primaryKeyword") or "").strip(),
+            "audience": str(idea.get("audience") or "").strip(),
+            "angle": str(idea.get("angle") or "").strip(),
+        })
+    return {
+        "voiceSuggestion": str(parsed.get("voiceSuggestion") or "").strip(),
+        "keywords": [str(k).strip() for k in (parsed.get("keywords") if isinstance(parsed.get("keywords"), list) else []) if str(k).strip()][:10],
+        "ideas": normalized_ideas[:2],
+        "modelUsed": model,
+        "provider": provider,
+    }
+
+
 def _normalize_content_page_sections(sections: list) -> list[dict]:
     normalized: list[dict] = []
     fallback_headings = ["Overview", "Services", "Location", "Why choose this business", "Trust signals"]
