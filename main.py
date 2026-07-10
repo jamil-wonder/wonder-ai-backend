@@ -573,6 +573,7 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "latest_phase1_score": doc.get("latest_phase1_score"),
         "latest_phase5_score": doc.get("latest_phase5_score"),
         "latest_weekly_blog_at": doc.get("latest_weekly_blog_at"),
+        "last_manually_refreshed_at": doc.get("last_manually_refreshed_at"),
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
         "latest_scrape_result": doc.get("latest_scrape_result"),
@@ -2540,16 +2541,18 @@ async def _build_weekly_blogs_for_business(
         "user_id": current_user["id"],
         "week_id": week_id,
     })
+    updates = {
+        "blogVoice": blog_voice,
+        "blogKeywords": suggested_keywords,
+        "latest_weekly_blog_at": now_iso,
+        "updated_at": now_iso,
+    }
+    if force:
+        updates["last_manually_refreshed_at"] = now_iso
+
     await businesses_col.update_one(
         {"_id": ObjectId(business_id), "user_id": current_user["id"]},
-        {
-            "$set": {
-                "blogVoice": blog_voice,
-                "blogKeywords": suggested_keywords,
-                "latest_weekly_blog_at": now_iso,
-                "updated_at": now_iso,
-            }
-        },
+        {"$set": updates},
     )
     return saved or doc
 
