@@ -9,6 +9,7 @@ class Phase5QuestionsRequest(BaseModel):
     description: Optional[str] = None
     services: List[str] = Field(default_factory=list)
     business_id: Optional[str] = None
+    questionGeneration: Optional[dict[str, int]] = None
 
 class Phase5QuestionsResponse(BaseModel):
     questions: List[str]

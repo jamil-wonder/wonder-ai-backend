@@ -142,6 +142,28 @@ def _deterministic_non_branded_questions(
     primary_service = services[0] if services else category
     secondary_service = services[1] if len(services) > 1 else primary_service
     return [
+        f"Best {category} options for {primary_service}?",
+        f"Top rated {category} with strong customer reviews?",
+        f"Most recommended {category} for {primary_service}?",
+        f"Where can I book a reliable {category}?",
+        f"Which {category} is best for quality and service?",
+        f"Best {category} for a special occasion?",
+        f"High quality {category} for {secondary_service}?",
+        f"Which {category} has the clearest customer reviews?",
+        f"Best value {category} with trustworthy information?",
+        f"Popular {category} for visitors and local customers?",
+    ]
+
+
+def _deterministic_local_seo_questions(
+    *,
+    category: str,
+    location: str,
+    services: list[str],
+) -> list[str]:
+    primary_service = services[0] if services else category
+    secondary_service = services[1] if len(services) > 1 else primary_service
+    return [
         f"Best {category} in {location}?",
         f"Top rated {category} in {location} with strong reviews?",
         f"Most recommended {category} in {location} for {primary_service}?",
@@ -163,28 +185,83 @@ def _deterministic_non_branded_questions(
     ]
 
 
-def _extract_query_groups(response: dict | None) -> tuple[list[str], list[str]]:
+def _deterministic_broad_seo_questions(
+    *,
+    category: str,
+    location: str,
+    services: list[str],
+) -> list[str]:
+    primary_service = services[0] if services else category
+    secondary_service = services[1] if len(services) > 1 else primary_service
+    return [
+        f"Best {category} near {location} for {primary_service}?",
+        f"Top rated {category} around {location} with strong reviews?",
+        f"Recommended {category} near {location} for visitors nearby?",
+        f"Where can I find reliable {category} options close to {location}?",
+        f"Best reviewed {category} around {location} for {secondary_service}?",
+        f"Which {category} near {location} is easiest to book online?",
+        f"Trusted {category} options around {location} with clear customer information?",
+        f"Popular {category} near {location} for people travelling nearby?",
+        f"High quality {category} close to {location} for {primary_service}?",
+        f"Which nearby {category} around {location} has the best reputation?",
+    ]
+
+
+def _normalize_question_counts(question_counts: dict | None) -> dict[str, int]:
+    source = question_counts if isinstance(question_counts, dict) else {}
+    def _safe_count(key: str, default: int) -> int:
+        try:
+            return max(0, int(source.get(key, default) or 0))
+        except Exception:
+            return default
+    counts = {
+        "branded": _safe_count("branded", 5),
+        "nonBranded": _safe_count("nonBranded", 0),
+        "localSeo": _safe_count("localSeo", 15),
+        "broadSeo": _safe_count("broadSeo", 0),
+    }
+    total = sum(counts.values())
+    if total <= 0:
+        return {"branded": 5, "nonBranded": 0, "localSeo": 15, "broadSeo": 0}
+    if total > 20:
+        overflow = total - 20
+        for key in ["broadSeo", "localSeo", "nonBranded", "branded"]:
+            remove = min(counts[key], overflow)
+            counts[key] -= remove
+            overflow -= remove
+            if overflow <= 0:
+                break
+    elif total < 20:
+        counts["localSeo"] += 20 - total
+    return counts
+
+
+def _extract_query_groups(response: dict | None) -> tuple[list[str], list[str], list[str], list[str]]:
     if not isinstance(response, dict):
-        return [], []
+        return [], [], [], []
 
     parsed = response
-    if not any(isinstance(parsed.get(key), list) for key in ["branded_queries", "non_branded_queries", "queries"]):
+    if not any(isinstance(parsed.get(key), list) for key in ["branded_queries", "non_branded_queries", "local_seo_queries", "broad_seo_queries", "queries"]):
         maybe = _safe_json_parse(str(parsed.get("_meta_response_text") or ""))
         if isinstance(maybe, dict):
             parsed = maybe
 
     branded = parsed.get("branded_queries")
     non_branded = parsed.get("non_branded_queries")
-    if isinstance(branded, list) or isinstance(non_branded, list):
+    local_seo = parsed.get("local_seo_queries") or parsed.get("local_queries")
+    broad_seo = parsed.get("broad_seo_queries") or parsed.get("broad_queries")
+    if isinstance(branded, list) or isinstance(non_branded, list) or isinstance(local_seo, list) or isinstance(broad_seo, list):
         return (
             [str(item) for item in branded or []],
             [str(item) for item in non_branded or []],
+            [str(item) for item in local_seo or []],
+            [str(item) for item in broad_seo or []],
         )
 
     queries = parsed.get("queries")
     if isinstance(queries, list):
         values = [str(item) for item in queries]
-        return values[:5], values[5:]
+        return values[:5], [], values[5:], []
 
     response_text = str(response.get("_meta_response_text") or "")
     lines = [
@@ -192,14 +269,22 @@ def _extract_query_groups(response: dict | None) -> tuple[list[str], list[str]]:
         for line in response_text.split("\n")
         if len(line.strip()) > 10 and "?" in line
     ]
-    return lines[:5], lines[5:]
+    return lines[:5], [], lines[5:], []
 
 
-async def generate_brand_questions(url: str, business_context: dict | None = None) -> list[str]:
+async def generate_brand_questions(
+    url: str,
+    business_context: dict | None = None,
+    question_counts: dict | None = None,
+) -> list[str]:
     """
-    Generate exactly 20 advanced Phase 5 questions:
-    5 branded brand-check questions followed by 15 non-branded local/category questions.
+    Generate exactly 20 advanced Phase 5 questions using the saved business mix.
     """
+    counts = _normalize_question_counts(question_counts)
+    branded_target = counts["branded"]
+    non_branded_target = counts["nonBranded"]
+    local_seo_target = counts["localSeo"]
+    broad_seo_target = counts["broadSeo"]
     page_ctx = await _fetch_page_context(url)
     ctx = _merge_context(page_ctx, business_context)
 
@@ -244,16 +329,25 @@ Business context:
 Generate exactly 20 search questions for testing AI visibility.
 
 Required structure:
-- branded_queries: exactly 5 questions.
-- non_branded_queries: exactly 15 questions.
+- branded_queries: exactly {branded_target} questions.
+- non_branded_queries: exactly {non_branded_target} questions.
+- local_seo_queries: exactly {local_seo_target} questions.
+- broad_seo_queries: exactly {broad_seo_target} questions.
 
-Rules for the 5 branded_queries:
+Rules for branded_queries:
 - Each question MUST include the exact business name: "{brand_name}".
 - Each question must also use the real category or location context.
 - Make them useful for checking brand understanding, reviews, menu/services, location, trust, booking, or suitability.
 - They must be SEO-friendly questions a real customer could ask.
 
-Rules for the 15 non_branded_queries:
+Rules for non_branded_queries:
+- Do NOT include "{brand_name}", "{domain}", the website URL, or any obvious brand variant.
+- These are category/service discovery prompts and do NOT have to include the location.
+- Every question must be specific to this category: "{category}" or the listed services.
+- Cover discovery, comparison, quality, reviews, booking/availability, price/value, occasion/use-case, and trust intent.
+- Avoid repeated wording patterns.
+
+Rules for local_seo_queries:
 - Do NOT include "{brand_name}", "{domain}", the website URL, or any obvious brand variant.
 - Every question MUST include the same business location: "{location}".
 - Every question must be specific to this category: "{category}".
@@ -263,10 +357,21 @@ Rules for the 15 non_branded_queries:
 - Do not produce generic prompts like "best restaurant near me" unless the exact location and category/service detail are included.
 - Avoid repeated wording patterns.
 
+Rules for broad_seo_queries:
+- Do NOT include "{brand_name}", "{domain}", the website URL, or any obvious brand variant.
+- Identify the actual real-world neighboring areas, neighborhoods, boroughs, or districts surrounding "{location}" (for example, if "{location}" is "City of London", surrounding areas could include "Shoreditch", "Southwark", "Holborn", "Clerkenwell", "Whitechapel", etc.).
+- Write questions using these actual neighboring location names (e.g., "Do people in [Neighboring Area] recommend any good [Category]?" or "What are the best [Category] options around [Neighboring Area]?").
+- The goal is to see if the AI engine recommends "{brand_name}" to people searching from these nearby surrounding areas.
+- Do NOT use the exact string "{location}" in these questions. Instead, use the real surrounding areas.
+- Every question must be specific to this category: "{category}" or the listed services.
+- Avoid repeated wording patterns.
+
 Return ONLY valid JSON:
 {{
-  "branded_queries": ["...", "... exactly 5"],
-  "non_branded_queries": ["...", "... exactly 15"]
+  "branded_queries": ["...", "... exactly {branded_target}"],
+  "non_branded_queries": ["...", "... exactly {non_branded_target}"],
+  "local_seo_queries": ["...", "... exactly {local_seo_target}"],
+  "broad_seo_queries": ["...", "... exactly {broad_seo_target}"]
 }}
 """
 
@@ -274,16 +379,19 @@ Return ONLY valid JSON:
     blocked_tokens.add(_normalize_domain(brand_name))
 
     quality_attempts = 3
-    last_counts = {"branded": 0, "non_branded": 0}
+    last_counts = {"branded": 0, "nonBranded": 0, "localSeo": 0, "broadSeo": 0}
     best_branded: list[str] = []
     best_non_branded: list[str] = []
+    best_local_seo: list[str] = []
+    best_broad_seo: list[str] = []
 
     for attempt in range(1, quality_attempts + 1):
         prompt = base_prompt
         if attempt > 1:
             prompt += (
-                "\n\nThe previous output failed validation. Regenerate with exactly 5 branded and "
-                "15 non-branded questions. Keep the exact location in every non-branded question."
+                f"\n\nThe previous output failed validation. Regenerate with exactly {branded_target} branded, "
+                f"{non_branded_target} non-branded, {local_seo_target} local SEO, and {broad_seo_target} broad SEO questions. "
+                "Keep the exact location in every local SEO question."
             )
 
         response = await _call_perplexity_with_retry(
@@ -295,10 +403,12 @@ Return ONLY valid JSON:
             await asyncio.sleep(0.3)
             continue
 
-        raw_branded, raw_non_branded = _extract_query_groups(response)
+        raw_branded, raw_non_branded, raw_local_seo, raw_broad_seo = _extract_query_groups(response)
 
         branded: list[str] = []
         non_branded: list[str] = []
+        local_seo: list[str] = []
+        broad_seo: list[str] = []
         seen: set[str] = set()
 
         for item in raw_branded:
@@ -314,10 +424,26 @@ Return ONLY valid JSON:
                 continue
             seen.add(key)
             branded.append(text)
-            if len(branded) == 5:
+            if len(branded) == branded_target:
                 break
 
         for item in raw_non_branded:
+            text = _clean_question(item)
+            key = text.lower().rstrip("?.!")
+            if len(text) < 12 or key in seen:
+                continue
+            if _is_low_quality_query(text):
+                continue
+            if _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain):
+                continue
+            if not _includes_category_or_service(text, category, services):
+                continue
+            seen.add(key)
+            non_branded.append(text)
+            if len(non_branded) == non_branded_target:
+                break
+
+        for item in raw_local_seo:
             text = _clean_question(item)
             key = text.lower().rstrip("?.!")
             if len(text) < 12 or key in seen:
@@ -331,100 +457,50 @@ Return ONLY valid JSON:
             if not _includes_category_or_service(text, category, services):
                 continue
             seen.add(key)
-            non_branded.append(text)
-            if len(non_branded) == 15:
+            local_seo.append(text)
+            if len(local_seo) == local_seo_target:
                 break
 
-        last_counts = {"branded": len(branded), "non_branded": len(non_branded)}
-        if (len(branded) + len(non_branded)) > (len(best_branded) + len(best_non_branded)):
+        for item in raw_broad_seo:
+            text = _clean_question(item)
+            key = text.lower().rstrip("?.!")
+            if len(text) < 12 or key in seen:
+                continue
+            if _is_low_quality_query(text):
+                continue
+            if _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain):
+                continue
+            if not _includes_category_or_service(text, category, services):
+                continue
+            seen.add(key)
+            broad_seo.append(text)
+            if len(broad_seo) == broad_seo_target:
+                break
+
+        last_counts = {"branded": len(branded), "nonBranded": len(non_branded), "localSeo": len(local_seo), "broadSeo": len(broad_seo)}
+        if (len(branded) + len(non_branded) + len(local_seo) + len(broad_seo)) > (len(best_branded) + len(best_non_branded) + len(best_local_seo) + len(best_broad_seo)):
             best_branded = branded[:]
             best_non_branded = non_branded[:]
+            best_local_seo = local_seo[:]
+            best_broad_seo = broad_seo[:]
 
-        if len(branded) == 5 and len(non_branded) == 15:
-            return [*branded, *non_branded]
+        if len(branded) == branded_target and len(non_branded) == non_branded_target and len(local_seo) == local_seo_target and len(broad_seo) == broad_seo_target:
+            return [*branded, *non_branded, *local_seo, *broad_seo]
 
         print(
             "[Phase5] advanced question-gen retry "
-            f"attempt={attempt}/{quality_attempts} branded={len(branded)}/5 non_branded={len(non_branded)}/15"
+            f"attempt={attempt}/{quality_attempts} branded={len(branded)}/{branded_target} "
+            f"non_branded={len(non_branded)}/{non_branded_target} local_seo={len(local_seo)}/{local_seo_target} "
+            f"broad_seo={len(broad_seo)}/{broad_seo_target}"
         )
 
-    if len(best_branded) == 5 and len(best_non_branded) >= 12:
-        missing_non_branded = 15 - len(best_non_branded)
-        repair_prompt = f"""
-You are repairing a strict SEO question set. Do NOT rewrite the existing questions.
+    seen = {q.lower().rstrip("?.!") for q in [*best_branded, *best_non_branded, *best_local_seo, *best_broad_seo]}
+    final_branded = best_branded[:branded_target]
+    final_non_branded = best_non_branded[:non_branded_target]
+    final_local_seo = best_local_seo[:local_seo_target]
+    final_broad_seo = best_broad_seo[:broad_seo_target]
 
-Business context:
-{context_block}
-
-Existing branded questions:
-{json.dumps(best_branded)}
-
-Existing non-branded questions:
-{json.dumps(best_non_branded)}
-
-Generate exactly {missing_non_branded} NEW non-branded questions only.
-
-Rules:
-- Do NOT include "{brand_name}", "{domain}", the website URL, or any brand variant.
-- Every question MUST include the same business location: "{location}".
-- Every question must be specific to this category: "{category}" or the listed services.
-- Avoid duplicates or near-duplicates of existing questions.
-- Do not use placeholder words such as "business", "company", or "place".
-- Do not use generic fallback prompts.
-
-Return ONLY valid JSON:
-{{
-  "non_branded_queries": ["...", "... exactly {missing_non_branded}"]
-}}
-"""
-        for repair_attempt in range(1, 3):
-            response = await _call_perplexity_with_retry(
-                repair_prompt,
-                retry_once=True,
-                timeout_sec=PERPLEXITY_PHASE5_TIMEOUT_SEC,
-            )
-            _, raw_extra = _extract_query_groups(response)
-            if not raw_extra and isinstance(response, dict):
-                maybe = response.get("queries")
-                if isinstance(maybe, list):
-                    raw_extra = [str(item) for item in maybe]
-
-            seen = {q.lower().rstrip("?.!") for q in [*best_branded, *best_non_branded]}
-            repaired = best_non_branded[:]
-            for item in raw_extra:
-                text = _clean_question(item)
-                key = text.lower().rstrip("?.!")
-                if len(text) < 12 or key in seen:
-                    continue
-                if _is_low_quality_query(text):
-                    continue
-                if _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain):
-                    continue
-                if not _includes_location(text, location):
-                    continue
-                if not _includes_category_or_service(text, category, services):
-                    continue
-                seen.add(key)
-                repaired.append(text)
-                if len(repaired) == 15:
-                    break
-
-            if len(repaired) == 15:
-                return [*best_branded, *repaired]
-
-            best_non_branded = repaired
-            last_counts = {"branded": len(best_branded), "non_branded": len(best_non_branded)}
-            print(
-                "[Phase5] advanced question-gen repair "
-                f"attempt={repair_attempt}/2 branded={len(best_branded)}/5 "
-                f"non_branded={len(best_non_branded)}/15"
-            )
-
-    seen = {q.lower().rstrip("?.!") for q in [*best_branded, *best_non_branded]}
-    final_branded = best_branded[:5]
-    final_non_branded = best_non_branded[:15]
-
-    if len(final_branded) < 5:
+    if len(final_branded) < branded_target:
         for candidate in _deterministic_branded_questions(
             brand_name=brand_name,
             category=category,
@@ -441,10 +517,10 @@ Return ONLY valid JSON:
                     or _includes_category_or_service(text, category, services),
                 ],
             )
-            if len(final_branded) == 5:
+            if len(final_branded) == branded_target:
                 break
 
-    if len(final_non_branded) < 15:
+    if len(final_non_branded) < non_branded_target:
         for candidate in _deterministic_non_branded_questions(
             category=category,
             location=location,
@@ -456,23 +532,74 @@ Return ONLY valid JSON:
                 seen,
                 validators=[
                     lambda text: not _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain),
+                    lambda text: _includes_category_or_service(text, category, services),
+                ],
+            )
+            if len(final_non_branded) == non_branded_target:
+                break
+
+    if len(final_local_seo) < local_seo_target:
+        for candidate in _deterministic_local_seo_questions(
+            category=category,
+            location=location,
+            services=services,
+        ):
+            _append_unique_valid_question(
+                final_local_seo,
+                candidate,
+                seen,
+                validators=[
+                    lambda text: not _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain),
                     lambda text: _includes_location(text, location),
                     lambda text: _includes_category_or_service(text, category, services),
                 ],
             )
-            if len(final_non_branded) == 15:
+            if len(final_local_seo) == local_seo_target:
                 break
 
-    if len(final_branded) == 5 and len(final_non_branded) == 15:
+    if len(final_broad_seo) < broad_seo_target:
+        for candidate in _deterministic_broad_seo_questions(
+            category=category,
+            location=location,
+            services=services,
+        ):
+            _append_unique_valid_question(
+                final_broad_seo,
+                candidate,
+                seen,
+                validators=[
+                    lambda text: not _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain),
+                    lambda text: _includes_location(text, location),
+                    lambda text: _includes_category_or_service(text, category, services),
+                ],
+            )
+            if len(final_broad_seo) == broad_seo_target:
+                break
+
+    if (
+        len(final_branded) == branded_target
+        and len(final_non_branded) == non_branded_target
+        and len(final_local_seo) == local_seo_target
+        and len(final_broad_seo) == broad_seo_target
+    ):
         print(
             "[Phase5] advanced question-gen completed with deterministic top-up "
-            f"branded={len(final_branded)}/5 non_branded={len(final_non_branded)}/15"
+            f"branded={len(final_branded)}/{branded_target} "
+            f"non_branded={len(final_non_branded)}/{non_branded_target} "
+            f"local_seo={len(final_local_seo)}/{local_seo_target} "
+            f"broad_seo={len(final_broad_seo)}/{broad_seo_target}"
         )
-        return [*final_branded, *final_non_branded]
+        return [*final_branded, *final_non_branded, *final_local_seo, *final_broad_seo]
 
-    last_counts = {"branded": len(final_branded), "non_branded": len(final_non_branded)}
+    last_counts = {
+        "branded": len(final_branded),
+        "nonBranded": len(final_non_branded),
+        "localSeo": len(final_local_seo),
+        "broadSeo": len(final_broad_seo),
+    }
     raise ValueError(
         "Question generation failed validation. "
-        f"Needed 5 branded and 15 local non-branded questions; got "
+        f"Needed {branded_target} branded, {non_branded_target} non-branded, "
+        f"{local_seo_target} local SEO, and {broad_seo_target} broad SEO questions; got "
         f"{json.dumps(last_counts)}. Please improve the saved business name, category, and location, then retry."
     )

@@ -549,6 +549,43 @@ def _clean_optional_text(value) -> str | None:
     return text or None
 
 
+DEFAULT_PHASE5_QUESTION_GENERATION = {
+    "branded": 5,
+    "nonBranded": 0,
+    "localSeo": 15,
+    "broadSeo": 0,
+}
+
+
+def _normalize_question_generation_settings(value) -> dict:
+    source = value if isinstance(value, dict) else {}
+    def _safe_count(key: str) -> int:
+        try:
+            return max(0, int(source.get(key, DEFAULT_PHASE5_QUESTION_GENERATION[key]) or 0))
+        except Exception:
+            return DEFAULT_PHASE5_QUESTION_GENERATION[key]
+    normalized = {
+        "branded": _safe_count("branded"),
+        "nonBranded": _safe_count("nonBranded"),
+        "localSeo": _safe_count("localSeo"),
+        "broadSeo": _safe_count("broadSeo"),
+    }
+    total = sum(normalized.values())
+    if total <= 0:
+        return dict(DEFAULT_PHASE5_QUESTION_GENERATION)
+    if total > 20:
+        overflow = total - 20
+        for key in ["broadSeo", "localSeo", "nonBranded", "branded"]:
+            remove = min(normalized[key], overflow)
+            normalized[key] -= remove
+            overflow -= remove
+            if overflow <= 0:
+                break
+    elif total < 20:
+        normalized["localSeo"] += 20 - total
+    return normalized
+
+
 def _public_business_doc(doc: dict | None) -> dict | None:
     if not doc:
         return None
@@ -567,6 +604,7 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "targetAudience": doc.get("targetAudience"),
         "blogVoice": doc.get("blogVoice"),
         "blogKeywords": doc.get("blogKeywords") if isinstance(doc.get("blogKeywords"), list) else [],
+        "questionGeneration": _normalize_question_generation_settings(doc.get("questionGeneration")),
         "competitors": doc.get("competitors") if isinstance(doc.get("competitors"), list) else [],
         "systemCompetitors": doc.get("systemCompetitors") if isinstance(doc.get("systemCompetitors"), list) else [],
         "trackedPages": doc.get("trackedPages") if isinstance(doc.get("trackedPages"), list) else [],
@@ -820,6 +858,7 @@ async def _upsert_user_business(
     ai_description: str | None = None,
     services: list[str] | None = None,
     target_audience: str | None = None,
+    question_generation: dict | None = None,
     competitors: list[str] | None = None,
     system_competitors: list[dict] | None = None,
     tracked_pages: list[str] | None = None,
@@ -886,6 +925,8 @@ async def _upsert_user_business(
         if isinstance(values, list):
             cleaned = [str(v).strip() for v in values if str(v or "").strip()]
             set_fields[key] = cleaned
+    if isinstance(question_generation, dict):
+        set_fields["questionGeneration"] = _normalize_question_generation_settings(question_generation)
     if isinstance(system_competitors, list):
         cleaned_system_competitors: list[dict] = []
         seen_domains: set[str] = set()
@@ -1427,6 +1468,7 @@ async def api_user_business_upsert(
         ai_description=request.aiDescription,
         services=request.services,
         target_audience=request.targetAudience,
+        question_generation=request.questionGeneration,
         competitors=request.competitors,
         system_competitors=request.systemCompetitors,
         tracked_pages=request.trackedPages,
@@ -3143,8 +3185,16 @@ async def api_phase5_generate_questions(
                 or []
             ),
         }
+        question_generation = _normalize_question_generation_settings(
+            req.questionGeneration
+            or (business_doc.get("questionGeneration") if business_doc else None)
+        )
 
-        questions = await generate_brand_questions(req.url, business_context=business_context)
+        questions = await generate_brand_questions(
+            req.url,
+            business_context=business_context,
+            question_counts=question_generation,
+        )
         configured_model = (os.getenv("PERPLEXITY_MODEL_PHASE5") or "sonar-pro").strip() or None
         await _log_ai_usage_event({
             "feature": "phase5_generate_questions",
@@ -3157,8 +3207,10 @@ async def api_phase5_generate_questions(
             "ai_calls_estimate": 1,
             "details": {
                 "questions_count": len(questions or []),
-                "branded_questions_count": 5,
-                "non_branded_questions_count": 15,
+                "branded_questions_count": question_generation["branded"],
+                "non_branded_questions_count": question_generation["nonBranded"],
+                "local_seo_questions_count": question_generation["localSeo"],
+                "broad_seo_questions_count": question_generation["broadSeo"],
                 "business_id": req.business_id,
                 "has_saved_business_context": bool(business_doc),
                 "has_category": bool(business_context.get("category")),
