@@ -542,3 +542,96 @@ async def generate_deep_competitor_scores(
     )
 
     return final_competitors
+
+
+async def generate_public_competitor_suggestions(
+    *,
+    url: str,
+    questions: list[dict],
+    business_name: str = "",
+    category: str = "",
+    location: str = "",
+    description: str = "",
+    desired_count: int = 4,
+) -> list[dict]:
+    """Fast competitor suggestions for public signup/onboarding.
+
+    This keeps the public landing flow responsive. Phase 5 still uses the
+    deeper multi-pass competitor scoring path.
+    """
+    domain = _normalize_domain(url)
+    desired_count = max(1, min(4, desired_count))
+    compact_questions = [str(q.get("text", "")).strip() for q in questions if str(q.get("text", "")).strip()][:8]
+
+    prompt = f"""
+    You are a precise market-research assistant for a SaaS onboarding flow.
+    Use live web search and return direct competitor business websites for this target.
+
+    Target:
+    - Domain: {domain}
+    - Business name: {business_name or "unknown"}
+    - Category: {category or "unknown"}
+    - Location: {location or "unknown"}
+    - Description: {description[:240] or "unknown"}
+
+    Search intents:
+    {json.dumps(compact_questions)}
+
+    Return JSON only:
+    {{
+      "competitors": [
+        {{
+          "name": "Official business name",
+          "domain": "competitor.com",
+          "url": "https://competitor.com/",
+          "score": 90,
+          "evidence": "Why this is a direct competitor"
+        }}
+      ]
+    }}
+
+    Rules:
+    - Return exactly {desired_count} competitors if direct competitors can be verified.
+    - Return fewer only when fewer verified direct competitors are found.
+    - Direct competitors must match the category and customer intent.
+    - Prefer businesses in or near the specified location.
+    - Use the official homepage or official business website.
+    - Do not include review sites, directories, booking platforms, articles, social media, or the target domain.
+    - Do not invent domains.
+    - name must be the real public business name.
+    - score must be an integer from 70 to 95 based on competitor strength.
+    """
+
+    response = await _call_claude_web_search_with_retry(
+        prompt,
+        retry_once=False,
+        timeout_sec=32,
+        max_uses=6,
+    )
+
+    parsed = response if isinstance(response, dict) else {}
+    if not isinstance(parsed.get("competitors"), list):
+        parsed = _safe_json_parse(str(parsed.get("_meta_response_text") or "")) if isinstance(parsed, dict) else {}
+
+    raw = parsed.get("competitors", []) if isinstance(parsed, dict) else []
+    if not isinstance(raw, list):
+        return []
+
+    out: list[dict] = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        normalized = _normalize_competitor_item(item, domain)
+        if not normalized:
+            continue
+        competitor_domain = normalized["domain"]
+        if competitor_domain in seen:
+            continue
+        seen.add(competitor_domain)
+        normalized["confidence"] = "verified"
+        out.append(normalized)
+        if len(out) >= desired_count:
+            break
+
+    return out[:desired_count]
