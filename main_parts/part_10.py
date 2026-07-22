@@ -232,6 +232,14 @@ async def _phase5_worker_startup():
         if auth_handoffs_col is not None:
             await auth_handoffs_col.create_index("code_hash", unique=True)
             await auth_handoffs_col.create_index("expires_at", expireAfterSeconds=0)
+        if google_integrations_col is not None:
+            await google_integrations_col.create_index("user_id", unique=True)
+        if analytics_snapshots_col is not None:
+            await analytics_snapshots_col.create_index([
+                ("user_id", 1),
+                ("business_id", 1),
+                ("created_at", -1),
+            ])
     except Exception:
         print("[Phase5] warning: index creation failed; continuing without blocking startup")
         traceback.print_exc()

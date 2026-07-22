@@ -169,6 +169,8 @@ generated_content_pages_col = None
 competitor_tracking_runs_col = None
 weekly_blog_suggestions_col = None
 auth_handoffs_col = None
+google_integrations_col = None
+analytics_snapshots_col = None
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
     db = mongo_client.get_database("wonderai")
@@ -180,6 +182,8 @@ try:
     competitor_tracking_runs_col = db.get_collection("competitor_tracking_runs")
     weekly_blog_suggestions_col = db.get_collection("weekly_blog_suggestions")
     auth_handoffs_col = db.get_collection("auth_handoffs")
+    google_integrations_col = db.get_collection("google_integrations")
+    analytics_snapshots_col = db.get_collection("analytics_snapshots")
     phase5_jobs_col = db.get_collection("phase5_jobs")
     ai_usage_col = db.get_collection("ai_usage_events")
     user_history_meta_col = db.get_collection("user_history_meta")

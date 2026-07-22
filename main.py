@@ -20,6 +20,7 @@ _CHUNK_FILES = [
     "part_09.py",
     "part_10.py",
     "part_11.py",
+    "part_12.py",
 ]
 
 for _chunk_file in _CHUNK_FILES:
