@@ -12,6 +12,7 @@ from .helpers import (
     _normalize_domain,
     _safe_json_parse,
 )
+from .providers import _call_openai_with_retry
 from .providers import _call_perplexity_with_retry
 from .providers import _call_claude_web_search_with_retry
 
@@ -608,6 +609,20 @@ async def generate_public_competitor_suggestions(
         timeout_sec=32,
         max_uses=6,
     )
+    provider_label = "claude-web-search"
+
+    if not isinstance(response, dict):
+        print(f"[Phase5][PublicCompetitors] Claude unavailable for {domain}; falling back to OpenAI")
+        openai_prompt = prompt.replace(
+            "Use live web search and return direct competitor business websites for this target.",
+            "Return likely direct competitor business websites for this target using the supplied business context. Prefer well-known official websites and do not include directories or review platforms.",
+        )
+        response = await _call_openai_with_retry(
+            openai_prompt,
+            retry_once=True,
+            timeout_sec=45,
+        )
+        provider_label = "openai-fallback"
 
     parsed = response if isinstance(response, dict) else {}
     if not isinstance(parsed.get("competitors"), list):
@@ -629,7 +644,7 @@ async def generate_public_competitor_suggestions(
         if competitor_domain in seen:
             continue
         seen.add(competitor_domain)
-        normalized["confidence"] = "verified"
+        normalized["confidence"] = "verified" if provider_label == "claude-web-search" else "openai-fallback"
         out.append(normalized)
         if len(out) >= desired_count:
             break
