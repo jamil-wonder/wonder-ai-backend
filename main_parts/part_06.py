@@ -97,7 +97,7 @@ async def api_public_competitors(
             request=http_request,
             current_user=current_user,
             endpoint_key="competitors",
-            max_calls=3,
+            max_calls=PUBLIC_COMPETITOR_LOOKUP_LIMIT,
         )
         target_domain = _normalize_domain(request.url)
         questions = _build_public_competitor_questions(request)

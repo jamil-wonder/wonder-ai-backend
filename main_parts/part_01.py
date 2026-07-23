@@ -400,6 +400,7 @@ class PublicCompetitorsResponse(BaseModel):
 PUBLIC_PREVIEW_ATTEMPT_LIMIT = int(os.getenv("PUBLIC_PREVIEW_ATTEMPT_LIMIT", "3"))
 PUBLIC_PREVIEW_SUCCESS_LIMIT = int(os.getenv("PUBLIC_PREVIEW_SUCCESS_LIMIT", "1"))
 PUBLIC_PREVIEW_WINDOW_HOURS = int(os.getenv("PUBLIC_PREVIEW_WINDOW_HOURS", "24"))
+PUBLIC_COMPETITOR_LOOKUP_LIMIT = int(os.getenv("PUBLIC_COMPETITOR_LOOKUP_LIMIT", "8"))
 
 
 def _normalize_site(value: str) -> str:
