@@ -103,6 +103,7 @@ async def api_public_competitors(
         questions = _build_public_competitor_questions(request)
         print(f"[API] /api/public/competitors started: {request.url} questions={len(questions)}")
 
+        public_competitor_timeout_seconds = 300
         raw_competitors = await asyncio.wait_for(
             generate_public_competitor_suggestions(
                 url=request.url,
@@ -113,7 +114,7 @@ async def api_public_competitors(
                 description=request.description or "",
                 desired_count=4,
             ),
-            timeout=22,
+            timeout=public_competitor_timeout_seconds,
         )
 
         competitors: list[dict] = []
@@ -162,7 +163,7 @@ async def api_public_competitors(
         return PublicCompetitorsResponse(success=True, competitors=competitors)
     except asyncio.TimeoutError:
         print(f"[API] /api/public/competitors timeout: {request.url}")
-        return PublicCompetitorsResponse(success=False, competitors=[], error="Competitor lookup timed out. Please retry.")
+        return PublicCompetitorsResponse(success=False, competitors=[], error="Competitor lookup took too long. Please retry or add domains manually.")
     except HTTPException:
         raise
     except Exception as e:
