@@ -17,8 +17,6 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import BaseModel, Field
 
-import pandas as pd
-
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import UpdateOne
 from bson.objectid import ObjectId
