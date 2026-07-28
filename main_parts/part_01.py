@@ -28,13 +28,6 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 import bcrypt
 from jose import JWTError, jwt
 
-from part_02 import *
-from part_03 import *
-from part_04 import *
-from part_05 import *
-from part_06 import *
-from part_07 import *
-
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production-please")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
