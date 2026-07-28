@@ -139,9 +139,9 @@ else:
     ]
 
 # Setup MongoDB
-MONGO_URL = os.getenv("MONGODB_URL")
+MONGO_URL = os.getenv("MONGODB_URL") or os.getenv("MONGO_URI") or "mongodb://localhost:27017"
 if not MONGO_URL:
-    raise RuntimeError("CRITICAL ERROR: MONGODB_URL is missing from environment variables.")
+    print("WARNING: MONGODB_URL is missing from environment variables. Using localhost fallback.")
 phase5_jobs_col = None
 ai_usage_col = None
 user_history_meta_col = None
