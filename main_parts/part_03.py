@@ -112,19 +112,44 @@ async def _upsert_user_business(
     else:
         query = {"user_id": current_user["id"], "normalized_domain": normalized_domain}
 
+    # Weekly Score Bucket Logic: Year-Week ID (e.g. 2026-W30)
+    if phase1_score is not None:
+        dt = datetime.utcnow()
+        week_id = f"{dt.isocalendar().year}-W{dt.isocalendar().week:02d}"
+        
+        # Check existing document for weekly_scores
+        existing = await businesses_col.find_one(query)
+        weekly_scores = (existing.get("weekly_scores") if existing else []) or []
+        
+        # Find if current week bucket exists
+        found = False
+        for entry in weekly_scores:
+            if entry.get("week_id") == week_id:
+                entry["score"] = int(phase1_score)
+                entry["updated_at"] = now_iso
+                found = True
+                break
+        
+        if not found:
+            weekly_scores.append({
+                "week_id": week_id,
+                "score": int(phase1_score),
+                "created_at": now_iso,
+                "updated_at": now_iso,
+            })
+        
+        # Retain last 52 weeks max
+        if len(weekly_scores) > 52:
+            weekly_scores = weekly_scores[-52:]
+            
+        set_fields["weekly_scores"] = weekly_scores
+
     update_doc = {
         "$set": set_fields,
         "$setOnInsert": {
             "created_at": now_iso,
         },
     }
-    if phase1_score is not None:
-        update_doc["$push"] = {
-            "scores_history": {
-                "timestamp": now_iso,
-                "score": int(phase1_score)
-            }
-        }
 
     return await businesses_col.find_one_and_update(
         query,

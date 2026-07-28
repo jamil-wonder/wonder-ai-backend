@@ -170,12 +170,44 @@ async def api_user_history_clear(current_user: dict = Depends(get_current_user))
 
 @app.get("/api/user/history/site-trend")
 async def api_user_history_site_trend(site: str, range: str = "month", current_user: dict = Depends(get_current_user)):
-    if phase5_jobs_col is None:
-        raise HTTPException(status_code=503, detail="phase5 job storage unavailable")
-
     site_host = _normalize_site(site)
     if not site_host:
         raise HTTPException(status_code=400, detail="A valid site is required")
+
+    # 1. Check if business profile has weekly_scores saved in MongoDB
+    if businesses_col is not None:
+        biz = await businesses_col.find_one({
+            "user_id": current_user["id"],
+            "normalized_domain": site_host,
+        })
+        if biz and isinstance(biz.get("weekly_scores"), list) and len(biz["weekly_scores"]) > 0:
+            weekly_points = []
+            for w in biz["weekly_scores"]:
+                if isinstance(w.get("score"), (int, float)):
+                    weekly_points.append({
+                        "job_id": w.get("week_id"),
+                        "url": site_host,
+                        "status": "completed",
+                        "score": round(float(w["score"]), 2),
+                        "created_at": w.get("updated_at") or w.get("created_at"),
+                        "week_id": w.get("week_id"),
+                    })
+            first_score = weekly_points[0]["score"] if weekly_points else None
+            last_score = weekly_points[-1]["score"] if weekly_points else None
+            delta = round(float(last_score) - float(first_score), 2) if (first_score is not None and last_score is not None) else None
+            return {
+                "site": site_host,
+                "range": range,
+                "total_points": len(weekly_points),
+                "points": weekly_points,
+                "first_score": first_score,
+                "latest_score": last_score,
+                "delta": delta,
+                "direction": "up" if delta and delta > 0 else "down" if delta and delta < 0 else "flat",
+            }
+
+    if phase5_jobs_col is None:
+        raise HTTPException(status_code=503, detail="phase5 job storage unavailable")
 
     query = {
         "user_id": current_user["id"],
