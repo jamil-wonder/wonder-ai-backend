@@ -17,6 +17,8 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import BaseModel, Field
 
+import pandas as pd
+
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import UpdateOne
 from bson.objectid import ObjectId
@@ -25,27 +27,28 @@ from fastapi import FastAPI, HTTPException, Request, Depends, status, Query, Bac
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-import bcrypt
+from passlib.context import CryptContext
 from jose import JWTError, jwt
+
+from part_02 import *
+from part_03 import *
+from part_04 import *
+from part_05 import *
+from part_06 import *
+from part_07 import *
 
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production-please")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    try:
-        if hashed_password.startswith("$2b$") or hashed_password.startswith("$2a$"):
-            return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
-    except Exception:
-        pass
-    # Fallback to simple hash comparison
-    return hashlib.sha256(plain_password.encode("utf-8")).hexdigest() == hashed_password
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
 
-def get_password_hash(password: str) -> str:
-    salt = bcrypt.gensalt()
-    return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
+def get_password_hash(password):
+    return pwd_context.hash(password)
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -139,9 +142,9 @@ else:
     ]
 
 # Setup MongoDB
-MONGO_URL = os.getenv("MONGODB_URL") or os.getenv("MONGO_URI") or "mongodb://localhost:27017"
+MONGO_URL = os.getenv("MONGODB_URL")
 if not MONGO_URL:
-    print("WARNING: MONGODB_URL is missing from environment variables. Using localhost fallback.")
+    raise RuntimeError("CRITICAL ERROR: MONGODB_URL is missing from environment variables.")
 phase5_jobs_col = None
 ai_usage_col = None
 user_history_meta_col = None
