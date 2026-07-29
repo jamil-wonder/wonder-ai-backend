@@ -167,7 +167,7 @@ class BusinessResponse(BaseModel):
     blogVoice: Optional[str] = None
     blogKeywords: List[str] = Field(default_factory=list)
     questionGeneration: Dict[str, int] = Field(
-        default_factory=lambda: {"branded": 5, "nonBranded": 0, "localSeo": 15, "broadSeo": 0}
+        default_factory=lambda: {"branded": 5, "nonBranded": 5, "localSeo": 5, "broadSeo": 5}
     )
     competitors: List[str] = Field(default_factory=list)
     systemCompetitors: List[Dict[str, Any]] = Field(default_factory=list)

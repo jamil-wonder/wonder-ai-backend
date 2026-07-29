@@ -363,10 +363,38 @@ def _is_low_quality_query(text: str) -> bool:
     if any(p in raw for p in noisy_phrases):
         return True
 
+    advice_patterns = [
+        r"^what should i look for\b",
+        r"^how (do|can|should) i compare\b",
+        r"^how (do|can|should) i check\b",
+        r"^what is the best way to\b",
+        r"^what's the best way to\b",
+        r"^how (do|can|should) i choose\b",
+        r"^how (do|can|should) i decide\b",
+    ]
+    if any(re.search(pattern, raw) for pattern in advice_patterns):
+        return True
+
     if re.search(r"\b(business|company|place)\b", raw):
         return True
 
     if "??" in raw:
+        return True
+
+    word_count = len(re.findall(r"\b[a-z0-9]+\b", raw))
+    if word_count <= 4:
+        return True
+
+    thin_best_patterns = [
+        r"^best\s+[a-z0-9 &'-]+\s+in\s+[a-z0-9 ,&'-]+\?$",
+        r"^best\s+[a-z0-9 &'-]+\s+near\s+[a-z0-9 ,&'-]+\?$",
+        r"^best\s+[a-z0-9 &'-]+\s+around\s+[a-z0-9 ,&'-]+\?$",
+        r"^best\s+[a-z0-9 &'-]+\s+options\s+for\s+[a-z0-9 ,&'-]+\?$",
+    ]
+    if word_count <= 8 and any(re.match(pattern, raw) for pattern in thin_best_patterns):
+        return True
+
+    if " options for " in raw and word_count <= 8:
         return True
 
     return False

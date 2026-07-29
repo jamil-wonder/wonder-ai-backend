@@ -276,16 +276,39 @@ async def api_phase5_generate_questions(
                 or (business_doc.get("services") if business_doc else [])
                 or []
             ),
+            "avoidQuestions": req.avoidQuestions or [],
         }
         question_generation = _normalize_question_generation_settings(
             req.questionGeneration
             or (business_doc.get("questionGeneration") if business_doc else None)
         )
+        print(
+            "[Phase5] generate-questions requested mix "
+            f"branded={question_generation['branded']} "
+            f"non_branded={question_generation['nonBranded']} "
+            f"local_seo={question_generation['localSeo']} "
+            f"broad_seo={question_generation['broadSeo']}"
+        )
 
-        questions = await generate_brand_questions(
+        question_result = await generate_brand_questions(
             req.url,
             business_context=business_context,
             question_counts=question_generation,
+            return_groups=True,
+        )
+        if isinstance(question_result, dict):
+            questions = question_result.get("questions") or []
+            question_groups = question_result.get("questionGroups") or {}
+        else:
+            questions = question_result or []
+            question_groups = {}
+        print(
+            "[Phase5] generate-questions output groups "
+            f"branded={len(question_groups.get('branded') or [])} "
+            f"non_branded={len(question_groups.get('nonBranded') or [])} "
+            f"local_seo={len(question_groups.get('localSeo') or [])} "
+            f"broad_seo={len(question_groups.get('broadSeo') or [])} "
+            f"total={len(questions or [])}"
         )
         configured_model = (os.getenv("PERPLEXITY_MODEL_PHASE5") or "sonar-pro").strip() or None
         await _log_ai_usage_event({
@@ -309,7 +332,7 @@ async def api_phase5_generate_questions(
                 "has_location": bool(business_context.get("location")),
             },
         })
-        return {"questions": questions}
+        return {"questions": questions, "questionGroups": question_groups}
     except ValueError as e:
         print(f"[Phase5] generate-questions validation failed: {str(e)}")
         raise HTTPException(

@@ -125,9 +125,9 @@ def _clean_optional_text(value) -> str | None:
 
 DEFAULT_PHASE5_QUESTION_GENERATION = {
     "branded": 5,
-    "nonBranded": 0,
-    "localSeo": 15,
-    "broadSeo": 0,
+    "nonBranded": 5,
+    "localSeo": 5,
+    "broadSeo": 5,
 }
 
 
@@ -156,7 +156,7 @@ def _normalize_question_generation_settings(value) -> dict:
             if overflow <= 0:
                 break
     elif total < 20:
-        normalized["localSeo"] += 20 - total
+        return dict(DEFAULT_PHASE5_QUESTION_GENERATION)
     return normalized
 
 

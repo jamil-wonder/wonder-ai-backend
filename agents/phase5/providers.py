@@ -185,7 +185,7 @@ async def _call_openai_chat_json(prompt: str, timeout_sec: int | None = None) ->
     chat_payload = {
         "model": model,
         "temperature": 0.0,
-        "max_tokens": 700,
+        "max_tokens": 1600,
         "messages": [
             {
                 "role": "system",
@@ -200,7 +200,7 @@ async def _call_openai_chat_json(prompt: str, timeout_sec: int | None = None) ->
     responses_payload = {
         "model": model,
         "input": prompt,
-        "max_output_tokens": 700,
+        "max_output_tokens": 1600,
     }
 
     try:
