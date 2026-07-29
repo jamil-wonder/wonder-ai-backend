@@ -232,18 +232,38 @@ async def _blog_model_json(
         )
         return parsed, model, "openai"
     if normalized == "perplexity":
-        parsed, model = await _perplexity_response_json(
-            prompt=prompt,
-            timeout_seconds=timeout_seconds,
-        )
-        return parsed, model, "perplexity"
+        try:
+            parsed, model = await _perplexity_response_json(
+                prompt=prompt,
+                timeout_seconds=timeout_seconds,
+            )
+            return parsed, model, "perplexity"
+        except Exception as exc:
+            print(f"[Blog AI] Perplexity failed; falling back to OpenAI: {type(exc).__name__}")
+            parsed, model = await _openai_chat_json(
+                prompt=prompt,
+                timeout_seconds=timeout_seconds,
+                temperature=0.35,
+                max_tokens=max_tokens,
+            )
+            return parsed, model, "openai-fallback"
     if normalized in {"claude", "anthropic"}:
-        parsed, model = await _anthropic_chat_json(
-            prompt=prompt,
-            timeout_seconds=timeout_seconds,
-            max_tokens=max_tokens,
-        )
-        return parsed, model, "anthropic"
+        try:
+            parsed, model = await _anthropic_chat_json(
+                prompt=prompt,
+                timeout_seconds=timeout_seconds,
+                max_tokens=max_tokens,
+            )
+            return parsed, model, "anthropic"
+        except Exception as exc:
+            print(f"[Blog AI] Anthropic failed; falling back to OpenAI: {type(exc).__name__}")
+            parsed, model = await _openai_chat_json(
+                prompt=prompt,
+                timeout_seconds=timeout_seconds,
+                temperature=0.35,
+                max_tokens=max_tokens,
+            )
+            return parsed, model, "openai-fallback"
     raise ValueError("Unsupported blog model. Choose chatgpt, perplexity, or claude.")
 
 
