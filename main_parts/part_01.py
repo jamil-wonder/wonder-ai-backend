@@ -140,22 +140,25 @@ PHASE5_RESUME_QUEUED_ON_STARTUP = str(os.getenv("PHASE5_RESUME_QUEUED_ON_STARTUP
 PHASE5_WORKER_ID = f"{os.getenv('HOSTNAME', 'local')}-{uuid.uuid4().hex[:8]}"
 PHASE5_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
+default_allowed_origins = [
+    "https://wonderscore.ai",
+    "https://www.wonderscore.ai",
+    "https://app.wonderscore.ai",
+    "https://api.wonderscore.ai",
+    "https://wonder-landing-mu.vercel.app",
+    "https://wonder-new-dashboard.vercel.app",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
-if allowed_origins_env.strip():
-    allowed_origins = [origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()]
-else:
-    allowed_origins = [
-        "https://wonderscore.ai",
-        "https://www.wonderscore.ai",
-        "https://app.wonderscore.ai",
-        "https://api.wonderscore.ai",
-        "https://wonder-landing-mu.vercel.app",
-        "https://wonder-new-dashboard.vercel.app",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ]
+env_allowed_origins = [
+    origin.strip()
+    for origin in allowed_origins_env.split(",")
+    if origin.strip()
+]
+allowed_origins = list(dict.fromkeys([*default_allowed_origins, *env_allowed_origins]))
 
 # Setup MongoDB
 MONGO_URL = os.getenv("MONGODB_URL")
