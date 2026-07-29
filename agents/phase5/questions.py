@@ -101,12 +101,16 @@ def _append_unique_valid_question(
     seen: set[str],
     *,
     validators: list,
+    brand_name_for_quality: str = "",
 ) -> bool:
     text = _clean_question(candidate)
     key = text.lower().rstrip("?.!")
     if len(text) < 12 or key in seen:
         return False
-    if _is_low_quality_query(text):
+    quality_text = text
+    if brand_name_for_quality:
+        quality_text = re.sub(re.escape(_text(brand_name_for_quality)), "", quality_text, flags=re.IGNORECASE)
+    if _is_low_quality_query(quality_text):
         return False
     for validator in validators:
         if not validator(text):
@@ -416,7 +420,8 @@ Return ONLY valid JSON:
             key = text.lower().rstrip("?.!")
             if len(text) < 12 or key in seen:
                 continue
-            if _is_low_quality_query(text):
+            quality_text = re.sub(re.escape(brand_name), "", text, flags=re.IGNORECASE)
+            if _is_low_quality_query(quality_text):
                 continue
             if not _includes_brand(text, brand_name):
                 continue
@@ -516,6 +521,7 @@ Return ONLY valid JSON:
                     lambda text: _includes_location(text, location)
                     or _includes_category_or_service(text, category, services),
                 ],
+                brand_name_for_quality=brand_name,
             )
             if len(final_branded) == branded_target:
                 break
