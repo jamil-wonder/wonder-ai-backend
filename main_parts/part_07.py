@@ -60,7 +60,8 @@ async def _build_weekly_blogs_for_business(
     for idx, idea in enumerate(ideas[:2]):
         generated = await generate_seo_blog(
             title=str(idea.get("title") or f"Weekly blog idea {idx + 1}"),
-            target_words=1100,
+            target_words=1500,
+            business_name=business_name,
             primary_keyword=str(idea.get("primaryKeyword") or (suggested_keywords[0] if suggested_keywords else "")),
             audience=str(idea.get("audience") or "Potential customers"),
             tone=blog_voice or "clear, helpful, human, specific",
@@ -267,11 +268,12 @@ async def api_blogs_generate(request: BlogGenerateRequest, current_user: dict = 
     if selected_model not in {"chatgpt", "perplexity", "claude"}:
         raise HTTPException(status_code=400, detail="Choose chatgpt, perplexity, or claude.")
 
-    target_words = max(1000, min(int(request.target_words or 1200), 1500))
+    target_words = max(1200, min(int(request.target_words or 1500), 1600))
     try:
         generated = await generate_seo_blog(
             title=title,
             target_words=target_words,
+            business_name=business_doc.get("name") if isinstance(business_doc, dict) else None,
             primary_keyword=_clean_optional_text(request.primary_keyword),
             audience=_clean_optional_text(request.audience),
             tone=_clean_optional_text(request.tone),

@@ -812,6 +812,7 @@ async def generate_seo_blog(
     *,
     title: str,
     target_words: int,
+    business_name: str | None = None,
     primary_keyword: str | None = None,
     audience: str | None = None,
     tone: str | None = None,
@@ -820,16 +821,18 @@ async def generate_seo_blog(
     internal_links: list[str] | None = None,
     selected_model: str = "chatgpt",
 ) -> dict:
-    safe_words = max(700, min(int(target_words or 1200), 1500))
-    min_words = max(650, min(1000, safe_words - 180))
-    max_words = min(1500, max(1000, safe_words + 120))
+    brand = (business_name or "").strip()
+    safe_words = max(1200, min(int(target_words or 1500), 1600))
+    min_words = max(1100, safe_words - 150)
+    max_words = min(1600, safe_words + 100)
     prompt = f"""
     You are an expert SEO blog strategist and conversion copywriter.
-    Create a complete SEO-friendly blog article as structured JSON.
+    Create a comprehensive, in-depth SEO blog article as structured JSON.
 
     Blog brief:
     - Title: {title}
-    - Target word count: {safe_words} words
+    - Business / Brand Name: {brand or "the business"}
+    - Target word count: {safe_words} words (min: {min_words}, max: {max_words})
     - Primary keyword: {primary_keyword or "infer from title"}
     - Audience: {audience or "qualified readers searching this topic"}
     - Tone: {tone or "clear, authoritative, helpful"}
@@ -851,12 +854,12 @@ async def generate_seo_blog(
       ]
     }}
 
-    Rules:
-    - Total article body must be between {min_words} and {max_words} words, never over 1500 words.
-    - Use helpful H2-style section headings and include one FAQ section if relevant.
-    - Make it SEO-friendly without keyword stuffing.
-    - Include specific benefits, features, selling points, and next steps from the brief.
-    - Do not include markdown fences. JSON only.
+    CRITICAL CONTENT RULES:
+    1. BRAND MENTIONS: You MUST naturally weave the brand name "{brand}" into the article AT LEAST 15 TIMES (and up to 30 times maximum across headings, intro, body paragraphs, case examples, recommendations, and closing call to action).
+    2. LENGTH: The total article body MUST be between {min_words} and {max_words} words (aiming for ~{safe_words} words). Write thorough, rich, detailed paragraphs instead of brief summaries.
+    3. INTEGRATION: Incorporate real business context, service offerings, customer benefits, and local/industry authority.
+    4. STRUCTURE: Use at least 5-6 H2 sections, bullet points, and an FAQ section at the end.
+    5. FORMAT: Do not include markdown code block fences. Return raw JSON only.
     """
 
     parsed, model, provider = await _blog_model_json(
