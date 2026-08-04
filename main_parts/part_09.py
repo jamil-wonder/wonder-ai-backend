@@ -31,8 +31,23 @@ async def _process_phase5_job(job_doc: dict):
             score_map: dict[str, dict] = {}
             for provider_name in providers:
                 score_map[provider_name] = compute_provider_score(results_map, provider_name)
-            numeric_scores = [float(v.get("score", 0)) for v in score_map.values() if isinstance(v, dict)]
-            overall = round(sum(numeric_scores) / len(numeric_scores), 2) if numeric_scores else None
+
+            # A provider with zero mentions AND zero citations across every
+            # single question in the run (total > 0) almost certainly failed
+            # outright this run (expired key, no credit, bad auth) rather
+            # than genuinely finding nothing on every question — a real
+            # working call nearly always surfaces at least some citation
+            # domains even on a "not mentioned" answer. Don't let a dead
+            # provider's forced ~0 drag overall_score down for the providers
+            # that actually ran; average only the ones with real signal.
+            usable_scores = [
+                float(v.get("score", 0))
+                for v in score_map.values()
+                if isinstance(v, dict) and v.get("total", 0) > 0 and (v.get("mentioned", 0) > 0 or v.get("cited", 0) > 0)
+            ]
+            if not usable_scores:
+                usable_scores = [float(v.get("score", 0)) for v in score_map.values() if isinstance(v, dict)]
+            overall = round(sum(usable_scores) / len(usable_scores), 2) if usable_scores else None
             return score_map, overall
 
         questions = list(job_doc.get("questions", []))
@@ -324,20 +339,12 @@ async def _process_phase5_job(job_doc: dict):
 
         # Finalize job status
         final_scores, final_overall = _compute_provider_scores(accumulated_results) if model_provider == "multi" else ({}, None)
-        await phase5_jobs_col.update_one(
-            {"job_id": job_id},
-            {
-                "$set": {
-                    "status": "completed",
-                    "current_question_id": None,
-                    "provider_scores": final_scores,
-                    "overall_score": final_overall,
-                    "deep_competitors": deep_competitors,
-                    "brand_summary": brand_summary,
-                    "updated_at": datetime.utcnow().isoformat(),
-                }
-            },
-        )
+
+        # Merge into the business's persisted systemCompetitors BEFORE
+        # marking the job "completed" — the frontend refetches
+        # /api/user/businesses the instant it observes "completed", so if
+        # this ran afterward instead, that refetch could easily land in the
+        # gap and see stale data (this was exactly that race).
         try:
             external_system_competitors = [
                 {
@@ -366,6 +373,21 @@ async def _process_phase5_job(job_doc: dict):
             )
         except Exception as business_error:
             print(f"[Business] phase5 upsert failed: {business_error}")
+
+        await phase5_jobs_col.update_one(
+            {"job_id": job_id},
+            {
+                "$set": {
+                    "status": "completed",
+                    "current_question_id": None,
+                    "provider_scores": final_scores,
+                    "overall_score": final_overall,
+                    "deep_competitors": deep_competitors,
+                    "brand_summary": brand_summary,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+            },
+        )
         print(f"[Phase5] worker completed job_id={job_id} provider={model_provider}")
 
         await _log_ai_usage_event({

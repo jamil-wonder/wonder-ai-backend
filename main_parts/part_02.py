@@ -282,11 +282,31 @@ async def _run_competitor_tracking_for_business(
     }
     insert_result = await competitor_tracking_runs_col.insert_one(run_doc)
 
+    # Reuse real per-question results from the business's most recent
+    # completed Phase 5 run (if any) instead of always starting competitor
+    # discovery from a blank slate. Those questions already ran against
+    # OpenAI/Perplexity/Claude and captured real cited/competitor domains
+    # (visible on the Query page's Sources column) — mining that gives far
+    # more reliable candidates than a single fresh, ungrounded discovery
+    # call, and still works even when the AI providers used for *discovery*
+    # (Claude web search, with OpenAI as fallback) are unavailable.
+    seed_results: dict = {}
+    if phase5_jobs_col is not None:
+        try:
+            latest_job = await phase5_jobs_col.find_one(
+                {"business_id": business_id, "status": "completed", "results": {"$exists": True, "$ne": {}}},
+                sort=[("updated_at", -1)],
+            )
+            if latest_job and isinstance(latest_job.get("results"), dict):
+                seed_results = latest_job["results"]
+        except Exception as e:
+            print(f"[CompetitorTracking] seed lookup failed business_id={business_id}: {e}")
+
     try:
         discovered = await generate_deep_competitor_scores(
             url=url,
             questions=questions,
-            seed_results={},
+            seed_results=seed_results,
         )
 
         previous = await competitor_tracking_runs_col.find_one(

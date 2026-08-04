@@ -27,30 +27,6 @@ async def _phase5_worker_loop():
             await asyncio.sleep(PHASE5_WORKER_POLL_INTERVAL)
 
 
-async def _phase5_kick_job_processing(job_id: str):
-    """Best-effort direct claim path so newly queued jobs are not stranded."""
-    if phase5_jobs_col is None:
-        return
-    try:
-        claimed = await phase5_jobs_col.find_one_and_update(
-            {"job_id": job_id, "status": "queued"},
-            {
-                "$set": {
-                    "status": "running",
-                    "worker_id": PHASE5_WORKER_ID,
-                    "updated_at": datetime.utcnow().isoformat(),
-                }
-            },
-            return_document=ReturnDocument.AFTER,
-        )
-        if not claimed:
-            return
-        print(f"[Phase5] kick start job_id={job_id} provider={claimed.get('model')}")
-        await _process_phase5_job(claimed)
-    except Exception:
-        traceback.print_exc()
-
-
 async def _phase5_try_start_immediately(job_id: str) -> None:
     """Try to claim a newly queued job right away and process in background."""
     if phase5_jobs_col is None:

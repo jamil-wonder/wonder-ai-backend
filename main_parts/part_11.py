@@ -45,19 +45,13 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
             f"[Phase5] queued job_id={job_id} provider={model_provider} "
             f"type=core questions={len(questions_dicts)}"
         )
-        await phase5_jobs_col.update_one(
-            {"job_id": job_id},
-            {
-                "$set": {
-                    "status": "running",
-                    "worker_id": PHASE5_WORKER_ID,
-                    "updated_at": datetime.utcnow().isoformat(),
-                }
-            },
-        )
-        print(f"[Phase5] immediate start job_id={job_id} provider={model_provider}")
-        running_doc = {**job_doc, "status": "running", "worker_id": PHASE5_WORKER_ID}
-        asyncio.create_task(_process_phase5_job(running_doc))
+        # Atomically claim-and-start so this can't race the background
+        # worker loop, which also polls for "queued" jobs — a plain
+        # insert + separate update-to-running here was not atomic, so the
+        # worker loop could claim and start processing the same job in the
+        # gap between those two calls, causing duplicate AI calls and
+        # duplicate per-question writes.
+        asyncio.create_task(_phase5_try_start_immediately(job_id))
 
         await _log_ai_usage_event({
             "feature": "phase5_job_started",
@@ -138,19 +132,9 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
             f"[Phase5] queued job_id={job_id} provider={model_provider} "
             f"type=deep questions={len(questions_dicts)}"
         )
-        await phase5_jobs_col.update_one(
-            {"job_id": job_id},
-            {
-                "$set": {
-                    "status": "running",
-                    "worker_id": PHASE5_WORKER_ID,
-                    "updated_at": datetime.utcnow().isoformat(),
-                }
-            },
-        )
-        print(f"[Phase5] immediate start job_id={job_id} provider={model_provider}")
-        running_doc = {**job_doc, "status": "running", "worker_id": PHASE5_WORKER_ID}
-        asyncio.create_task(_process_phase5_job(running_doc))
+        # See the /api/phase5/start-job handler above for why this must be
+        # the atomic claim helper rather than insert + separate update.
+        asyncio.create_task(_phase5_try_start_immediately(job_id))
 
         await _log_ai_usage_event({
             "feature": "phase5_deep_job_started",

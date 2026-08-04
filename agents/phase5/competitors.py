@@ -15,6 +15,42 @@ from .helpers import (
 from .providers import _call_openai_with_retry
 from .providers import _call_perplexity_with_retry
 from .providers import _call_claude_web_search_with_retry
+from .scoring import compute_competitor_score, score_from_position
+
+
+async def _web_research_with_fallback(
+    *,
+    claude_prompt: str,
+    timeout_sec: int = 30,
+    max_uses: int = 6,
+) -> tuple[dict | None, str]:
+    """
+    Try Claude web search first (it's the only provider here with live
+    search). If Claude is unavailable for any reason (expired credits,
+    invalid key, rate limit, timeout — anything that makes
+    _call_claude_web_search_with_retry return None), fall back to a plain
+    OpenAI call using the same instructions minus the "use live web search"
+    framing, so competitor discovery keeps working off whichever provider
+    still has working credentials instead of silently returning nothing.
+    """
+    response = await _call_claude_web_search_with_retry(
+        claude_prompt,
+        retry_once=False,
+        timeout_sec=timeout_sec,
+        max_uses=max_uses,
+    )
+    if response is not None:
+        return response, "claude-web-search"
+
+    fallback_prompt = (
+        claude_prompt.replace("Use web search and", "Using your general knowledge (live web search is unavailable),")
+        .replace("Use live web search and", "Using your general knowledge (live web search is unavailable),")
+        .replace("Use live web search to", "Using your general knowledge (live web search is unavailable),")
+    )
+    fallback = await _call_openai_with_retry(fallback_prompt, retry_once=True, timeout_sec=max(timeout_sec, 30))
+    if fallback is not None:
+        return fallback, "openai-fallback"
+    return None, "none"
 
 
 def _canonical_site_url(value: str) -> str:
@@ -312,10 +348,15 @@ async def generate_deep_competitor_scores(
     domain = _normalize_domain(url)
 
     candidate_counts: dict[str, int] = {}
-    for q in questions:
-        qid = q.get("id")
-        raw_r = seed_results.get(qid, {}) if isinstance(seed_results, dict) else {}
-        r = _flatten_multi_result(raw_r)
+    # Iterate seed_results by value, not keyed off `questions`' own ids —
+    # seed_results may come from a different (earlier) run's question set
+    # entirely (see _run_competitor_tracking_for_business reusing a prior
+    # completed Phase 5 job), whose question ids don't match `questions`.
+    # The mining below only needs the per-question result payloads, not
+    # their ids, so this works for both the same-job and cross-job cases.
+    seed_rows = list(seed_results.values()) if isinstance(seed_results, dict) else []
+    for raw_r in seed_rows:
+        r = _flatten_multi_result(raw_r) if isinstance(raw_r, dict) else {}
 
         idea_candidates = r.get("idea_candidates", []) if isinstance(r, dict) else []
         if isinstance(idea_candidates, list):
@@ -362,9 +403,8 @@ async def generate_deep_competitor_scores(
             f"Target domain is {domain}. Return JSON only: "
             '{"competitors":[{"domain":"example.com","url":"https://example.com/","name":"Business name","evidence":"short reason"}]}'
         )
-        probe_response = await _call_claude_web_search_with_retry(
-            probe_prompt,
-            retry_once=False,
+        probe_response, _ = await _web_research_with_fallback(
+            claude_prompt=probe_prompt,
             timeout_sec=24,
             max_uses=4,
         )
@@ -436,9 +476,8 @@ async def generate_deep_competitor_scores(
     - JSON only.
     """
 
-    response = await _call_claude_web_search_with_retry(
-        prompt,
-        retry_once=False,
+    response, discovery_provider = await _web_research_with_fallback(
+        claude_prompt=prompt,
         timeout_sec=30,
         max_uses=6,
     )
@@ -510,24 +549,68 @@ async def generate_deep_competitor_scores(
 
     desired_external = 4
     final_competitors: list[dict] = []
+    seen_domains: set[str] = set()
 
-    if validated_filtered:
-        final_competitors = validated_filtered[:desired_external]
-    else:
+    for item in validated_filtered:
+        d = item.get("domain")
+        if not d or d in seen_domains:
+            continue
+        seen_domains.add(d)
+        final_competitors.append(item)
+        if len(final_competitors) >= desired_external:
+            break
+
+    # The strict niche/business-model validator (requires BOTH
+    # niche_match >= 70 AND business_model_match >= 70) can approve fewer
+    # candidates than were actually discovered — it's a correctness filter,
+    # not a completeness one. Don't leave the comparison table sparse when
+    # more real candidates were sitting right there unvalidated; fill the
+    # remaining slots from the broader discovery list, tagged with a
+    # lower-confidence label so it's honest about not being strictly
+    # validated.
+    if len(final_competitors) < desired_external:
         for item in out:
             if not isinstance(item, dict):
                 continue
             normalized = _normalize_competitor_item(item, domain)
             if not normalized:
                 continue
-            normalized["confidence"] = normalized.get("confidence") or "claude-discovered"
-            if normalized["domain"] in [c.get("domain") for c in final_competitors]:
+            d = normalized["domain"]
+            if d in seen_domains:
                 continue
+            seen_domains.add(d)
+            normalized["confidence"] = normalized.get("confidence") or discovery_provider
             final_competitors.append(normalized)
             if len(final_competitors) >= desired_external:
                 break
 
     final_competitors = final_competitors[:desired_external]
+
+    # Replace the AI-guessed discovery score with a measured one wherever this
+    # domain actually showed up in the real Phase 5 results already collected
+    # for the target (same weighted formula as the target's own score, so
+    # ranks are directly comparable). Domains with no measured signal (found
+    # only via the supplementary discovery probe) fall back to a position-
+    # based estimate, and only use the raw AI number as a last resort.
+    for item in final_competitors:
+        item_domain = item.get("domain", "")
+        measured = compute_competitor_score(seed_results, item_domain)
+        if measured["has_signal"]:
+            item["score"] = measured["score"]
+            item["score_basis"] = "measured"
+            item["mention_rate"] = measured["mention_rate"]
+            item["avg_pos_score"] = measured["avg_pos_score"]
+            item["citation_rate"] = measured["citation_rate"]
+            item["sample_size"] = measured["total"]
+        else:
+            position = item.get("position")
+            if isinstance(position, int):
+                item["score"] = score_from_position(position)
+                item["score_basis"] = "estimated_position"
+            else:
+                item["score_basis"] = "ai_estimated"
+
+    final_competitors.sort(key=lambda item: float(item.get("score") or 0), reverse=True)
 
     target_score = _estimate_target_visibility_score(seed_results)
     final_competitors.append(

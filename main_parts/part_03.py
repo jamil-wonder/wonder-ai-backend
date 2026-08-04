@@ -81,26 +81,48 @@ async def _upsert_user_business(
     if isinstance(question_generation, dict):
         set_fields["questionGeneration"] = _normalize_question_generation_settings(question_generation)
     if isinstance(system_competitors, list):
-        cleaned_system_competitors: list[dict] = []
-        seen_domains: set[str] = set()
+        # Merge newly discovered competitors into the ones already saved on
+        # this business profile, instead of replacing the list each run.
+        # A domain found again just gets its score/evidence refreshed; a
+        # domain that isn't rediscovered this run is left alone (it may
+        # simply not have come up for this particular question set/run).
+        MAX_SYSTEM_COMPETITORS = 8
+        existing_system_competitors = (
+            existing.get("systemCompetitors") if existing and isinstance(existing.get("systemCompetitors"), list) else []
+        )
+
+        merged: dict[str, dict] = {}
+        for item in existing_system_competitors:
+            if not isinstance(item, dict):
+                continue
+            domain = _normalize_site(str(item.get("domain") or item.get("url") or ""))
+            if not domain:
+                continue
+            merged[domain] = {**item, "domain": domain}
+
         for item in system_competitors:
             if not isinstance(item, dict):
                 continue
             domain = _normalize_site(str(item.get("domain") or item.get("url") or ""))
-            if not domain or domain in seen_domains:
+            if not domain:
                 continue
-            seen_domains.add(domain)
-            cleaned_system_competitors.append({
+            prior = merged.get(domain)
+            merged[domain] = {
                 "domain": domain,
-                "url": item.get("url") or f"https://{domain}/",
-                "name": _clean_optional_text(item.get("name")) or domain,
+                "url": item.get("url") or (prior or {}).get("url") or f"https://{domain}/",
+                "name": _clean_optional_text(item.get("name")) or (prior or {}).get("name") or domain,
                 "score": int(float(item.get("score") or 0)),
                 "status": _clean_optional_text(item.get("status")) or _clean_optional_text(item.get("confidence")) or "AI evidence",
                 "evidence": _clean_optional_text(item.get("evidence")) or "",
+                "first_seen_at": (prior or {}).get("first_seen_at") or now_iso,
                 "updated_at": now_iso,
-            })
-            if len(cleaned_system_competitors) >= 4:
-                break
+            }
+
+        cleaned_system_competitors = sorted(
+            merged.values(),
+            key=lambda entry: float(entry.get("score") or 0),
+            reverse=True,
+        )[:MAX_SYSTEM_COMPETITORS]
         set_fields["systemCompetitors"] = cleaned_system_competitors
 
     query: dict
