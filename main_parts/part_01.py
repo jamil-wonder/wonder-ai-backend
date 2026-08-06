@@ -420,22 +420,62 @@ async def send_email(to_email: str, subject: str, html_body: str, text_body: str
 
 def _build_verification_email_otp(name: str, code: str) -> tuple[str, str]:
     display_name = name or "there"
+    code_cells = "".join(
+        f'<span style="display:inline-block;width:38px;height:46px;line-height:46px;margin:0 3px;background:#ffffff;border:1px solid #ece3d1;border-radius:12px;text-align:center;font-size:24px;font-weight:700;letter-spacing:0;color:#15463b;">{digit}</span>'
+        for digit in code
+    )
     text_body = (
         f"Hi {display_name},\n\n"
-        f"Your Wonder AI verification code is: {code}\n\n"
+        f"Your Wonderscore verification code is: {code}\n\n"
         f"This code expires in {EMAIL_OTP_TTL_MINUTES} minutes. "
         f"If you didn't create this account, you can ignore this email.\n"
     )
     html_body = f"""
-    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#23211b;">
-      <p style="font-size:14px;">Hi {display_name},</p>
-      <p style="font-size:14px;line-height:1.6;">Enter this code to verify your email address for Wonder AI:</p>
-      <p style="margin:24px 0;text-align:center;">
-        <span style="display:inline-block;background:#f6f3ec;border:1px solid #ece3d1;border-radius:10px;padding:14px 28px;font-size:28px;font-weight:700;letter-spacing:8px;color:#15463b;">
-          {code}
-        </span>
-      </p>
-      <p style="font-size:12px;color:#8a8273;">This code expires in {EMAIL_OTP_TTL_MINUTES} minutes. If you didn't create this account, you can ignore this email.</p>
+    <div style="margin:0;padding:0;background:#faf8f3;">
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;padding:28px 16px;color:#23211b;">
+        <div style="background:#ffffff;border:1px solid #ece3d1;border-radius:24px;overflow:hidden;box-shadow:0 18px 45px rgba(21,70,59,0.10);">
+          <div style="padding:28px 28px 20px 28px;border-bottom:1px solid #f0e8d8;background:#fdfcf8;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+              <tr>
+                <td style="vertical-align:middle;">
+                  <div style="display:inline-block;width:42px;height:42px;line-height:42px;text-align:center;border-radius:14px;background:#15463b;color:#ffffff;font-size:24px;font-weight:700;">✦</div>
+                </td>
+                <td style="vertical-align:middle;padding-left:12px;">
+                  <div style="font-size:20px;font-weight:700;letter-spacing:-0.02em;color:#15463b;">Wonderscore</div>
+                  <div style="font-size:12px;line-height:18px;color:#8a8273;">AI visibility dashboard</div>
+                </td>
+              </tr>
+            </table>
+          </div>
+
+          <div style="padding:30px 28px 24px 28px;">
+            <div style="display:inline-block;margin-bottom:14px;padding:5px 9px;border-radius:999px;background:#edf8f1;border:1px solid #ccebd8;color:#0f7a4d;font-size:10px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;">
+              Secure sign-in
+            </div>
+            <h1 style="margin:0 0 10px 0;font-size:28px;line-height:34px;font-weight:700;color:#15463b;letter-spacing:-0.03em;">Enter your verification code</h1>
+            <p style="margin:0 0 24px 0;font-size:15px;line-height:24px;color:#6f6757;">
+              Hi {display_name}, use this code to continue to your Wonderscore dashboard.
+            </p>
+
+            <div style="margin:0 0 22px 0;padding:20px 12px;background:#f6f3ec;border:1px solid #ece3d1;border-radius:18px;text-align:center;">
+              <div style="margin-bottom:12px;font-size:10px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;color:#9b927f;">Verification code</div>
+              <div style="white-space:nowrap;">{code_cells}</div>
+            </div>
+
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;margin-top:8px;">
+              <tr>
+                <td style="padding:14px 16px;background:#fdfcf8;border:1px solid #ece3d1;border-radius:14px;font-size:13px;line-height:20px;color:#6f6757;">
+                  This code expires in <strong style="color:#23211b;">{EMAIL_OTP_TTL_MINUTES} minutes</strong>. If you did not request this email, you can safely ignore it.
+                </td>
+              </tr>
+            </table>
+          </div>
+        </div>
+
+        <p style="margin:18px 0 0 0;text-align:center;font-size:11px;line-height:18px;color:#9b927f;">
+          Sent by Wonderscore for account security.
+        </p>
+      </div>
     </div>
     """
     return html_body, text_body
