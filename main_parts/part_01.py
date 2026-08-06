@@ -420,10 +420,6 @@ async def send_email(to_email: str, subject: str, html_body: str, text_body: str
 
 def _build_verification_email_otp(name: str, code: str) -> tuple[str, str]:
     display_name = name or "there"
-    code_cells = "".join(
-        f'<span style="display:inline-block;width:38px;height:46px;line-height:46px;margin:0 3px;background:#ffffff;border:1px solid #ece3d1;border-radius:12px;text-align:center;font-size:24px;font-weight:700;letter-spacing:0;color:#15463b;">{digit}</span>'
-        for digit in code
-    )
     text_body = (
         f"Hi {display_name},\n\n"
         f"Your Wonderscore verification code is: {code}\n\n"
@@ -434,11 +430,11 @@ def _build_verification_email_otp(name: str, code: str) -> tuple[str, str]:
     <div style="margin:0;padding:0;background:#faf8f3;">
       <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;padding:28px 16px;color:#23211b;">
         <div style="background:#ffffff;border:1px solid #ece3d1;border-radius:24px;overflow:hidden;box-shadow:0 18px 45px rgba(21,70,59,0.10);">
-          <div style="padding:28px 28px 20px 28px;border-bottom:1px solid #f0e8d8;background:#fdfcf8;">
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+          <div style="padding:26px 28px 20px 28px;border-bottom:1px solid #f0e8d8;background:#fdfcf8;">
+            <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
               <tr>
-                <td style="vertical-align:middle;">
-                  <div style="display:inline-block;width:42px;height:42px;line-height:42px;text-align:center;border-radius:14px;background:#15463b;color:#ffffff;font-size:24px;font-weight:700;">✦</div>
+                <td width="42" style="vertical-align:middle;">
+                  <div style="width:42px;height:42px;line-height:42px;text-align:center;border-radius:14px;background:#15463b;color:#ffffff;font-size:24px;font-weight:700;">&#10022;</div>
                 </td>
                 <td style="vertical-align:middle;padding-left:12px;">
                   <div style="font-size:20px;font-weight:700;letter-spacing:-0.02em;color:#15463b;">Wonderscore</div>
@@ -458,8 +454,14 @@ def _build_verification_email_otp(name: str, code: str) -> tuple[str, str]:
             </p>
 
             <div style="margin:0 0 22px 0;padding:20px 12px;background:#f6f3ec;border:1px solid #ece3d1;border-radius:18px;text-align:center;">
-              <div style="margin-bottom:12px;font-size:10px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;color:#9b927f;">Verification code</div>
-              <div style="white-space:nowrap;">{code_cells}</div>
+              <div style="margin-bottom:10px;font-size:10px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;color:#9b927f;">Verification code</div>
+              <table role="presentation" cellspacing="0" cellpadding="0" align="center" style="border-collapse:collapse;margin:0 auto;">
+                <tr>
+                  <td style="padding:10px 16px;background:#ffffff;border:1px solid #e5dac7;border-radius:14px;">
+                    <span style="font-size:28px;line-height:34px;font-weight:700;letter-spacing:0.28em;color:#15463b;font-family:Arial,Helvetica,sans-serif;">{code}</span>
+                  </td>
+                </tr>
+              </table>
             </div>
 
             <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;margin-top:8px;">
