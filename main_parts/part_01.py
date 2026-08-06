@@ -175,6 +175,7 @@ weekly_blog_suggestions_col = None
 auth_handoffs_col = None
 google_integrations_col = None
 analytics_snapshots_col = None
+email_verifications_col = None
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
     db = mongo_client.get_database("wonderai")
@@ -192,6 +193,7 @@ try:
     ai_usage_col = db.get_collection("ai_usage_events")
     user_history_meta_col = db.get_collection("user_history_meta")
     public_rate_limits_col = db.get_collection("public_rate_limits")
+    email_verifications_col = db.get_collection("email_verifications")
 except Exception as e:
     print(f"[API] Error connecting to MongoDB: {type(e).__name__}")
 
@@ -367,6 +369,175 @@ async def _log_ai_usage_event(event: dict):
     except Exception as e:
         print(f"[AI Usage] log failed: {e}")
 
+# --- Email (SMTP) ---
+# All optional: if SMTP_HOST/SMTP_USER/SMTP_PASSWORD aren't set, send_email()
+# just logs and no-ops rather than raising, so nothing that isn't ready to
+# configure email yet is broken by this.
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = (os.getenv("SMTP_USER") or "").strip() or None
+# Google displays App Passwords with spaces for human readability
+# ("yczh jhws ueuo qaol") but the real 16-char credential has none — that
+# literal string, spaces included, is a common paste-in mistake that fails
+# SMTP auth silently (send_email() just logs and no-ops). Stripping all
+# whitespace here makes both the spaced and unspaced forms work.
+SMTP_PASSWORD = (os.getenv("SMTP_PASSWORD") or "").replace(" ", "").strip() or None
+SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "Wonder AI")
+EMAIL_OTP_LENGTH = 6
+EMAIL_OTP_TTL_MINUTES = 15
+EMAIL_OTP_MAX_ATTEMPTS = 5
+EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS = 120
+
+
+async def send_email(to_email: str, subject: str, html_body: str, text_body: str) -> bool:
+    if not SMTP_USER or not SMTP_PASSWORD:
+        print(f"[Email] SMTP not configured — skipping send to {to_email} ({subject})")
+        return False
+    try:
+        import aiosmtplib
+        from email.message import EmailMessage
+
+        message = EmailMessage()
+        message["From"] = f"{SMTP_FROM_NAME} <{SMTP_USER}>"
+        message["To"] = to_email
+        message["Subject"] = subject
+        message.set_content(text_body)
+        message.add_alternative(html_body, subtype="html")
+
+        await aiosmtplib.send(
+            message,
+            hostname=SMTP_HOST,
+            port=SMTP_PORT,
+            start_tls=True,
+            username=SMTP_USER,
+            password=SMTP_PASSWORD,
+        )
+        return True
+    except Exception as e:
+        print(f"[Email] send failed to {to_email}: {type(e).__name__}: {e}")
+        return False
+
+
+def _build_verification_email_otp(name: str, code: str) -> tuple[str, str]:
+    display_name = name or "there"
+    text_body = (
+        f"Hi {display_name},\n\n"
+        f"Your Wonder AI verification code is: {code}\n\n"
+        f"This code expires in {EMAIL_OTP_TTL_MINUTES} minutes. "
+        f"If you didn't create this account, you can ignore this email.\n"
+    )
+    html_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#23211b;">
+      <p style="font-size:14px;">Hi {display_name},</p>
+      <p style="font-size:14px;line-height:1.6;">Enter this code to verify your email address for Wonder AI:</p>
+      <p style="margin:24px 0;text-align:center;">
+        <span style="display:inline-block;background:#f6f3ec;border:1px solid #ece3d1;border-radius:10px;padding:14px 28px;font-size:28px;font-weight:700;letter-spacing:8px;color:#15463b;">
+          {code}
+        </span>
+      </p>
+      <p style="font-size:12px;color:#8a8273;">This code expires in {EMAIL_OTP_TTL_MINUTES} minutes. If you didn't create this account, you can ignore this email.</p>
+    </div>
+    """
+    return html_body, text_body
+
+
+async def send_verification_email(to_email: str, name: str, user_id: str, purpose: str = "verify") -> bool:
+    if email_verifications_col is None:
+        return False
+    code = "".join(secrets.choice("0123456789") for _ in range(EMAIL_OTP_LENGTH))
+    code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    now = datetime.utcnow()
+    # Invalidate any earlier outstanding codes for this user so only the
+    # most recent one sent is ever valid — avoids ambiguity about which
+    # code should work if someone requests a resend.
+    await email_verifications_col.update_many(
+        {"user_id": user_id, "used_at": None},
+        {"$set": {"used_at": now}},
+    )
+    await email_verifications_col.insert_one({
+        "user_id": user_id,
+        "email": to_email,
+        "code_hash": code_hash,
+        "purpose": purpose,
+        "attempts": 0,
+        "created_at": now,
+        "expires_at": now + timedelta(minutes=EMAIL_OTP_TTL_MINUTES),
+        "used_at": None,
+    })
+    subject = "Your Wonder AI sign-in code" if purpose == "login" else "Your Wonder AI verification code"
+    html_body, text_body = _build_verification_email_otp(name, code)
+    return await send_email(to_email, subject, html_body, text_body)
+
+
+# --- Email quality gate ---
+# EmailStr on the request models only checks that an address is *shaped*
+# like an email. That's not enough on its own: "user@mailinator.com" is
+# syntactically fine and even has a real, working mail server behind it —
+# it's just a disposable inbox nobody actually owns. Two more checks catch
+# what format-checking alone lets through:
+#   1. Deliverability (DNS MX lookup) — catches typo'd/nonexistent domains
+#      that look like real emails but can never receive mail.
+#   2. A disposable-provider blocklist — catches real, working mail servers
+#      that exist specifically to be thrown away (temp-mail, mailinator,
+#      guerrillamail, etc.), which a DNS lookup alone can't distinguish
+#      from a legitimate provider since both have valid MX records.
+DISPOSABLE_EMAIL_DOMAINS = {
+    "mailinator.com", "mailinator.net", "mailinator.org",
+    "10minutemail.com", "10minutemail.net", "20minutemail.com",
+    "guerrillamail.com", "guerrillamail.net", "guerrillamail.org", "guerrillamail.biz",
+    "guerrillamail.de", "sharklasers.com", "grr.la", "guerrillamailblock.com",
+    "yopmail.com", "yopmail.net", "yopmail.fr", "cool.fr.nf",
+    "temp-mail.org", "tempmail.com", "tempmail.net", "tempmail.dev",
+    "throwawaymail.com", "throwaway.email", "trashmail.com", "trashmail.net",
+    "getnada.com", "nada.email", "dispostable.com", "fakeinbox.com",
+    "mintemail.com", "mytemp.email", "spamgourmet.com", "spam4.me",
+    "mohmal.com", "moakt.com", "emailondeck.com", "maildrop.cc",
+    "mailnesia.com", "mailcatch.com", "tempinbox.com", "tempr.email",
+    "burnermail.io", "fakemailgenerator.com", "harakirimail.com",
+    "discardmail.com", "discardmail.de", "spambog.com", "spambog.de",
+    "byom.de", "jetable.org", "einrot.com", "einrot.de",
+    "wegwerfmail.de", "wegwerfmail.net", "wegwerfmail.org",
+    "tempmailaddress.com", "temp-mail.io", "emailfake.com",
+    "mailtemp.net", "1secmail.com", "1secmail.net", "1secmail.org",
+    "crazymailing.com", "anonbox.net", "getairmail.com",
+    "luxusmail.org", "objectmail.com", "proxymail.eu", "rcpt.at",
+    "tempail.com", "tempemail.co", "tempemail.net", "tempmail2.com",
+    "no-spam.ws", "spamfree24.org", "spamfree24.de", "kasmail.com",
+    "shieldedmail.com", "incognitomail.com", "mailnull.com",
+    "meltmail.com", "spamavert.com", "deadaddress.com",
+}
+
+
+def _extract_email_domain(email: str) -> str:
+    return email.rsplit("@", 1)[-1].strip().lower() if "@" in (email or "") else ""
+
+
+def validate_signup_email(email: str) -> str:
+    """Validates an email is both deliverable and not a disposable/throwaway
+    address. Returns the normalized address, or raises HTTPException(400)."""
+    raw = (email or "").strip()
+    domain = _extract_email_domain(raw)
+    if domain in DISPOSABLE_EMAIL_DOMAINS:
+        raise HTTPException(
+            status_code=400,
+            detail="Please use a permanent email address - disposable/temporary email providers aren't accepted.",
+        )
+    try:
+        from email_validator import validate_email as _validate_email, EmailNotValidError
+        result = _validate_email(raw, check_deliverability=True, timeout=6)
+        return result.normalized
+    except ImportError:
+        # email-validator not installed in this environment — fall back to
+        # the format check EmailStr already did rather than hard-failing
+        # signup over a missing optional dependency.
+        return raw
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"That email address doesn't look reachable - double-check it. ({e})",
+        )
+
+
 # --- Auth Routes ---
 
 class GoogleAuthRequest(BaseModel):
@@ -381,6 +552,21 @@ class UserProfileUpdateRequest(BaseModel):
 class UserPasswordChangeRequest(BaseModel):
     current_password: str
     new_password: str
+
+
+class OtpVerifyRequest(BaseModel):
+    email: str
+    code: str
+
+
+class OtpResendRequest(BaseModel):
+    email: str
+
+
+class OtpRequiredResponse(BaseModel):
+    otp_required: bool = True
+    email: str
+    message: str
 
 
 class AuthHandoffExchangeRequest(BaseModel):

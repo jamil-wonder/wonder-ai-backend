@@ -13,3 +13,5 @@ python-jose[cryptography]==3.3.0
 cryptography>=42.0.0
 google-auth==2.28.2
 python-multipart
+email-validator
+aiosmtplib

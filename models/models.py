@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 from typing import List, Dict, Any, Optional
 
 class ScoreBreakdown(BaseModel):
@@ -99,7 +99,7 @@ class TrackUrlRequest(BaseModel):
 # Authentication Models
 class UserCreate(BaseModel):
     name: str
-    email: str
+    email: EmailStr
     password: str
 
 class UserResponse(BaseModel):
@@ -109,6 +109,7 @@ class UserResponse(BaseModel):
     created_at: str
     role: str = "user"
     status: str = "active"
+    email_verified: bool = False
 
 class UserRoleUpdateRequest(BaseModel):
     role: str

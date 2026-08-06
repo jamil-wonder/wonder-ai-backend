@@ -1,46 +1,54 @@
 # Generated from the former backend/main.py lines 1271-1673.
-@app.post("/api/auth/signup", response_model=Token)
+#
+# Neither signup nor login issues a token directly anymore. Both end the
+# same way: an OTP gets emailed, and POST /api/auth/otp/verify is the only
+# place a JWT actually gets minted. This means there is no such thing as an
+# authenticated-but-unverified session — you cannot hold a valid token
+# without having proven you can receive mail at that address, whether that
+# proof happened at signup or (for 2FA purposes) on every subsequent login.
+@app.post("/api/auth/signup", response_model=OtpRequiredResponse)
 async def api_signup(user: UserCreate):
     try:
-        # Check if user already exists
-        existing_user = await users_col.find_one({"email": user.email})
+        # Reject disposable/throwaway providers and addresses whose domain
+        # can't actually receive mail, on top of EmailStr's format-only check.
+        normalized_email = validate_signup_email(user.email)
+
+        existing_user = await users_col.find_one({"email": normalized_email})
         if existing_user:
             raise HTTPException(status_code=400, detail="Email already registered")
 
-        # Create new user (automatically assign first user as admin conditionally if no users exist)
         total_users = await users_col.count_documents({})
         assigned_role = "admin" if total_users == 0 else "user"
 
         hashed_password = get_password_hash(user.password)
         new_user = {
             "name": user.name,
-            "email": user.email,
+            "email": normalized_email,
             "hashed_password": hashed_password,
             "role": assigned_role,
             "status": "active",
+            "email_verified": False,
             "created_at": datetime.utcnow().isoformat()
         }
-        
+
         result = await users_col.insert_one(new_user)
         user_id = str(result.inserted_id)
 
-        # Generate JWT token
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": user.email, "id": user_id}, expires_delta=access_token_expires
+        sent = await send_verification_email(normalized_email, user.name, user_id, purpose="signup")
+        if not sent:
+            # Don't leave a stuck, unreachable account behind — if we can't
+            # even send the first code, there's no way for them to ever get
+            # in, so surface that clearly instead of a silent dead end.
+            raise HTTPException(
+                status_code=502,
+                detail="Account created, but the verification email couldn't be sent. Try again shortly, or contact support.",
+            )
+
+        return OtpRequiredResponse(
+            email=normalized_email,
+            message="We sent a verification code to your email.",
         )
 
-        user_response = UserResponse(
-            id=user_id,
-            name=user.name,
-            email=user.email,
-            created_at=new_user["created_at"],
-            role=new_user["role"],
-            status=new_user["status"]
-        )
-
-        return Token(access_token=access_token, token_type="bearer", user=user_response)
-    
     except HTTPException:
         raise
     except Exception as e:
@@ -48,36 +56,32 @@ async def api_signup(user: UserCreate):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.post("/api/auth/login", response_model=Token)
+
+@app.post("/api/auth/login", response_model=OtpRequiredResponse)
 async def api_login(request: LoginRequest):
     try:
-        # Find user
         user = await users_col.find_one({"email": request.email})
         if not user:
             raise HTTPException(status_code=401, detail="Invalid email or password")
 
-        # Verify password
         if not verify_password(request.password, user["hashed_password"]):
             raise HTTPException(status_code=401, detail="Invalid email or password")
 
+        if user.get("status") == "banned":
+            raise HTTPException(status_code=403, detail="Your account has been restricted.")
+
         user_id = str(user["_id"])
+        sent = await send_verification_email(user.get("email", ""), user.get("name", ""), user_id, purpose="login")
+        if not sent:
+            raise HTTPException(
+                status_code=502,
+                detail="Couldn't send a sign-in code right now. Try again shortly.",
+            )
 
-        # Generate JWT token
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": user["email"], "id": user_id}, expires_delta=access_token_expires
-        )
-
-        user_response = UserResponse(
-            id=user_id,
-            name=user["name"],
+        return OtpRequiredResponse(
             email=user["email"],
-            created_at=user.get("created_at", datetime.utcnow().isoformat()),
-            role=user.get("role", "user"),
-            status=user.get("status", "active")
+            message="We sent a sign-in code to your email.",
         )
-
-        return Token(access_token=access_token, token_type="bearer", user=user_response)
 
     except HTTPException:
         raise
@@ -85,6 +89,103 @@ async def api_login(request: LoginRequest):
         print(f"[API] ERROR during login: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/api/auth/otp/verify", response_model=Token)
+async def api_otp_verify(request: OtpVerifyRequest):
+    if email_verifications_col is None:
+        raise HTTPException(status_code=503, detail="Verification storage unavailable")
+
+    email = (request.email or "").strip().lower()
+    code = (request.code or "").strip()
+    if not email or not code:
+        raise HTTPException(status_code=400, detail="Email and code are required")
+
+    user = await users_col.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=400, detail="Incorrect code")
+    user_id = str(user["_id"])
+
+    now = datetime.utcnow()
+    record = await email_verifications_col.find_one(
+        {"user_id": user_id, "used_at": None, "expires_at": {"$gt": now}},
+        sort=[("created_at", -1)],
+    )
+    if not record:
+        raise HTTPException(status_code=400, detail="No pending code for this email — request a new one.")
+
+    if record.get("attempts", 0) >= EMAIL_OTP_MAX_ATTEMPTS:
+        await email_verifications_col.update_one({"_id": record["_id"]}, {"$set": {"used_at": now}})
+        raise HTTPException(status_code=429, detail="Too many incorrect attempts — request a new code.")
+
+    code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    if code_hash != record.get("code_hash"):
+        updated = await email_verifications_col.find_one_and_update(
+            {"_id": record["_id"]},
+            {"$inc": {"attempts": 1}},
+            return_document=ReturnDocument.AFTER,
+        )
+        remaining = max(0, EMAIL_OTP_MAX_ATTEMPTS - (updated.get("attempts", 0) if updated else EMAIL_OTP_MAX_ATTEMPTS))
+        raise HTTPException(status_code=400, detail=f"Incorrect code. {remaining} attempt(s) left.")
+
+    await email_verifications_col.update_one({"_id": record["_id"]}, {"$set": {"used_at": now}})
+
+    if user.get("status") == "banned":
+        raise HTTPException(status_code=403, detail="Your account has been restricted.")
+
+    # Receiving and entering this code is proof of ownership regardless of
+    # whether it was sent for signup or a routine login — mark verified
+    # either way so an old unverified account gets cleared the first time
+    # its owner successfully logs back in, not just at original signup.
+    await users_col.update_one({"_id": ObjectId(user_id)}, {"$set": {"email_verified": True}})
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user["email"], "id": user_id}, expires_delta=access_token_expires
+    )
+    user_response = UserResponse(
+        id=user_id,
+        name=user.get("name", ""),
+        email=user["email"],
+        created_at=user.get("created_at", datetime.utcnow().isoformat()),
+        role=user.get("role", "user"),
+        status=user.get("status", "active"),
+        email_verified=True,
+    )
+    return Token(access_token=access_token, token_type="bearer", user=user_response)
+
+
+@app.post("/api/auth/otp/resend")
+async def api_otp_resend(request: OtpResendRequest):
+    if email_verifications_col is None:
+        raise HTTPException(status_code=503, detail="Verification storage unavailable")
+
+    email = (request.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    user = await users_col.find_one({"email": email})
+    if not user:
+        # Don't reveal whether this email has an account — same response
+        # shape either way.
+        return {"success": True, "message": "If that email has a pending code, a new one was sent."}
+
+    user_id = str(user["_id"])
+    cooldown_cutoff = datetime.utcnow() - timedelta(seconds=EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS)
+    recent = await email_verifications_col.find_one({
+        "user_id": user_id,
+        "created_at": {"$gt": cooldown_cutoff},
+    })
+    if recent:
+        raise HTTPException(status_code=429, detail="Please wait a bit before requesting another code")
+
+    sent = await send_verification_email(email, user.get("name", ""), user_id, purpose="resend")
+    if not sent:
+        raise HTTPException(
+            status_code=502,
+            detail="Couldn't send the code — the mail server rejected it or isn't configured. Try again shortly.",
+        )
+    return {"success": True, "message": "A new code was sent"}
 
 
 @app.post("/api/auth/handoff")
@@ -171,6 +272,7 @@ async def api_user_profile(current_user: dict = Depends(get_current_user)):
         created_at=user.get("created_at", datetime.utcnow().isoformat()),
         role=user.get("role", "user"),
         status=user.get("status", "active"),
+        email_verified=user.get("email_verified", False),
     )
 
 
@@ -184,24 +286,41 @@ async def api_user_profile_update(request: UserProfileUpdateRequest, current_use
     if not email:
         raise HTTPException(status_code=400, detail="Email is required")
 
+    current = await users_col.find_one({"_id": ObjectId(current_user["id"])})
+    email_changed = bool(current) and current.get("email") != email
+
+    # Only run the (network-cost) deliverability/disposable-domain check
+    # when the email is actually changing — no need to re-validate an
+    # address that was already accepted, on every unrelated profile save.
+    if email_changed:
+        email = validate_signup_email(email)
+
     existing = await users_col.find_one({"email": email})
     if existing and str(existing.get("_id")) != current_user["id"]:
         raise HTTPException(status_code=400, detail="Email already in use")
 
+    update_fields = {
+        "name": name,
+        "email": email,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    if email_changed:
+        update_fields["email_verified"] = False
+
     updated = await users_col.find_one_and_update(
         {"_id": ObjectId(current_user["id"])},
-        {
-            "$set": {
-                "name": name,
-                "email": email,
-                "updated_at": datetime.utcnow().isoformat(),
-            }
-        },
+        {"$set": update_fields},
         return_document=ReturnDocument.AFTER,
     )
 
     if not updated:
         raise HTTPException(status_code=404, detail="User not found")
+
+    if email_changed:
+        try:
+            await send_verification_email(email, name, current_user["id"])
+        except Exception as e:
+            print(f"[API] Failed to send verification email to {email}: {e}")
 
     return UserResponse(
         id=str(updated["_id"]),
@@ -210,6 +329,7 @@ async def api_user_profile_update(request: UserProfileUpdateRequest, current_use
         created_at=updated.get("created_at", datetime.utcnow().isoformat()),
         role=updated.get("role", "user"),
         status=updated.get("status", "active"),
+        email_verified=updated.get("email_verified", False),
     )
 
 
