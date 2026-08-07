@@ -265,6 +265,11 @@ async def fetch_with_httpx(url: str) -> Tuple[str, str]:
 
 async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bool = True) -> dict:
     warnings = []
+    # Internal scraper/infra diagnostics (Playwright failures, timeouts, WAF
+    # blocks, etc.) — useful for us, meaningless/alarming to end users, so
+    # they never go in `warnings` (which feeds the dashboard and the
+    # scan-complete email). Logged to console and returned as debugNotes.
+    debug_notes = []
 
     target_url = url.strip()
     if not re.match(r'^https?://', target_url, re.I):
@@ -282,7 +287,7 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
 
     playwright_enabled = can_use_playwright_on_current_loop()
     if PLAYWRIGHT_AVAILABLE and not playwright_enabled:
-        warnings.append("Playwright disabled on current Windows event loop. Falling back to HTTP fetch.")
+        debug_notes.append("Playwright disabled on current Windows event loop. Falling back to HTTP fetch.")
 
     if playwright_enabled:
         try:
@@ -292,9 +297,9 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
             used_playwright = pw_result["used_playwright"]
             timed_out = pw_result["timed_out"]
             screenshot_bytes = pw_result["screenshot_bytes"]
-            warnings.extend(pw_result["warnings"])
+            debug_notes.extend(pw_result["warnings"])
         except Exception as e:
-            warnings.append(f"Playwright error: {str(e)[:100]}. Falling back to standard fetch.")
+            debug_notes.append(f"Playwright error: {str(e)[:100]}. Falling back to standard fetch.")
             print(f"Playwright Runtime Error: {e}")
     elif PLAYWRIGHT_AVAILABLE:
         # Try Playwright in a dedicated thread with its own Proactor loop on Windows.
@@ -305,26 +310,26 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
             used_playwright = pw_result["used_playwright"]
             timed_out = pw_result["timed_out"]
             screenshot_bytes = pw_result["screenshot_bytes"]
-            warnings.extend(pw_result["warnings"])
+            debug_notes.extend(pw_result["warnings"])
             if used_playwright:
-                warnings.append("Playwright executed in dedicated worker thread mode.")
+                debug_notes.append("Playwright executed in dedicated worker thread mode.")
         except Exception as e:
-            warnings.append(f"Playwright thread mode error: {str(e)[:100]}. Falling back to standard fetch.")
+            debug_notes.append(f"Playwright thread mode error: {str(e)[:100]}. Falling back to standard fetch.")
             print(f"Playwright Thread Runtime Error: {e}")
 
     if not used_playwright:
         try:
             content, final_url = await fetch_with_httpx(target_url)
-            warnings.append("Note: JS-rendering was disabled or blocked. Dynamic content missing.")
+            debug_notes.append("Note: JS-rendering was disabled or blocked. Dynamic content missing.")
         except Exception as e:
             raise Exception(f"Failed to fetch {target_url}: {str(e)}")
 
-    is_protected_site = any("Cloudflare / 403 block detected" in str(w) for w in warnings)
+    is_protected_site = any("Cloudflare / 403 block detected" in str(w) for w in debug_notes)
     force_full_ai = os.getenv("PHASE1_FORCE_FULL_AI", "1").strip() == "1"
     if timed_out:
-        warnings.append("Primary page fetch timed out; running reduced analysis mode.")
+        debug_notes.append("Primary page fetch timed out; running reduced analysis mode.")
     if is_protected_site:
-        warnings.append("Protected/WAF site detected; skipping deep crawl and AI enrichment to avoid long timeout.")
+        debug_notes.append("Protected/WAF site detected; skipping deep crawl and AI enrichment to avoid long timeout.")
 
     soup = BeautifulSoup(content, 'html.parser')
 
@@ -726,7 +731,7 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
 
     allow_ai_enrichment = enable_ai and (force_full_ai or (not is_protected_site and not timed_out))
     if force_full_ai and (is_protected_site or timed_out):
-        warnings.append("Full AI enrichment forced despite protected/slow page mode.")
+        debug_notes.append("Full AI enrichment forced despite protected/slow page mode.")
 
     # Vision extraction removed by product decision.
 
@@ -742,10 +747,10 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
             print("[AI] Phase1 contact fallback completed")
         except asyncio.TimeoutError:
             contact_fallback = {"emails": [], "phones": [], "addresses": [], "openingHours": [], "confidence": {}}
-            warnings.append(f"AI contact fallback timed out after {PHASE1_AI_CONTACT_TIMEOUT_SECONDS}s; continuing with available extracted data.")
+            debug_notes.append(f"AI contact fallback timed out after {PHASE1_AI_CONTACT_TIMEOUT_SECONDS}s; continuing with available extracted data.")
         except Exception as cf_err:
             contact_fallback = {"emails": [], "phones": [], "addresses": [], "openingHours": [], "confidence": {}}
-            warnings.append(f"AI contact fallback failed: {str(cf_err)[:80]}")
+            debug_notes.append(f"AI contact fallback failed: {str(cf_err)[:80]}")
         if isinstance(contact_fallback, dict):
             ai_debug["models"]["contact_fallback"] = contact_fallback.get("modelUsed")
             ai_debug["contact_fallback"] = {
@@ -925,7 +930,7 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
     except asyncio.TimeoutError:
         print(f"Phase1 enrichment error: timeout while waiting for AI enrichment response ({PHASE1_AI_ENRICH_TIMEOUT_SECONDS}s)")
         ai_debug["reason"] = "AI enrichment timed out"
-        warnings.append(f"AI enrichment timed out after {PHASE1_AI_ENRICH_TIMEOUT_SECONDS}s; returning core analysis data.")
+        debug_notes.append(f"AI enrichment timed out after {PHASE1_AI_ENRICH_TIMEOUT_SECONDS}s; returning core analysis data.")
     except Exception as enrich_error:
         print(f"Phase1 enrichment error: {enrich_error.__class__.__name__}: {str(enrich_error)}")
         ai_debug["reason"] = str(enrich_error)[:220]
@@ -1023,6 +1028,7 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
         },
         "rawMeta": raw_meta,
         "warnings": warnings,
+        "debugNotes": debug_notes,
         "seoInfo": seo_info,
         "technologies": technologies,
         "aiSuggestions": {str(k): str(v)[:180] for k, v in ai_suggestions.items() if str(k).strip() and str(v).strip()},
