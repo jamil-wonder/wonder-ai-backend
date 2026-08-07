@@ -151,6 +151,7 @@ async def api_otp_verify(request: OtpVerifyRequest):
         role=user.get("role", "user"),
         status=user.get("status", "active"),
         email_verified=True,
+        notify_scan_complete=user.get("notify_scan_complete", True),
     )
     return Token(access_token=access_token, token_type="bearer", user=user_response)
 
@@ -255,6 +256,7 @@ async def api_auth_handoff_exchange(request: AuthHandoffExchangeRequest):
         created_at=user.get("created_at", datetime.utcnow().isoformat()),
         role=user.get("role", "user"),
         status=user.get("status", "active"),
+        notify_scan_complete=user.get("notify_scan_complete", True),
     )
     return Token(access_token=access_token, token_type="bearer", user=user_response)
 
@@ -273,6 +275,7 @@ async def api_user_profile(current_user: dict = Depends(get_current_user)):
         role=user.get("role", "user"),
         status=user.get("status", "active"),
         email_verified=user.get("email_verified", False),
+        notify_scan_complete=user.get("notify_scan_complete", True),
     )
 
 
@@ -330,6 +333,32 @@ async def api_user_profile_update(request: UserProfileUpdateRequest, current_use
         role=updated.get("role", "user"),
         status=updated.get("status", "active"),
         email_verified=updated.get("email_verified", False),
+        notify_scan_complete=updated.get("notify_scan_complete", True),
+    )
+
+
+@app.put("/api/user/notification-preferences", response_model=UserResponse)
+async def api_update_notification_preferences(
+    request: NotificationPreferencesUpdateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    updated = await users_col.find_one_and_update(
+        {"_id": ObjectId(current_user["id"])},
+        {"$set": {"notify_scan_complete": bool(request.notify_scan_complete)}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return UserResponse(
+        id=str(updated["_id"]),
+        name=updated.get("name", ""),
+        email=updated.get("email", ""),
+        created_at=updated.get("created_at", datetime.utcnow().isoformat()),
+        role=updated.get("role", "user"),
+        status=updated.get("status", "active"),
+        email_verified=updated.get("email_verified", False),
+        notify_scan_complete=updated.get("notify_scan_complete", True),
     )
 
 

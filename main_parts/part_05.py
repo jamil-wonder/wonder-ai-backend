@@ -367,6 +367,14 @@ async def api_scrape(
         except Exception as business_error:
             print(f"[Business] phase1 upsert failed: {business_error}")
 
+        # Scan-complete email is NOT sent from here — this endpoint alone
+        # doesn't have the AI model insights the email is meant to include
+        # (those come from a separate /api/ai-insights call the frontend
+        # fires in parallel with this one). See POST /api/notify/scan-complete,
+        # which the frontend calls once it actually has both results in
+        # hand, so the email is never sent without real insight data and we
+        # never pay for a duplicate AI-insights call just to build an email.
+
         ai_debug = result.get("aiDebug", {}) if isinstance(result, dict) else {}
         ai_calls = ai_debug.get("calls", {}) if isinstance(ai_debug, dict) else {}
         ai_models = ai_debug.get("models", {}) if isinstance(ai_debug, dict) else {}

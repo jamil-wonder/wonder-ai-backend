@@ -115,6 +115,35 @@ async def sunday_analyzer_scheduler():
                             )
                             print(f"[Scheduler] Completed auto scrape for {url}")
                             try:
+                                user_doc = await users_col.find_one({"_id": ObjectId(user_id)}) if users_col is not None else None
+                                if user_doc and user_doc.get("notify_scan_complete", True):
+                                    business_label = result.get("businessName") or biz_doc.get("businessName") or ""
+                                    # One AI-insights pass per business per week (not per
+                                    # visit like the manual dashboard flow) — the scheduler
+                                    # has no other source for this data, so it's worth the
+                                    # bounded weekly cost to include a real model insight
+                                    # instead of leaving that part of the email empty.
+                                    ai_insights: list = []
+                                    try:
+                                        ai_insights = await asyncio.wait_for(
+                                            get_ai_insights_multi(business_label, url),
+                                            timeout=60,
+                                        )
+                                    except Exception as insight_err:
+                                        print(f"[Scheduler] AI insights unavailable for {url}: {insight_err}")
+
+                                    sent = await send_scan_complete_email(
+                                        to_email=user_doc.get("email", "") or user_mock["email"],
+                                        name=user_doc.get("name", ""),
+                                        business_name=business_label,
+                                        domain=_normalize_site(url),
+                                        scrape=result,
+                                        ai_insights=ai_insights,
+                                    )
+                                    print(f"[Scheduler] Scan-complete email for {url}: {'sent' if sent else 'not sent (SMTP unavailable)'}")
+                            except Exception as email_err:
+                                print(f"[Scheduler] Failed to send scan-complete email for {url}: {email_err}")
+                            try:
                                 await _build_weekly_blogs_for_business(
                                     business_doc={**biz_doc, "businessName": result.get("businessName") or biz_doc.get("businessName"), "latest_scrape_result": result},
                                     current_user=user_mock,

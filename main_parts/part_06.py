@@ -56,6 +56,35 @@ async def api_ai_insights(
         return AiInsightsResult(success=False, insights=[], error=str(e))
 
 
+@app.post("/api/notify/scan-complete")
+async def api_notify_scan_complete(
+    request: ScanCompleteNotifyRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Called by the frontend once it actually has BOTH the scrape result
+    and the AI model insights in hand (i.e. right where the Analyser page's
+    own "analysis completed" toast fires) — never re-runs either AI call
+    itself, just builds and sends the summary email from data the frontend
+    already paid for and already has."""
+    try:
+        user_doc = await users_col.find_one({"_id": ObjectId(current_user["id"])})
+        if not user_doc or not user_doc.get("notify_scan_complete", True):
+            return {"success": True, "sent": False, "reason": "notifications_disabled"}
+
+        sent = await send_scan_complete_email(
+            to_email=user_doc.get("email", ""),
+            name=user_doc.get("name", ""),
+            business_name=request.businessName or str((request.scrape or {}).get("businessName") or ""),
+            domain=_normalize_site(request.url),
+            scrape=request.scrape or {},
+            ai_insights=request.aiInsights or [],
+        )
+        return {"success": True, "sent": sent}
+    except Exception as e:
+        print(f"[Email] Failed to send scan-complete email: {e}")
+        return {"success": False, "sent": False}
+
+
 def _build_public_competitor_questions(request: PublicCompetitorsRequest) -> list[dict]:
     category = (request.category or "business").strip()
     location = (request.location or "nearby").strip()

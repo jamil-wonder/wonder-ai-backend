@@ -33,9 +33,17 @@ async def _web_research_with_fallback(
     framing, so competitor discovery keeps working off whichever provider
     still has working credentials instead of silently returning nothing.
     """
+    # retry_once=True: a single transient failure (brief rate limit, a
+    # timeout under concurrent Phase5 load) previously fell straight through
+    # to the OpenAI fallback — which has no live web search and is far less
+    # likely to name real, currently-accurate competitor domains, especially
+    # for smaller/local/niche businesses. One retry against the real
+    # web-search-capable provider before downgrading is worth the extra
+    # credit — this is the main cause of runs that come back with too few
+    # real competitors found.
     response = await _call_claude_web_search_with_retry(
         claude_prompt,
-        retry_once=False,
+        retry_once=True,
         timeout_sec=timeout_sec,
         max_uses=max_uses,
     )
@@ -175,9 +183,13 @@ async def _validate_same_niche_competitors_claude(
     - JSON only.
     """
 
+    # Same reasoning as the discovery call above: a failed validation pass
+    # with no retry means real candidates that were actually found upstream
+    # never get confirmed, so the sparser "unvalidated fallback" branch
+    # kicks in more than it needs to.
     response = await _call_claude_web_search_with_retry(
         prompt,
-        retry_once=False,
+        retry_once=True,
         timeout_sec=28,
         max_uses=5,
     )

@@ -111,6 +111,7 @@ class UserResponse(BaseModel):
     role: str = "user"
     status: str = "active"
     email_verified: bool = False
+    notify_scan_complete: bool = True
 
 class UserRoleUpdateRequest(BaseModel):
     role: str

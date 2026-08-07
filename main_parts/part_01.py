@@ -511,6 +511,260 @@ async def send_verification_email(to_email: str, name: str, user_id: str, purpos
     return await send_email(to_email, subject, html_body, text_body)
 
 
+def _grade_pill_color(grade: str) -> tuple[str, str]:
+    g = str(grade or "").upper()
+    if g in ("A+", "A"):
+        return "#0f7a4d", "#edf8f1"
+    if g in ("B+", "B"):
+        return "#9a6a12", "#faf1da"
+    return "#b1442a", "#fbeee6"
+
+
+def _score_badge_html(score: int) -> str:
+    """A solid circular badge, not an SVG progress ring — Gmail (and some
+    other clients) strip inline <svg> outright for security, which is
+    exactly what silently turned the previous ring into bare, uncircled
+    text. border-radius on a table cell is far less exciting visually but
+    actually renders as a circle everywhere that matters."""
+    clamped = max(0, min(100, int(score or 0)))
+    size = 92
+    return f"""<table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+      <tr>
+        <td width="{size}" height="{size}" align="center" valign="middle" style="width:{size}px;height:{size}px;border-radius:{size // 2}px;background:#15463b;">
+          <div style="font-family:Arial,Helvetica,sans-serif;font-size:30px;line-height:{size}px;font-weight:700;color:#ffffff;">{clamped}</div>
+        </td>
+      </tr>
+    </table>"""
+
+
+def _entity_signal_rows(scrape: dict) -> str:
+    checks = [
+        ("Business name", bool(str((scrape or {}).get("businessName") or "").strip())),
+        ("Phone number", bool((scrape or {}).get("phones"))),
+        ("Address", bool((scrape or {}).get("addresses"))),
+        ("Opening hours", bool((scrape or {}).get("openingHours"))),
+        ("Social links", bool((scrape or {}).get("socialLinks"))),
+        ("Contact page", bool((scrape or {}).get("hasContactPath"))),
+    ]
+    rows = ""
+    for label, found in checks:
+        color = "#1e7d4f" if found else "#b1442a"
+        status_text = "Found" if found else "Not found"
+        rows += f"""
+        <tr>
+          <td style="padding:6px 0;font-size:13px;color:#3a352b;border-bottom:1px solid #f0ebe0;">{label}</td>
+          <td style="padding:6px 0;font-size:13px;font-weight:700;color:{color};text-align:right;border-bottom:1px solid #f0ebe0;">{status_text}</td>
+        </tr>"""
+    return rows
+
+
+def _technical_summary_line(scrape: dict) -> str:
+    checks = [
+        ("HTTPS", bool((scrape or {}).get("hasSSL"))),
+        ("Mobile-friendly", bool((scrape or {}).get("hasMobileMeta"))),
+        ("Sitemap", bool((scrape or {}).get("sitemapFound"))),
+        ("Robots.txt", bool((scrape or {}).get("robotsTxtFound"))),
+        ("Canonical URL", bool((scrape or {}).get("canonicalUrl"))),
+    ]
+    passed = sum(1 for _, ok in checks if ok)
+    failed = [label for label, ok in checks if not ok]
+    if not failed:
+        return f"{passed} of {len(checks)} technical checks passed — nothing missing here."
+    return f"{passed} of {len(checks)} technical checks passed. Missing: {', '.join(failed)}."
+
+
+def _pick_ai_insight(ai_insights: list) -> dict | None:
+    """One representative model insight, not all of them — prefers a model
+    that actually recognizes the business over a generic/unknown response."""
+    if not isinstance(ai_insights, list) or not ai_insights:
+        return None
+    def has_summary(item):
+        return isinstance(item, dict) and str(item.get("summary") or "").strip()
+    known = [i for i in ai_insights if has_summary(i) and i.get("isKnown")]
+    pool = known or [i for i in ai_insights if has_summary(i)]
+    return pool[0] if pool else None
+
+
+def _model_badge(model_name: str) -> tuple[str, str, str]:
+    name = str(model_name or "").lower()
+    if "claude" in name:
+        return "Claude", "#f3ece0", "#a15a1f"
+    if "gemini" in name:
+        return "Gemini", "#e8f0fe", "#3b6fd1"
+    if "perplexity" in name or "pplx" in name or "sonar" in name:
+        return "Perplexity", "#e6f5f2", "#0f7a6b"
+    return "ChatGPT", "#eef0ec", "#3a352b"
+
+
+def _build_scan_complete_email(
+    *,
+    name: str,
+    business_name: str,
+    domain: str,
+    scrape: dict,
+    ai_insights: list,
+    dashboard_url: str,
+) -> tuple[str, str]:
+    display_name = name or "there"
+    label = business_name or domain or "your business"
+    scores = (scrape or {}).get("scores") or {}
+    total = int(scores.get("total") or 0)
+    grade = str(scores.get("grade") or "-")
+    grade_color, grade_bg = _grade_pill_color(grade)
+    score_badge = _score_badge_html(total)
+
+    insight = _pick_ai_insight(ai_insights)
+    insight_html = ""
+    insight_text = ""
+    if insight:
+        model_label, model_bg, model_color = _model_badge(insight.get("modelName"))
+        summary = str(insight.get("summary") or "").strip()
+        if len(summary) > 160:
+            summary = summary[:157].rstrip() + "..."
+        insight_html = f"""
+        <div style="margin:0 0 20px 0;padding:14px 16px;background:#ffffff;border:1px solid #ece3d1;border-radius:14px;">
+          <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#9b927f;margin-bottom:8px;">AI model insight</div>
+          <span style="display:inline-block;margin-bottom:8px;padding:3px 9px;border-radius:999px;background:{model_bg};color:{model_color};font-size:11px;font-weight:700;">{model_label}</span>
+          <p style="margin:0;font-size:13px;line-height:20px;color:#3a352b;">{summary}</p>
+        </div>"""
+        insight_text = f"\n{model_label} on {label}: {summary}\n"
+
+    entity_rows = _entity_signal_rows(scrape)
+    technical_line = _technical_summary_line(scrape)
+
+    # Restored on purpose — the found/not-found rows above say WHAT wasn't
+    # found, but not why it matters. These are the scraper's own
+    # human-written explanations (e.g. "No phone number detected — hurts
+    # local SEO"), which is real, specific detail the compact rows alone
+    # don't carry. Kept short (3 max) so it stays a highlight, not a
+    # second copy of the full audit.
+    top_findings = [str(w).strip() for w in ((scrape or {}).get("warnings") or []) if str(w or "").strip()][:3]
+    if top_findings:
+        findings_intro = "A few things worth a look:"
+        findings_html = "".join(
+            f'<tr><td style="padding:5px 0;font-size:13px;line-height:19px;color:#6f6757;">&#8226;&nbsp; {f}</td></tr>'
+            for f in top_findings
+        )
+        findings_text = "\n".join(f"  - {f}" for f in top_findings)
+    else:
+        findings_intro = "No major gaps found this run — nice work."
+        findings_html = ""
+        findings_text = ""
+
+    text_body = (
+        f"Hi {display_name},\n\n"
+        f"Your Wonderscore scan for {label} ({domain}) just finished.\n\n"
+        f"Overall score: {total}/100 (Grade {grade})\n"
+        f"{insight_text}\n"
+        f"Technical readiness: {technical_line}\n\n"
+        f"{findings_intro}\n{findings_text}\n\n"
+        f"View the full report: {dashboard_url}\n"
+    )
+
+    html_body = f"""
+    <div style="margin:0;padding:0;background:#faf8f3;">
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;padding:28px 16px;color:#23211b;">
+        <div style="background:#ffffff;border:1px solid #ece3d1;border-radius:24px;overflow:hidden;box-shadow:0 18px 45px rgba(21,70,59,0.10);">
+          <div style="padding:26px 28px 20px 28px;border-bottom:1px solid #f0e8d8;background:#fdfcf8;">
+            <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+              <tr>
+                <td width="42" style="vertical-align:middle;">
+                  <div style="width:42px;height:42px;line-height:42px;text-align:center;border-radius:14px;background:#15463b;color:#ffffff;font-size:24px;font-weight:700;">&#10022;</div>
+                </td>
+                <td style="vertical-align:middle;padding-left:12px;">
+                  <div style="font-size:20px;font-weight:700;letter-spacing:-0.02em;color:#15463b;">Wonderscore</div>
+                  <div style="font-size:12px;line-height:18px;color:#8a8273;">AI visibility dashboard</div>
+                </td>
+              </tr>
+            </table>
+          </div>
+
+          <div style="padding:30px 28px 24px 28px;">
+            <div style="display:inline-block;margin-bottom:14px;padding:5px 9px;border-radius:999px;background:#edf8f1;border:1px solid #ccebd8;color:#0f7a4d;font-size:10px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;">
+              Scan complete
+            </div>
+            <h1 style="margin:0 0 10px 0;font-size:26px;line-height:32px;font-weight:700;color:#15463b;letter-spacing:-0.03em;">{label}'s visibility scan is ready</h1>
+            <p style="margin:0 0 22px 0;font-size:14px;line-height:22px;color:#6f6757;">
+              Hi {display_name}, we just finished scanning <strong style="color:#23211b;">{domain}</strong>. Here's the short version.
+            </p>
+
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;margin-bottom:22px;">
+              <tr>
+                <td width="112" style="vertical-align:middle;">
+                  {score_badge}
+                </td>
+                <td style="vertical-align:middle;padding-left:14px;">
+                  <span style="display:inline-block;padding:4px 10px;border-radius:999px;background:{grade_bg};color:{grade_color};font-size:12px;font-weight:700;">Grade {grade}</span>
+                  <div style="margin-top:8px;font-size:13px;line-height:20px;color:#6f6757;">Wonder Score, based on 6 audit areas</div>
+                </td>
+              </tr>
+            </table>
+
+            {insight_html}
+
+            <div style="margin:0 0 16px 0;">
+              <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#9b927f;margin-bottom:6px;">Entity &amp; contact signals</div>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+                {entity_rows}
+              </table>
+            </div>
+
+            <div style="margin:0 0 16px 0;padding:12px 14px;background:#f6f3ec;border:1px solid #ece3d1;border-radius:12px;">
+              <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#9b927f;margin-bottom:4px;">Technical readiness</div>
+              <p style="margin:0;font-size:13px;line-height:19px;color:#3a352b;">{technical_line}</p>
+            </div>
+
+            <div style="margin:0 0 22px 0;padding:14px 16px;background:#fdfcf8;border:1px solid #ece3d1;border-radius:14px;">
+              <div style="font-size:13px;font-weight:700;color:#23211b;margin-bottom:{"6px" if findings_html else "0"};">{findings_intro}</div>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+                {findings_html}
+              </table>
+            </div>
+
+            <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+              <tr>
+                <td style="border-radius:12px;background:#15463b;">
+                  <a href="{dashboard_url}" style="display:inline-block;padding:12px 22px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;">View full report</a>
+                </td>
+              </tr>
+            </table>
+          </div>
+        </div>
+
+        <p style="margin:18px 0 0 0;text-align:center;font-size:11px;line-height:18px;color:#9b927f;">
+          You're getting this because scan-complete emails are on in your Wonderscore settings.
+        </p>
+      </div>
+    </div>
+    """
+    return html_body, text_body
+
+
+async def send_scan_complete_email(
+    *,
+    to_email: str,
+    name: str,
+    business_name: str,
+    domain: str,
+    scrape: dict,
+    ai_insights: list | None = None,
+) -> bool:
+    if not to_email:
+        return False
+    frontend_url = (os.getenv("FRONTEND_APP_URL") or "http://localhost:3000").rstrip("/")
+    dashboard_url = f"{frontend_url}/analyser"
+    html_body, text_body = _build_scan_complete_email(
+        name=name,
+        business_name=business_name,
+        domain=domain,
+        scrape=scrape or {},
+        ai_insights=ai_insights or [],
+        dashboard_url=dashboard_url,
+    )
+    label = business_name or domain or "your business"
+    return await send_email(to_email, f"Your Wonderscore scan for {label} is ready", html_body, text_body)
+
+
 # --- Email quality gate ---
 # EmailStr on the request models only checks that an address is *shaped*
 # like an email. That's not enough on its own: "user@mailinator.com" is
@@ -594,6 +848,17 @@ class UserProfileUpdateRequest(BaseModel):
 class UserPasswordChangeRequest(BaseModel):
     current_password: str
     new_password: str
+
+
+class NotificationPreferencesUpdateRequest(BaseModel):
+    notify_scan_complete: bool
+
+
+class ScanCompleteNotifyRequest(BaseModel):
+    url: str
+    businessName: str = ""
+    scrape: dict = {}
+    aiInsights: list = []
 
 
 class OtpVerifyRequest(BaseModel):
