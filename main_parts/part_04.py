@@ -419,6 +419,19 @@ async def api_user_business_upsert(
         if current_count >= 3:
             raise HTTPException(status_code=400, detail="You can save up to 3 business profiles for now")
 
+    # A manual scan (Analyser page) saves its result here via
+    # latest_scrape_result, but this endpoint never used to forward its
+    # score into latest_phase1_score/weekly_scores — only the Sunday
+    # scheduler did. That meant a manual scan's score only ever lived in
+    # the browser's localStorage cache, so it vanished on logout or a
+    # different device. Deriving it here (not trusting a client-sent
+    # score field) makes every save — manual or scheduled — update the
+    # same persisted score history.
+    phase1_score = None
+    scrape_scores = (request.latest_scrape_result or {}).get("scores")
+    if isinstance(scrape_scores, dict) and isinstance(scrape_scores.get("total"), (int, float)):
+        phase1_score = int(scrape_scores["total"])
+
     business = await _upsert_user_business(
         current_user=current_user,
         url=request.url,
@@ -436,6 +449,7 @@ async def api_user_business_upsert(
         tracked_pages=request.trackedPages,
         business_id=request.business_id,
         scrape_result=request.latest_scrape_result,
+        phase1_score=phase1_score,
     )
     public = _public_business_doc(business)
     if not public:
