@@ -573,6 +573,118 @@ def _technical_summary_line(scrape: dict) -> str:
     return f"{passed} of {len(checks)} technical checks passed. Missing: {', '.join(failed)}."
 
 
+def _compute_audit_areas(scrape: dict) -> list[dict]:
+    """Python port of the frontend's 6 audit-area scores (analyser/page.tsx
+    lines ~283-310). Used as a fallback when the caller doesn't already
+    supply computed areas — namely the Sunday scheduler, which has no
+    frontend to compute them. Deliberately reads raw signal fields
+    (phones/schemas/socialLinks/etc.), NOT scrape['scores'], because that
+    dict's category totals mean different things depending on where the
+    scrape came from (the frontend overwrites them with these same
+    transformed values before it's ever sent anywhere)."""
+    scrape = scrape or {}
+    scores = scrape.get("scores") or {}
+    schemas_found = len(scrape.get("schemas") or [])
+    socials_found = len((scrape.get("socialLinks") or {}) or {})
+    has_ssl = scrape.get("hasSSL", True)
+    has_mobile = scrape.get("hasMobileMeta", True)
+    has_sitemap = scrape.get("sitemapFound", True)
+    has_robots = scrape.get("robotsTxtFound", True)
+    description = scrape.get("description") or ""
+    canonical_url = scrape.get("canonicalUrl")
+    language = scrape.get("language")
+    logo_found = bool(scrape.get("logoFound") or scrape.get("logoUrl"))
+    phones = scrape.get("phones") or []
+    emails = scrape.get("emails") or []
+
+    core_identity_total = (scores.get("coreIdentity") or {}).get("total") or 22
+    sentiment_score = min(100, max(70, round((core_identity_total / 25) * 100)))
+
+    sources_score = min(100, round(75 + (12 if socials_found > 0 else 0) + (8 if phones else 0) + (5 if emails else 0)))
+
+    content_score = 20
+    if description and len(description) > 30:
+        content_score += 35
+    if canonical_url:
+        content_score += 20
+    if language:
+        content_score += 15
+    if logo_found:
+        content_score += 10
+    content_score = min(100, max(65, content_score))
+
+    presence_score = 95 if socials_found >= 3 else 85 if socials_found == 2 else 75 if socials_found == 1 else 60
+    coverage_score = 92 if schemas_found >= 3 else 82 if schemas_found == 2 else 70 if schemas_found == 1 else 45
+
+    tech_score = 0
+    if has_ssl: tech_score += 20
+    if has_mobile: tech_score += 20
+    if canonical_url: tech_score += 20
+    if has_sitemap: tech_score += 20
+    if has_robots: tech_score += 20
+    tech_score = min(100, max(70, tech_score))
+
+    return [
+        {"label": "How AI describes you", "score": sentiment_score},
+        {"label": "Where AI gets its information", "score": sources_score},
+        {"label": "Content quality", "score": content_score},
+        {"label": "Presence across platforms", "score": presence_score},
+        {"label": "Topic coverage", "score": coverage_score},
+        {"label": "Technical health", "score": tech_score},
+    ]
+
+
+def _audit_areas_html(areas: list) -> tuple[str, str]:
+    """The 6 audit-area score cards, 2 per row. Returns (html, text)."""
+    cleaned = []
+    for a in (areas or [])[:6]:
+        if not isinstance(a, dict):
+            continue
+        label = str(a.get("label") or "").strip()
+        try:
+            score = int(round(float(a.get("score") or 0)))
+        except (TypeError, ValueError):
+            score = 0
+        if label:
+            cleaned.append((label, max(0, min(100, score))))
+    if not cleaned:
+        return "", ""
+
+    def color_for(score: int) -> str:
+        if score >= 75:
+            return "#1e7d4f"
+        if score >= 60:
+            return "#9a6a12"
+        return "#b1442a"
+
+    cells = [
+        f"""
+        <td width="50%" valign="top" style="padding:0 6px 12px 0;">
+          <div style="padding:12px 14px;background:#fdfcf8;border:1px solid #ece3d1;border-radius:12px;">
+            <div style="font-size:20px;font-weight:700;color:{color_for(score)};">{score}</div>
+            <div style="margin-top:2px;font-size:12px;line-height:16px;color:#6f6757;">{label}</div>
+          </div>
+        </td>"""
+        for label, score in cleaned
+    ]
+    rows = []
+    for i in range(0, len(cells), 2):
+        pair = cells[i:i + 2]
+        if len(pair) == 1:
+            pair.append('<td width="50%"></td>')
+        rows.append(f"<tr>{''.join(pair)}</tr>")
+
+    html = f"""
+    <div style="margin:0 0 18px 0;">
+      <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#9b927f;margin-bottom:8px;">Your 6 audit areas</div>
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+        {''.join(rows)}
+      </table>
+    </div>"""
+    text = "\n".join(f"  {label}: {score}" for label, score in cleaned)
+    return html, text
+
+
 def _pick_ai_insight(ai_insights: list) -> dict | None:
     """One representative model insight, not all of them — prefers a model
     that actually recognizes the business over a generic/unknown response."""
@@ -604,6 +716,7 @@ def _build_scan_complete_email(
     scrape: dict,
     ai_insights: list,
     dashboard_url: str,
+    areas: list | None = None,
 ) -> tuple[str, str]:
     display_name = name or "there"
     label = business_name or domain or "your business"
@@ -612,6 +725,7 @@ def _build_scan_complete_email(
     grade = str(scores.get("grade") or "-")
     grade_color, grade_bg = _grade_pill_color(grade)
     score_badge = _score_badge_html(total)
+    areas_html, areas_text = _audit_areas_html(areas or _compute_audit_areas(scrape))
 
     insight = _pick_ai_insight(ai_insights)
     insight_html = ""
@@ -655,7 +769,8 @@ def _build_scan_complete_email(
         f"Hi {display_name},\n\n"
         f"Your Wonderscore scan for {label} ({domain}) just finished.\n\n"
         f"Overall score: {total}/100 (Grade {grade})\n"
-        f"{insight_text}\n"
+        + (f"\n{areas_text}\n" if areas_text else "")
+        + f"{insight_text}\n"
         f"Technical readiness: {technical_line}\n\n"
         f"{findings_intro}\n{findings_text}\n\n"
         f"View the full report: {dashboard_url}\n"
@@ -699,6 +814,8 @@ def _build_scan_complete_email(
                 </td>
               </tr>
             </table>
+
+            {areas_html}
 
             {insight_html}
 
@@ -748,6 +865,7 @@ async def send_scan_complete_email(
     domain: str,
     scrape: dict,
     ai_insights: list | None = None,
+    areas: list | None = None,
 ) -> bool:
     if not to_email:
         return False
@@ -760,6 +878,7 @@ async def send_scan_complete_email(
         scrape=scrape or {},
         ai_insights=ai_insights or [],
         dashboard_url=dashboard_url,
+        areas=areas,
     )
     label = business_name or domain or "your business"
     return await send_email(to_email, f"Your Wonderscore scan for {label} is ready", html_body, text_body)
@@ -859,6 +978,7 @@ class ScanCompleteNotifyRequest(BaseModel):
     businessName: str = ""
     scrape: dict = {}
     aiInsights: list = []
+    areas: list = []
 
 
 class OtpVerifyRequest(BaseModel):

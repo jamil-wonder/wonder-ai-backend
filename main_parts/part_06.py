@@ -78,6 +78,7 @@ async def api_notify_scan_complete(
             domain=_normalize_site(request.url),
             scrape=request.scrape or {},
             ai_insights=request.aiInsights or [],
+            areas=request.areas or [],
         )
         return {"success": True, "sent": sent}
     except Exception as e:
