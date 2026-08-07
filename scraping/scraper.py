@@ -953,6 +953,12 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
     booking_score = 7 if has_booking else 0
     trust_score = social_score + booking_score
 
+    # Not every business takes bookings, but almost every business site has
+    # a contact page — this is what the frontend actually surfaces (as
+    # "Contact path" in Entity & Contact Signals) since it's a far more
+    # universal signal than booking.
+    has_contact_path = bool(soup.find_all('a', href=re.compile(r'contact|get-?in-?touch|enquir|reach-?us', re.I)))
+
     schema_present = 4 if len(schemas) > 0 else 0
     has_business_type = any(
         isinstance(s.get('@type'), str) and re.search(r'business|organization|localbusiness|store|restaurant|service', s['@type'], re.I) 
@@ -999,6 +1005,7 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
         "hasSSL": has_ssl,
         "hasMobileMeta": has_mobile_meta,
         "hasAnalytics": has_analytics,
+        "hasContactPath": has_contact_path,
         "pageSpeedHints": page_speed_hints,
         "schemas": schemas,
         "scores": {

@@ -54,6 +54,7 @@ class ScrapeResult(BaseModel):
     hasSSL: bool
     hasMobileMeta: bool
     hasAnalytics: bool
+    hasContactPath: bool = False
     pageSpeedHints: List[str]
     schemas: List[Dict[str, Any]]
     scores: Dict[str, Any]
