@@ -122,6 +122,9 @@ class UserResponse(BaseModel):
 class UserRoleUpdateRequest(BaseModel):
     role: str
 
+class UserStatusUpdateRequest(BaseModel):
+    status: str
+
 class SearchHistoryResponse(BaseModel):
     id: str
     user_id: Optional[str] = None

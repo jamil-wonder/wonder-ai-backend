@@ -1,27 +1,148 @@
 # Generated from the former backend/main.py lines 3000-3376.
-@app.get("/api/admin/users")
-async def admin_get_users(admin: dict = Depends(get_current_admin_user)):
+from models import UserStatusUpdateRequest
+
+
+def _admin_pagination(total: int, page: int, page_size: int) -> dict:
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+        "has_prev": page > 1,
+    }
+
+
+@app.get("/api/admin/stats")
+async def admin_get_stats(admin: dict = Depends(get_current_admin_user)):
+    """Overview counters for the admin dashboard landing page — kept as one
+    cheap endpoint (count_documents, not full scans) rather than making the
+    UI stitch this together from several list endpoints itself."""
     try:
+        now = datetime.utcnow()
+        today_iso = now.strftime("%Y-%m-%d")
+        week_ago_iso = (now - timedelta(days=7)).isoformat()
+
+        total_users = await users_col.count_documents({})
+        admin_count = await users_col.count_documents({"role": "admin"})
+        banned_count = await users_col.count_documents({"status": "banned"})
+        verified_count = await users_col.count_documents({"email_verified": True})
+
+        total_businesses = await businesses_col.count_documents({}) if businesses_col is not None else 0
+
+        scans_this_week = 0
+        if urls_col is not None:
+            scans_this_week = await urls_col.count_documents({"timestamp": {"$gte": week_ago_iso}})
+
+        ai_calls_today = 0
+        ai_calls_week = 0
+        if ai_usage_col is not None:
+            async for doc in ai_usage_col.find(
+                {"timestamp": {"$gte": week_ago_iso}},
+                {"ai_calls_estimate": 1, "timestamp": 1},
+            ):
+                calls = int(doc.get("ai_calls_estimate", 0) or 0)
+                ai_calls_week += calls
+                ts = str(doc.get("timestamp") or "")
+                if ts.startswith(today_iso):
+                    ai_calls_today += calls
+
+        return {
+            "success": True,
+            "stats": {
+                "total_users": total_users,
+                "admin_count": admin_count,
+                "banned_count": banned_count,
+                "verified_count": verified_count,
+                "total_businesses": total_businesses,
+                "scans_this_week": scans_this_week,
+                "ai_calls_today": ai_calls_today,
+                "ai_calls_this_week": ai_calls_week,
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/users")
+async def admin_get_users(
+    page: int = 1,
+    page_size: int = 20,
+    q: str = "",
+    role: str = "",
+    status: str = "",
+    admin: dict = Depends(get_current_admin_user),
+):
+    try:
+        safe_page = max(1, page)
+        safe_page_size = max(1, min(100, page_size))
+
+        query: dict = {}
+        search = q.strip()
+        if search:
+            query["$or"] = [
+                {"name": {"$regex": search, "$options": "i"}},
+                {"email": {"$regex": search, "$options": "i"}},
+            ]
+        if role.strip():
+            query["role"] = role.strip()
+        if status.strip():
+            query["status"] = status.strip()
+
+        total = await users_col.count_documents(query)
+        cursor = (
+            users_col.find(query)
+            .sort("created_at", -1)
+            .skip((safe_page - 1) * safe_page_size)
+            .limit(safe_page_size)
+        )
+        docs = await cursor.to_list(length=safe_page_size)
+
+        # One grouped aggregation for the whole page of user_ids, instead of
+        # a businesses_col query per row — keeps this endpoint's cost flat
+        # regardless of page_size.
+        user_ids = [str(u["_id"]) for u in docs]
+        business_counts: dict[str, int] = {}
+        if businesses_col is not None and user_ids:
+            async for row in businesses_col.aggregate([
+                {"$match": {"user_id": {"$in": user_ids}}},
+                {"$group": {"_id": "$user_id", "count": {"$sum": 1}}},
+            ]):
+                business_counts[row["_id"]] = row["count"]
+
         users = []
-        async for u in users_col.find({}):
+        for u in docs:
+            uid = str(u["_id"])
             users.append({
-                "id": str(u["_id"]),
+                "id": uid,
                 "name": u.get("name"),
                 "email": u.get("email"),
                 "role": u.get("role", "user"),
                 "status": u.get("status", "active"),
-                "created_at": u.get("created_at")
+                "email_verified": bool(u.get("email_verified")),
+                "notify_scan_complete": u.get("notify_scan_complete", True),
+                "created_at": u.get("created_at"),
+                "businesses_count": business_counts.get(uid, 0),
             })
-        return {"success": True, "users": users}
+
+        return {
+            "success": True,
+            "users": users,
+            "pagination": _admin_pagination(total, safe_page, safe_page_size),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.put("/api/admin/users/{user_id}/role")
 async def admin_update_user_role(user_id: str, request: UserRoleUpdateRequest, admin: dict = Depends(get_current_admin_user)):
     try:
         if admin["id"] == user_id:
             raise HTTPException(status_code=400, detail="Admins cannot change their own role")
-        
+        if request.role not in ("user", "admin"):
+            raise HTTPException(status_code=400, detail="Role must be 'user' or 'admin'")
+
         upd = await users_col.update_one(
             {"_id": ObjectId(user_id)},
             {"$set": {"role": request.role}}
@@ -34,11 +155,72 @@ async def admin_update_user_role(user_id: str, request: UserRoleUpdateRequest, a
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/admin/searches")
-async def admin_get_searches(admin: dict = Depends(get_current_admin_user)):
+
+@app.put("/api/admin/users/{user_id}/status")
+async def admin_update_user_status(user_id: str, request: UserStatusUpdateRequest, admin: dict = Depends(get_current_admin_user)):
+    """The privilege control that was missing entirely — user.status has
+    always supported "banned" (every login/OTP/Google path already checks
+    it) but nothing could ever set it. This is that switch."""
     try:
+        if admin["id"] == user_id:
+            raise HTTPException(status_code=400, detail="Admins cannot change their own status")
+        if request.status not in ("active", "banned"):
+            raise HTTPException(status_code=400, detail="Status must be 'active' or 'banned'")
+
+        upd = await users_col.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"status": request.status}}
+        )
+        if upd.matched_count == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+        return {"success": True, "status": request.status}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/admin/users/{user_id}")
+async def admin_delete_user(user_id: str, admin: dict = Depends(get_current_admin_user)):
+    try:
+        if admin["id"] == user_id:
+            raise HTTPException(status_code=400, detail="Admins cannot delete their own account")
+
+        result = await users_col.delete_one({"_id": ObjectId(user_id)})
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # Cascade — an orphaned business profile pointing at a deleted user
+        # is dead data no page can ever legitimately show again.
+        if businesses_col is not None:
+            await businesses_col.delete_many({"user_id": user_id})
+
+        return {"success": True, "deleted_user_id": user_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/searches")
+async def admin_get_searches(
+    page: int = 1,
+    page_size: int = 50,
+    admin: dict = Depends(get_current_admin_user),
+):
+    try:
+        safe_page = max(1, page)
+        safe_page_size = max(1, min(200, page_size))
+
+        total = await urls_col.count_documents({})
+        cursor = (
+            urls_col.find({})
+            .sort("timestamp", -1)
+            .skip((safe_page - 1) * safe_page_size)
+            .limit(safe_page_size)
+        )
         searches = []
-        async for doc in urls_col.find({}).sort("timestamp", -1):
+        async for doc in cursor:
             searches.append({
                 "id": str(doc["_id"]),
                 "url": doc["url"],
@@ -47,7 +229,11 @@ async def admin_get_searches(admin: dict = Depends(get_current_admin_user)):
                 "user_id": doc.get("user_id"),
                 "user_email": doc.get("user_email")
             })
-        return {"success": True, "searches": searches}
+        return {
+            "success": True,
+            "searches": searches,
+            "pagination": _admin_pagination(total, safe_page, safe_page_size),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -96,17 +282,34 @@ async def admin_delete_searches(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/admin/wishlist-full")
-async def admin_get_wishlist_full(admin: dict = Depends(get_current_admin_user)):
+async def admin_get_wishlist_full(
+    page: int = 1,
+    page_size: int = 50,
+    admin: dict = Depends(get_current_admin_user),
+):
     try:
+        safe_page = max(1, page)
+        safe_page_size = max(1, min(200, page_size))
+
+        total = await wishlist_col.count_documents({})
+        cursor = (
+            wishlist_col.find({})
+            .sort("timestamp", -1)
+            .skip((safe_page - 1) * safe_page_size)
+            .limit(safe_page_size)
+        )
         emails = []
-        # Support full documents, with potentially a logged created_at date
-        async for doc in wishlist_col.find({}):
+        async for doc in cursor:
             emails.append({
                 "id": str(doc["_id"]),
                 "email": doc["email"],
                 "timestamp": doc.get("timestamp")
             })
-        return {"success": True, "wishlist": emails}
+        return {
+            "success": True,
+            "wishlist": emails,
+            "pagination": _admin_pagination(total, safe_page, safe_page_size),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

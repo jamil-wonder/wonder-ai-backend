@@ -322,11 +322,21 @@ async def _log_ai_usage_event(event: dict):
             model_name = (os.getenv("PERPLEXITY_MODEL_PHASE5") or "sonar-pro").strip()
         if not model_name and model_provider in {"anthropic", "claude"}:
             model_name = (os.getenv("ANTHROPIC_MODEL_PHASE5") or "claude-sonnet-4-5").strip()
+        # Phase5 jobs can run in "multi" mode (job_doc.get("model") == "multi"
+        # in part_09.py) — every provider ran, not one specific model. That's
+        # not missing data, it's a real third category alongside a single
+        # provider, so it gets its own name instead of falling through to the
+        # "unknown" bucket below where every genuinely-untracked event also
+        # lands.
+        if not model_name and model_provider == "multi":
+            model_name = "multi"
 
         model_family = payload.get("model_family")
         lowered_model = str(model_name or "").lower()
         if not model_family:
-            if model_provider == "gemini":
+            if model_provider == "multi":
+                model_family = "multi"
+            elif model_provider == "gemini":
                 model_family = "gemini"
             elif model_provider == "openai":
                 model_family = "gpt"
@@ -347,7 +357,9 @@ async def _log_ai_usage_event(event: dict):
 
         provider = payload.get("provider")
         if not provider:
-            if model_family == "gemini":
+            if model_family == "multi":
+                provider = "multi"
+            elif model_family == "gemini":
                 provider = "google"
             elif model_family == "gpt" or model_provider == "openai":
                 provider = "openai"
