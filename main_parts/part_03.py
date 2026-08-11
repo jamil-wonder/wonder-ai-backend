@@ -422,6 +422,11 @@ async def api_google_login(request: GoogleAuthRequest):
             user_role = assigned_role
             user_status = "active"
             created_at = new_user["created_at"]
+            # Google sign-in skips the OTP flow entirely (Google already
+            # verified the email), so this is the only signal that this is
+            # a brand-new account rather than a returning user — fire the
+            # same welcome email the OTP signup path sends.
+            asyncio.create_task(send_welcome_email(email, name))
         else:
             user_id = str(user["_id"])
             user_role = user.get("role", "user")

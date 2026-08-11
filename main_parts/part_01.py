@@ -511,6 +511,98 @@ async def send_verification_email(to_email: str, name: str, user_id: str, purpos
     return await send_email(to_email, subject, html_body, text_body)
 
 
+def _build_welcome_email(name: str, dashboard_url: str) -> tuple[str, str]:
+    display_name = name or "there"
+    steps = [
+        ("Run your first scan", "Head to the Analyser tab and enter your website — Wonderscore crawls it and scores your AI visibility in a couple of minutes."),
+        ("Save your business profile", "Save the business, add competitors and the pages you want tracked, so every future scan builds on it."),
+        ("Let it run itself", "Every Sunday at 4am we automatically re-scan your saved businesses and email you a fresh summary — no need to remember to check back."),
+    ]
+    text_steps = "\n".join(f"{i}. {title} — {desc}" for i, (title, desc) in enumerate(steps, start=1))
+    text_body = (
+        f"Hi {display_name},\n\n"
+        f"Welcome to Wonderscore — glad to have you.\n\n"
+        f"Here's how to get started:\n{text_steps}\n\n"
+        f"Go to your dashboard: {dashboard_url}\n\n"
+        f"You can turn scan-complete emails on or off any time from Settings.\n"
+    )
+
+    step_rows = "".join(
+        f"""
+        <tr>
+          <td width="30" valign="top" style="padding:2px 12px 18px 0;">
+            <div style="width:22px;height:22px;line-height:22px;text-align:center;border-radius:999px;background:#15463b;color:#ffffff;font-size:11px;font-weight:700;">{i}</div>
+          </td>
+          <td style="padding:0 0 18px 0;">
+            <div style="font-size:14px;font-weight:700;color:#23211b;">{title}</div>
+            <div style="margin-top:2px;font-size:13px;line-height:19px;color:#6f6757;">{desc}</div>
+          </td>
+        </tr>"""
+        for i, (title, desc) in enumerate(steps, start=1)
+    )
+
+    html_body = f"""
+    <div style="margin:0;padding:0;background:#faf8f3;">
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;padding:28px 16px;color:#23211b;">
+        <div style="background:#ffffff;border:1px solid #ece3d1;border-radius:24px;overflow:hidden;box-shadow:0 18px 45px rgba(21,70,59,0.10);">
+          <div style="padding:26px 28px 20px 28px;border-bottom:1px solid #f0e8d8;background:#fdfcf8;">
+            <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+              <tr>
+                <td width="42" style="vertical-align:middle;">
+                  <div style="width:42px;height:42px;line-height:42px;text-align:center;border-radius:14px;background:#15463b;color:#ffffff;font-size:24px;font-weight:700;">&#10022;</div>
+                </td>
+                <td style="vertical-align:middle;padding-left:12px;">
+                  <div style="font-size:20px;font-weight:700;letter-spacing:-0.02em;color:#15463b;">Wonderscore</div>
+                  <div style="font-size:12px;line-height:18px;color:#8a8273;">AI visibility dashboard</div>
+                </td>
+              </tr>
+            </table>
+          </div>
+
+          <div style="padding:30px 28px 24px 28px;">
+            <div style="display:inline-block;margin-bottom:14px;padding:5px 9px;border-radius:999px;background:#edf8f1;border:1px solid #ccebd8;color:#0f7a4d;font-size:10px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;">
+              Welcome
+            </div>
+            <h1 style="margin:0 0 10px 0;font-size:26px;line-height:32px;font-weight:700;color:#15463b;letter-spacing:-0.03em;">Welcome to Wonderscore, {display_name}</h1>
+            <p style="margin:0 0 24px 0;font-size:14px;line-height:22px;color:#6f6757;">
+              Wonderscore scores and tracks how visible your business is to AI search — ChatGPT, Claude, Perplexity, and Gemini — and tells you exactly what to fix.
+            </p>
+
+            <div style="margin:0 0 22px 0;">
+              <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#9b927f;margin-bottom:10px;">Here's how to get started</div>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+                {step_rows}
+              </table>
+            </div>
+
+            <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+              <tr>
+                <td style="border-radius:12px;background:#15463b;">
+                  <a href="{dashboard_url}" style="display:inline-block;padding:12px 22px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;">Go to your dashboard</a>
+                </td>
+              </tr>
+            </table>
+          </div>
+        </div>
+
+        <p style="margin:18px 0 0 0;text-align:center;font-size:11px;line-height:18px;color:#9b927f;">
+          You can turn scan-complete emails on or off any time from Settings.
+        </p>
+      </div>
+    </div>
+    """
+    return html_body, text_body
+
+
+async def send_welcome_email(to_email: str, name: str) -> bool:
+    if not to_email:
+        return False
+    frontend_url = (os.getenv("FRONTEND_APP_URL") or "http://localhost:3000").rstrip("/")
+    dashboard_url = f"{frontend_url}/overview"
+    html_body, text_body = _build_welcome_email(name, dashboard_url)
+    return await send_email(to_email, "Welcome to Wonderscore", html_body, text_body)
+
+
 def _grade_pill_color(grade: str) -> tuple[str, str]:
     g = str(grade or "").upper()
     if g in ("A+", "A"):

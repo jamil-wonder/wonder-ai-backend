@@ -139,6 +139,14 @@ async def api_otp_verify(request: OtpVerifyRequest):
     # its owner successfully logs back in, not just at original signup.
     await users_col.update_one({"_id": ObjectId(user_id)}, {"$set": {"email_verified": True}})
 
+    # Welcome email fires exactly once per account — only when the OTP
+    # being verified was the one sent by signup, never on a routine login's
+    # 2FA code (send_verification_email tags each record with its purpose
+    # at send time; see api_signup). Fire-and-forget so a slow SMTP send
+    # never delays the login response.
+    if record.get("purpose") == "signup":
+        asyncio.create_task(send_welcome_email(user["email"], user.get("name", "")))
+
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": user["email"], "id": user_id}, expires_delta=access_token_expires
