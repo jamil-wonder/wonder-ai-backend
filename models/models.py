@@ -112,6 +112,12 @@ class UserResponse(BaseModel):
     status: str = "active"
     email_verified: bool = False
     notify_scan_complete: bool = True
+    # Set only by GET /api/user/profile as a sliding-expiration renewal — a
+    # fresh 7-day token issued on every successful profile check so an
+    # actively-used session never hits the hard 7-day expiry. Absent
+    # everywhere else UserResponse is returned (OTP verify/Google login
+    # already hand back a token of their own via Token, not this model).
+    access_token: Optional[str] = None
 
 class UserRoleUpdateRequest(BaseModel):
     role: str

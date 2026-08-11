@@ -402,19 +402,26 @@ async def api_google_login(request: GoogleAuthRequest):
             raise HTTPException(status_code=400, detail="Invalid Google token payload")
 
         user = await users_col.find_one({"email": email})
-        
+
         if not user:
             total_users = await users_col.count_documents({})
             assigned_role = "admin" if total_users == 0 else "user"
-            
+
             hashed_password = get_password_hash(secrets.token_urlsafe(32))
-            
+
             new_user = {
                 "name": name,
                 "email": email,
                 "hashed_password": hashed_password,
                 "role": assigned_role,
                 "status": "active",
+                # Google has already verified this email address just by
+                # letting the OAuth flow complete — there is no OTP step for
+                # this path to ever mark it true later, so it must be set
+                # here or the dashboard's route guard (needsVerification in
+                # DashboardLayout) redirects every Google user to a
+                # /verify-email screen expecting a code that was never sent.
+                "email_verified": True,
                 "created_at": datetime.utcnow().isoformat()
             }
             result = await users_col.insert_one(new_user)
@@ -422,6 +429,7 @@ async def api_google_login(request: GoogleAuthRequest):
             user_role = assigned_role
             user_status = "active"
             created_at = new_user["created_at"]
+            email_verified = True
             # Google sign-in skips the OTP flow entirely (Google already
             # verified the email), so this is the only signal that this is
             # a brand-new account rather than a returning user — fire the
@@ -433,6 +441,13 @@ async def api_google_login(request: GoogleAuthRequest):
             user_status = user.get("status", "active")
             created_at = user.get("created_at", datetime.utcnow().isoformat())
             name = user.get("name", name)
+            email_verified = bool(user.get("email_verified"))
+            if not email_verified:
+                # Self-heals any account already stuck from before this fix
+                # (created via this same endpoint with no email_verified
+                # field at all) the next time they sign in with Google.
+                await users_col.update_one({"_id": user["_id"]}, {"$set": {"email_verified": True}})
+                email_verified = True
 
         if user_status == "banned":
             raise HTTPException(status_code=403, detail="Your account has been restricted.")
@@ -448,7 +463,8 @@ async def api_google_login(request: GoogleAuthRequest):
             email=email,
             created_at=created_at,
             role=user_role,
-            status=user_status
+            status=user_status,
+            email_verified=email_verified,
         )
 
         return Token(access_token=access_token, token_type="bearer", user=user_response)

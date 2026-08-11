@@ -275,6 +275,17 @@ async def api_user_profile(current_user: dict = Depends(get_current_user)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # Sliding expiration: there's no separate refresh-token flow, so instead
+    # every successful profile check (the frontend calls this on every app
+    # load/tab reopen) quietly re-mints a fresh 7-day token. An actively
+    # used session effectively never hits the hard expiry and never gets
+    # bounced to OTP — only someone who doesn't open the app at all for 7
+    # straight days does. The frontend swaps this in when present.
+    fresh_token = create_access_token(
+        data={"sub": user["email"], "id": str(user["_id"])},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
+
     return UserResponse(
         id=str(user["_id"]),
         name=user.get("name", ""),
@@ -284,6 +295,7 @@ async def api_user_profile(current_user: dict = Depends(get_current_user)):
         status=user.get("status", "active"),
         email_verified=user.get("email_verified", False),
         notify_scan_complete=user.get("notify_scan_complete", True),
+        access_token=fresh_token,
     )
 
 
