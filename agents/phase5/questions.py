@@ -55,19 +55,30 @@ def _location_aliases(location: str) -> set[str]:
     if not raw:
         return set()
 
+    # The full location string and its comma/slash-separated parts are kept
+    # regardless of length — a real place name that happens to be short
+    # ("Rye", "UK", "NYC") must not be filtered out here, or every local SEO
+    # question for that business silently fails its location check forever.
     aliases = {raw}
     parts = [p.strip() for p in re.split(r"[,/|-]", raw) if p.strip()]
     aliases.update(parts)
+    # Extra single-word tokens pulled out of a longer phrase (so "London,
+    # UK" also matches on just "London") do keep a length floor — those are
+    # substrings extracted from something bigger, not the deliberate name
+    # itself, so a short one here is more likely noise ("of", "in", "at").
     words = [w for w in re.findall(r"[a-z0-9]+", raw) if len(w) >= 4]
     aliases.update(words)
-    return {alias for alias in aliases if len(alias) >= 4}
+    return {alias for alias in aliases if alias}
 
 
 def _includes_location(text: str, location: str) -> bool:
     raw = _text(text).lower()
     if not raw:
         return False
-    return any(alias in raw for alias in _location_aliases(location))
+    # Word-boundary match, not a bare substring check — otherwise a short
+    # real alias like "uk" would also match inside unrelated words like
+    # "truck" or "look".
+    return any(re.search(rf"\b{re.escape(alias)}\b", raw) for alias in _location_aliases(location))
 
 
 def _includes_brand(text: str, brand_name: str) -> bool:
@@ -93,6 +104,24 @@ def _includes_category_or_service(text: str, category: str, services: list[str])
     ]
     terms = list(dict.fromkeys([*category_tokens, *service_tokens]))
     return any(term in raw for term in terms)
+
+
+def _matches_best_in_location_pattern(text: str, category: str, location: str, services: list[str]) -> bool:
+    """Detects the classic "Best <category> in <location>?" local-search
+    shape (e.g. "Best restaurant in Belgravia?"). Structural, not just a
+    keyword check — the category term must appear before " in " and the
+    location must appear after it, so "Best in class {category}, {location}
+    reviews?" doesn't false-positive just because both words are present
+    somewhere in the sentence."""
+    raw = _text(text).lower()
+    if not raw.startswith("best "):
+        return False
+    if " in " not in raw:
+        return False
+    in_idx = raw.find(" in ")
+    before_in = raw[:in_idx]
+    after_in = raw[in_idx + 4:]
+    return _includes_category_or_service(before_in, category, services) and _includes_location(after_in, location)
 
 
 def _append_unique_valid_question(
@@ -222,6 +251,12 @@ async def generate_brand_questions(
         "localSeo": local_seo_target + (3 if local_seo_target else 0),
         "broadSeo": broad_seo_target + (3 if broad_seo_target else 0),
     }
+    # Real user local-intent searches skew heavily toward the classic
+    # "Best <category> in <location>?" shape (see _matches_best_in_location_
+    # pattern below) — at 5 local SEO questions that's 2, at 10 it's 4. This
+    # is a floor enforced by re-prompting the AI for real candidates that
+    # match it (see the retry loop), never by splicing in a templated string.
+    local_pattern_min = max(1, round(local_seo_target * 0.4)) if local_seo_target > 0 else 0
     page_ctx = await _fetch_page_context(url)
     ctx = _merge_context(page_ctx, business_context)
 
@@ -309,8 +344,9 @@ Rules for local_seo_queries:
 - Use service/details from the context when available.
 - Cover discovery, comparison, quality, reviews, booking/availability, price/value, occasion/use-case, and trust intent.
 - Do not use placeholder words such as "business", "company", or "place".
-- Do not produce generic prompts like "best restaurant near me" unless the exact location and category/service detail are included.
 - Avoid repeated wording patterns.
+- At least {local_pattern_min} of the {candidate_counts["localSeo"]} local_seo_queries MUST use the classic, high-volume real-search shape "Best <category> in <location>?" — for this business that means questions shaped like "Best {category} in {location}?", using the exact location "{location}" every time and a natural real-world variant of the category or a specific service each time (do not repeat the identical sentence). Example shape only (do not reuse this exact wording): "Best restaurant in Belgravia?" for a restaurant in Belgravia, "Best hotel in Rye?" for a hotel in Rye, "Best supermarket in UK?" for a supermarket business covering the UK.
+- The remaining local_seo_queries should use other natural local-intent phrasings (comparison, reviews, booking, price/value, occasion) rather than all following the same "Best X in Y" shape.
 
 Rules for broad_seo_queries:
 - Do NOT include "{brand_name}", "{domain}", the website URL, or any obvious brand variant.
@@ -367,7 +403,10 @@ Return ONLY valid JSON:
                 f"\n\nThe previous output failed validation. Regenerate a larger candidate pool with exactly "
                 f"{candidate_counts['branded']} branded, {candidate_counts['nonBranded']} non-branded, "
                 f"{candidate_counts['localSeo']} local SEO, and {candidate_counts['broadSeo']} broad SEO candidates. "
-                "Keep the exact location in every local SEO question. Avoid short generic 'Best X in Y' prompts."
+                f"Keep the exact location \"{location}\" in every local SEO question. "
+                f"Remember: at least {local_pattern_min} of the local_seo_queries MUST be the classic "
+                f"\"Best {category} in {location}?\" shape (real category/service wording, exact location) — "
+                f"this attempt was short on that pattern last time, so include more of them, not fewer."
             )
 
         if provider_name == "openai":
@@ -435,6 +474,14 @@ Return ONLY valid JSON:
             if len(non_branded) == non_branded_target:
                 break
 
+        # Two passes so a pattern-matching candidate can never get crowded
+        # out just because it happened to appear later in the AI's raw
+        # output than local_seo_target other valid-but-non-pattern
+        # candidates. Pass 1 fills the local_pattern_min quota from real
+        # "Best <category> in <location>?" candidates only; pass 2 fills
+        # whatever's left with any other valid local-intent candidate
+        # (pattern-matching ones included, since they're valid too).
+        valid_local_candidates: list[str] = []
         for item in raw_local_seo:
             text = _clean_question(item)
             key = text.lower().rstrip("?.!")
@@ -449,9 +496,23 @@ Return ONLY valid JSON:
             if not _includes_category_or_service(text, category, services):
                 continue
             seen.add(key)
-            local_seo.append(text)
-            if len(local_seo) == local_seo_target:
+            valid_local_candidates.append(text)
+
+        for text in valid_local_candidates:
+            if len(local_seo) >= local_pattern_min:
                 break
+            if _matches_best_in_location_pattern(text, category, location, services):
+                local_seo.append(text)
+
+        for text in valid_local_candidates:
+            if len(local_seo) >= local_seo_target:
+                break
+            if text not in local_seo:
+                local_seo.append(text)
+
+        local_pattern_count = sum(
+            1 for text in local_seo if _matches_best_in_location_pattern(text, category, location, services)
+        )
 
         for item in raw_broad_seo:
             text = _clean_question(item)
@@ -474,18 +535,33 @@ Return ONLY valid JSON:
             best_branded = branded[:]
         if len(non_branded) > len(best_non_branded):
             best_non_branded = non_branded[:]
-        if len(local_seo) > len(best_local_seo):
+        # Prefer whichever attempt clears the pattern quota first, then
+        # whichever simply has more items — a fuller list that's short on
+        # the required "Best X in Y" shape isn't actually the better result.
+        best_local_pattern_count = sum(
+            1 for text in best_local_seo if _matches_best_in_location_pattern(text, category, location, services)
+        )
+        local_is_better = (
+            min(local_pattern_count, local_pattern_min) > min(best_local_pattern_count, local_pattern_min)
+            or (
+                min(local_pattern_count, local_pattern_min) == min(best_local_pattern_count, local_pattern_min)
+                and len(local_seo) > len(best_local_seo)
+            )
+        )
+        if local_is_better:
             best_local_seo = local_seo[:]
         if len(broad_seo) > len(best_broad_seo):
             best_broad_seo = broad_seo[:]
 
-        if len(branded) == branded_target and len(non_branded) == non_branded_target and len(local_seo) == local_seo_target and len(broad_seo) == broad_seo_target:
+        local_seo_ok = len(local_seo) == local_seo_target and local_pattern_count >= local_pattern_min
+        if len(branded) == branded_target and len(non_branded) == non_branded_target and local_seo_ok and len(broad_seo) == broad_seo_target:
             return _format_result(branded, non_branded, local_seo, broad_seo)
 
         print(
             "[Phase5] advanced question-gen retry "
             f"provider={provider_name} attempt={attempt}/{quality_attempts} branded={len(branded)}/{branded_target} "
-            f"non_branded={len(non_branded)}/{non_branded_target} local_seo={len(local_seo)}/{local_seo_target} "
+            f"non_branded={len(non_branded)}/{non_branded_target} "
+            f"local_seo={len(local_seo)}/{local_seo_target} (pattern {local_pattern_count}/{local_pattern_min}) "
             f"broad_seo={len(broad_seo)}/{broad_seo_target}"
         )
 
@@ -518,11 +594,14 @@ Return ONLY valid JSON:
 
     total_generated = len(final_branded) + len(final_non_branded) + len(final_local_seo) + len(final_broad_seo)
     if total_generated > 0:
+        final_local_pattern_count = sum(
+            1 for text in final_local_seo if _matches_best_in_location_pattern(text, category, location, services)
+        )
         print(
             "[Phase5] advanced question-gen completed with validated output "
             f"branded={len(final_branded)}/{branded_target} "
             f"non_branded={len(final_non_branded)}/{non_branded_target} "
-            f"local_seo={len(final_local_seo)}/{local_seo_target} "
+            f"local_seo={len(final_local_seo)}/{local_seo_target} (pattern {final_local_pattern_count}/{local_pattern_min}) "
             f"broad_seo={len(final_broad_seo)}/{broad_seo_target}"
         )
         return _format_result(final_branded, final_non_branded, final_local_seo, final_broad_seo)
