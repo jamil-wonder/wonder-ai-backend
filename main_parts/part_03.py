@@ -134,36 +134,53 @@ async def _upsert_user_business(
     else:
         query = {"user_id": current_user["id"], "normalized_domain": normalized_domain}
 
-    # Weekly Score Bucket Logic: Year-Week ID (e.g. 2026-W30)
+    # Score history — one point per real scan, not one per ISO week.
+    # This used to find-or-create a bucket keyed by week_id and overwrite
+    # its score in place. That silently erased history: the Sunday
+    # scheduler and a manual re-scan later the same week both land in the
+    # same week_id, so the second write just overwrote the first entry's
+    # score — only one of the two scans ever survived to show on the trend
+    # chart, under whichever timestamp happened to be on that shared entry.
+    # Every scan (manual or scheduler) now gets appended as its own point
+    # with its own real timestamp, so the chart can show exactly what ran
+    # and when instead of collapsing same-week runs into one number.
     if phase1_score is not None:
         dt = datetime.utcnow()
         week_id = f"{dt.isocalendar().year}-W{dt.isocalendar().week:02d}"
-        
-        # Check existing document for weekly_scores
+
         existing = await businesses_col.find_one(query)
         weekly_scores = (existing.get("weekly_scores") if existing else []) or []
-        
-        # Find if current week bucket exists
-        found = False
-        for entry in weekly_scores:
-            if entry.get("week_id") == week_id:
-                entry["score"] = int(phase1_score)
-                entry["updated_at"] = now_iso
-                found = True
-                break
-        
-        if not found:
+
+        # Guard only against true accidental duplicates (e.g. a frontend
+        # double-submit firing the same save twice within seconds) — not
+        # against a second real scan later the same day/week.
+        last_entry = weekly_scores[-1] if weekly_scores else None
+        is_accidental_duplicate = False
+        if last_entry and last_entry.get("score") == int(phase1_score) and last_entry.get("created_at"):
+            try:
+                # now_iso carries a trailing "Z" that fromisoformat() only
+                # accepts on Python 3.11+ — stripped here to parse safely
+                # regardless of runtime version.
+                last_dt = datetime.fromisoformat(str(last_entry["created_at"]).rstrip("Z"))
+                is_accidental_duplicate = (dt - last_dt).total_seconds() < 120
+            except Exception:
+                is_accidental_duplicate = False
+
+        if is_accidental_duplicate:
+            last_entry["updated_at"] = now_iso
+        else:
             weekly_scores.append({
                 "week_id": week_id,
                 "score": int(phase1_score),
                 "created_at": now_iso,
                 "updated_at": now_iso,
             })
-        
-        # Retain last 52 weeks max
-        if len(weekly_scores) > 52:
-            weekly_scores = weekly_scores[-52:]
-            
+
+        # Cap by point count, not by "weeks", now that a week can hold more
+        # than one point — generous enough for even a daily scanner.
+        if len(weekly_scores) > 200:
+            weekly_scores = weekly_scores[-200:]
+
         set_fields["weekly_scores"] = weekly_scores
 
     update_doc = {
