@@ -659,26 +659,66 @@ async def get_ai_insights_claude(business_name: str, url: str) -> dict:
         }, fallback_model)
 
 
+async def get_ai_insights_gemini(business_name: str, url: str) -> dict:
+    prompt = f"""
+    You are an AI research assistant. A user has a local business or website and wants to know what is known online.
+    The business name is "{business_name}" and website is "{url}".
+
+    Respond in valid JSON with this exact shape:
+    {{
+      "modelName": "Gemini",
+      "isKnown": true or false,
+      "summary": "3-4 sentences summarizing what is known.",
+      "sentiment": "Positive" | "Neutral" | "Negative" | "Mixed" | "Unknown",
+      "platforms": ["Google", "Reddit", "YouTube", "Wikipedia"],
+      "evidence": ["4-8 bullet points with specific external facts or mentions"]
+    }}
+
+    Rules:
+    - Keep summary and evidence at medium detail, matching a concise analyst brief.
+    - Prefer externally verifiable mentions over generic claims.
+    - Return exactly 4-8 evidence bullets.
+    - JSON only.
+    """
+    try:
+        # This model spends part of its output budget on hidden "thinking"
+        # tokens before the visible JSON (observed ~800 thinking tokens for
+        # a short response in testing) — max_output_tokens covers both, so
+        # a tight budget here intermittently truncates the response before
+        # any JSON is produced at all, which silently looked like "Gemini
+        # returned nothing" rather than a token-budget problem.
+        response = await _generate_with_fallback_async(
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=4000,
+                response_mime_type="application/json",
+            ),
+        )
+        parsed = _safe_json_parse(response.text or "") if response is not None else {}
+        return _normalize_insight_payload(parsed if isinstance(parsed, dict) else {}, _model_used(response))
+    except Exception as e:
+        print(f"Error fetching Gemini insights: {e}")
+        fallback_model = (os.getenv("GEMINI_MODEL_PRIMARY") or os.getenv("GEMINI_MODEL") or "Gemini").strip()
+        return _normalize_insight_payload({
+            "isKnown": False,
+            "summary": "Failed to fetch AI insights.",
+            "sentiment": "Unknown",
+            "platforms": [],
+            "evidence": [],
+        }, fallback_model)
+
+
 async def get_ai_insights_multi(business_name: str, url: str) -> list[dict]:
     perplexity_task = get_ai_insights(business_name, url)
     gpt_task = get_ai_insights_openai(business_name, url)
     claude_task = get_ai_insights_claude(business_name, url)
-    results = await asyncio.gather(perplexity_task, gpt_task, claude_task, return_exceptions=True)
+    gemini_task = get_ai_insights_gemini(business_name, url)
+    results = await asyncio.gather(perplexity_task, gpt_task, claude_task, gemini_task, return_exceptions=True)
     insights: list[dict] = []
     for r in results:
         if isinstance(r, dict):
             insights.append(r)
-    
-    # Append Gemini as a disabled placeholder
-    insights.append({
-        "modelName": "Gemini",
-        "isKnown": False,
-        "summary": "Google Gemini integration is temporarily offline for maintenance.",
-        "sentiment": "Unknown",
-        "platforms": [],
-        "evidence": [],
-        "status": "disabled"
-    })
     return insights
 
 async def get_vision_extraction(screenshot_bytes: bytes) -> dict:

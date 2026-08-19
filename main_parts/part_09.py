@@ -27,7 +27,7 @@ async def _process_phase5_job(job_doc: dict):
             return not latest or latest.get("status") == "cancelled"
 
         def _compute_provider_scores(results_map: dict[str, dict]) -> tuple[dict, float | None]:
-            providers = ["perplexity", "chatgpt", "claude"]
+            providers = ["perplexity", "chatgpt", "claude", "gemini"]
             score_map: dict[str, dict] = {}
             for provider_name in providers:
                 score_map[provider_name] = compute_provider_score(results_map, provider_name)
@@ -179,6 +179,7 @@ async def _process_phase5_job(job_doc: dict):
                         PHASE5_QUESTION_TIMEOUT_OPENAI_SEC,
                         PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC,
                         PHASE5_QUESTION_TIMEOUT_ANTHROPIC_SEC,
+                        PHASE5_QUESTION_TIMEOUT_GEMINI_SEC,
                     )
                 else:
                     per_question_timeout = PHASE5_QUESTION_TIMEOUT_GEMINI_SEC
@@ -226,6 +227,7 @@ async def _process_phase5_job(job_doc: dict):
                                 "perplexity": {"mentioned": False, "position": None, "sources": [], "cited": False, "status": "Not Mentioned"},
                                 "chatgpt": {"mentioned": False, "position": None, "sources": [], "cited": False, "status": "Not Mentioned"},
                                 "claude": {"mentioned": False, "position": None, "sources": [], "cited": False, "status": "Not Mentioned"},
+                                "gemini": {"mentioned": False, "position": None, "sources": [], "cited": False, "status": "Not Mentioned"},
                             },
                         }
 

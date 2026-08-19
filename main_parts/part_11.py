@@ -65,7 +65,7 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
                 "job_id": job_id,
                 "job_type": "core",
                 "model_provider": model_provider,
-                "providers": ["perplexity", "chatgpt", "claude"],
+                "providers": ["perplexity", "chatgpt", "claude", "gemini"],
                 "question_count": len(questions_dicts),
             },
         })
