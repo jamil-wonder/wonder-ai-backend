@@ -774,168 +774,6 @@ async def analyze_single_question(
             return 0
         return max(0, 110 - (pos * 10))
 
-    async def _run_grounded_probe() -> dict:
-        probe_prompt = f"Use live Google Search for this query and list top evidence domains only: '{question['text']}'."
-        probe_response = await _call_gemini_with_retry(
-            client,
-            probe_prompt,
-            config=types.GenerateContentConfig(
-                tools=[{"google_search": {}}],
-                temperature=0.0,
-                top_p=0.95,
-                max_output_tokens=450,
-            ),
-        )
-        if probe_response is None:
-            return {
-                "references": [],
-                "source_urls": [],
-                "target_mentioned": False,
-                "position": None,
-                "response_text": "",
-            }
-
-        probe_refs, probe_urls, probe_mentioned, probe_pos = _extract_grounding_signals(
-            probe_response,
-            domain,
-        )
-        probe_text = (getattr(probe_response, "text", "") or "").strip()
-        text_domains = _extract_domains_from_text(probe_text)
-        for d in text_domains:
-            if d not in probe_refs:
-                probe_refs.append(d)
-            if _is_target_domain_match(d, domain):
-                probe_mentioned = True
-                if probe_pos is None:
-                    probe_pos = 8
-
-        if not probe_mentioned and domain in probe_text.lower():
-            probe_mentioned = True
-            if probe_pos is None:
-                probe_pos = 8
-
-        return {
-            "references": list(dict.fromkeys(probe_refs)),
-            "source_urls": list(dict.fromkeys(probe_urls)),
-            "target_mentioned": probe_mentioned,
-            "position": probe_pos,
-            "response_text": probe_text,
-        }
-
-    async def _run_target_verification() -> tuple[bool, int | None, list[str], str]:
-        verify_prompt = f"""
-        Use live Google Search for this exact query and check if the target domain appears in top results.
-        Query: '{question['text']}'
-        Target domain: '{domain}'
-
-        Return strict JSON only:
-        {{
-          "mentioned": true or false,
-          "position": <1-10 or null>,
-          "sources": ["domain.com"]
-        }}
-        """
-        verify_response = await _call_gemini_with_retry(
-            client,
-            verify_prompt,
-            config=types.GenerateContentConfig(
-                tools=[{"google_search": {}}],
-                temperature=0.0,
-                top_p=0.95,
-                max_output_tokens=350,
-            ),
-        )
-        if verify_response is None:
-            return False, None, [], ""
-
-        parsed = _safe_json_parse(verify_response.text or "")
-        mentioned = bool(parsed.get("mentioned", False)) if isinstance(parsed, dict) else False
-        raw_pos = parsed.get("position") if isinstance(parsed, dict) else None
-        position_value = raw_pos if isinstance(raw_pos, int) and 1 <= raw_pos <= 10 else None
-        raw_sources = parsed.get("sources", []) if isinstance(parsed, dict) else []
-        verify_sources = []
-        if isinstance(raw_sources, list):
-            for item in raw_sources:
-                d = _normalize_domain(item)
-                if d:
-                    verify_sources.append(d)
-
-        grounded_refs, _, grounded_mentioned, grounded_pos = _extract_grounding_signals(
-            verify_response,
-            domain,
-        )
-        verify_sources.extend(grounded_refs)
-
-        text = (verify_response.text or "").lower()
-        if not mentioned and (domain in text or domain.split(".")[0] in text):
-            mentioned = True
-            if position_value is None:
-                position_value = 8
-
-        if grounded_mentioned:
-            mentioned = True
-            if position_value is None:
-                position_value = grounded_pos
-
-        return mentioned, position_value, list(dict.fromkeys(verify_sources)), (verify_response.text or "")
-
-    async def _run_chat_style_verification() -> tuple[bool, int | None, list[str], str]:
-        chat_prompt = f"""
-        Query: '{question['text']}'
-        Target domain: '{domain}'
-
-        Return JSON only:
-        {{
-          "mentioned": true or false,
-          "position": <1-10 or null>,
-          "references": ["domain.com"],
-          "reason": "short reason"
-        }}
-
-        Rules:
-        - Use plain reasoning like Gemini chat style.
-        - No markdown.
-        - If uncertain, set mentioned=false.
-        """
-        chat_response = await _call_gemini_with_retry(
-            client,
-            chat_prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.0,
-                top_p=0.95,
-                max_output_tokens=300,
-            ),
-        )
-        if chat_response is None:
-            return False, None, [], ""
-
-        parsed = _safe_json_parse(chat_response.text or "")
-        mentioned = bool(parsed.get("mentioned", False)) if isinstance(parsed, dict) else False
-        raw_pos = parsed.get("position") if isinstance(parsed, dict) else None
-        position_value = raw_pos if isinstance(raw_pos, int) and 1 <= raw_pos <= 10 else None
-        refs = parsed.get("references", []) if isinstance(parsed, dict) else []
-        out_refs = []
-        if isinstance(refs, list):
-            for item in refs:
-                d = _normalize_domain(item)
-                if d:
-                    out_refs.append(d)
-
-        txt = (chat_response.text or "").lower()
-        if not mentioned and (domain in txt or domain.split(".")[0] in txt):
-            mentioned = True
-            if position_value is None:
-                position_value = 8
-
-        for d in out_refs:
-            if _is_target_domain_match(d, domain):
-                mentioned = True
-                if position_value is None:
-                    position_value = 8
-                break
-
-        return mentioned, position_value, list(dict.fromkeys(out_refs)), (chat_response.text or "")
-
     if not include_competitors:
         prompt = f"""
         You are an expert brand visibility evaluator. Use live Google Search for this query:
@@ -1103,43 +941,14 @@ async def analyze_single_question(
             if position is None:
                 position = 8
 
-        should_probe = (
-            response is None
-            or (not clean_references and not clean_sources and not target_mentioned and position is None)
-            or (not isinstance(data, dict) or not data)
-        )
-        if should_probe:
-            probe = await _run_grounded_probe()
-            clean_references.extend(probe["references"])
-            clean_sources.extend(probe["references"])
-            source_urls.extend(probe["source_urls"])
-
-            if probe["target_mentioned"]:
-                target_mentioned = True
-                if position is None:
-                    position = probe["position"]
-
-            probe_text = (probe.get("response_text") or "").lower()
-            if not target_mentioned and (domain in probe_text or brand_token in probe_text):
-                target_mentioned = True
-                if position is None:
-                    position = 8
-
-        if not target_mentioned and position is None:
-            verified, verified_position, verified_sources, _ = await _run_target_verification()
-            if verified:
-                target_mentioned = True
-                position = verified_position if isinstance(verified_position, int) else 8
-                clean_sources.extend(verified_sources)
-                clean_references.extend(verified_sources)
-
-        if not target_mentioned and position is None:
-            chat_verified, chat_position, chat_sources, _ = await _run_chat_style_verification()
-            if chat_verified:
-                target_mentioned = True
-                position = chat_position if isinstance(chat_position, int) else 8
-                clean_sources.extend(chat_sources)
-                clean_references.extend(chat_sources)
+        # Single-call answer only, matching the other three providers (each
+        # makes exactly one API call per question) — no chained probe/verify/
+        # chat-style fallback calls. Those made Gemini's own path 3-4x
+        # sequential live-search round trips deep on "not mentioned"
+        # questions, which is what made the whole 4-model batch bound on
+        # Gemini's tail latency (see PHASE5_QUESTION_TIMEOUT_GEMINI_SEC=140s
+        # vs ~40-45s for the others). Whatever the single main call above
+        # found is now the final answer.
 
         clean_sources = list(dict.fromkeys(clean_sources))
         clean_references = list(dict.fromkeys(clean_references))
@@ -1269,7 +1078,7 @@ async def analyze_single_question(
             print(
                 f"[Phase5] Not Mentioned qid={question.get('id')} domain={domain} "
                 f"refs={len(clean_references)} sources={len(clean_sources)} "
-                f"response_none={response is None} probed={should_probe}"
+                f"response_none={response is None}"
             )
 
         concise_answer = str(data.get("concise_answer", "") if isinstance(data, dict) else "").strip()
