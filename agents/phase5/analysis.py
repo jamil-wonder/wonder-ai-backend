@@ -888,7 +888,15 @@ async def analyze_single_question(
                 tools=[{"google_search": {}}],
                 temperature=0.0,
                 top_p=0.95,
-                max_output_tokens=700,
+                # 700 was silently truncating the JSON mid-object — Gemini's
+                # "thinking" models spend part of this budget on hidden
+                # reasoning before any visible text, and this prompt also
+                # asks for a full concise_answer + ranked_competitors
+                # payload. A truncated response fails _safe_json_parse and
+                # falls through to generic fallback facts for every single
+                # question, which is why target_site matched/missing facts
+                # were identical across unrelated queries.
+                max_output_tokens=4000,
             ),
         )
         data = _safe_json_parse((response.text or "") if response is not None else "")
