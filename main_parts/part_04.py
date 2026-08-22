@@ -616,7 +616,7 @@ async def api_public_report(token: str):
     # Rank vs named competitors — real ranking, not just an average.
     named_competitors = sorted(
         [
-            {"name": c.get("name") or c.get("domain"), "domain": c.get("domain"), "score": round(float(c.get("score")))}
+            {"name": c.get("name") or c.get("domain"), "domain": c.get("domain"), "score": _round_half_up(float(c.get("score")))}
             for c in system_competitors
             if isinstance(c, dict) and c.get("domain") and isinstance(c.get("score"), (int, float))
         ],
@@ -625,7 +625,7 @@ async def api_public_report(token: str):
     )[:5]
     rank = None
     if isinstance(headline_score, (int, float)) and named_competitors:
-        rank = 1 + sum(1 for c in named_competitors if c["score"] > round(headline_score))
+        rank = 1 + sum(1 for c in named_competitors if c["score"] > _round_half_up(headline_score))
 
     # Real Search Tracker data: per-model appearance and what-moved, from
     # the business's most recent completed multi-model run (and the one
@@ -674,10 +674,10 @@ async def api_public_report(token: str):
     return {
         "businessName": business.get("businessName") or "",
         "domain": _normalize_site(business.get("url") or ""),
-        "score": round(headline_score) if isinstance(headline_score, (int, float)) else None,
-        "grade": get_grade(round(headline_score)) if isinstance(headline_score, (int, float)) else None,
-        "previousScore": round(previous_score) if isinstance(previous_score, (int, float)) else None,
-        "competitorAverage": round(competitor_avg) if isinstance(competitor_avg, (int, float)) else None,
+        "score": _round_half_up(headline_score) if isinstance(headline_score, (int, float)) else None,
+        "grade": get_grade(_round_half_up(headline_score)) if isinstance(headline_score, (int, float)) else None,
+        "previousScore": _round_half_up(previous_score) if isinstance(previous_score, (int, float)) else None,
+        "competitorAverage": _round_half_up(competitor_avg) if isinstance(competitor_avg, (int, float)) else None,
         "rank": rank,
         "competitors": named_competitors,
         "perModel": per_model,

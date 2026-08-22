@@ -101,6 +101,20 @@ import uuid
 import json
 import re
 import hashlib
+import math
+
+
+def _round_half_up(value: float) -> int:
+    """Python's builtin round() rounds half-to-even (round(64.5) == 64),
+    JavaScript's Math.round always rounds half up (Math.round(64.5) == 65).
+    Every score shown to a user is rounded on ONE side or the other of the
+    API boundary — the same 64.5 could render as 64 in a Python-built email
+    and 65 on a Math.round()-based frontend page for the same real number,
+    which is exactly what happened (Reports preview showed 65, the public
+    share link showed 64). Use this instead of round() anywhere a score
+    might be shown somewhere the frontend also renders it, so the two
+    always agree."""
+    return math.floor(value + 0.5)
 from concurrent.futures import ThreadPoolExecutor
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
@@ -1106,7 +1120,7 @@ def _detect_alerts(
             alerts.append({
                 "category": "Score drop",
                 "headline": f"Your Wonder Score dropped {round(drop, 1)} points this week",
-                "detail": f"{round(previous_score)} → {round(current_score)}. Worth checking this week's Search Tracker results for what changed.",
+                "detail": f"{_round_half_up(previous_score)} → {_round_half_up(current_score)}. Worth checking this week's Search Tracker results for what changed.",
             })
 
     previous_domains = {c.get("domain") for c in previous_competitors if isinstance(c, dict) and c.get("domain")}
@@ -1296,9 +1310,9 @@ def _build_combined_weekly_email(
     if tracker:
         t_current = tracker.get("current_score")
         t_previous = tracker.get("previous_score")
-        t_grade = get_grade(round(t_current)) if isinstance(t_current, (int, float)) else "-"
+        t_grade = get_grade(_round_half_up(t_current)) if isinstance(t_current, (int, float)) else "-"
         t_grade_color, t_grade_bg = _grade_pill_color(t_grade)
-        t_score_badge = _score_badge_html(round(t_current)) if isinstance(t_current, (int, float)) else _score_badge_html(0)
+        t_score_badge = _score_badge_html(_round_half_up(t_current)) if isinstance(t_current, (int, float)) else _score_badge_html(0)
 
         if isinstance(t_previous, (int, float)) and isinstance(t_current, (int, float)):
             delta = round(t_current - t_previous, 1)
@@ -1313,7 +1327,7 @@ def _build_combined_weekly_email(
 
         t_competitor_avg = tracker.get("competitor_avg")
         competitor_line = (
-            f"Competitor average: {round(t_competitor_avg)}/100"
+            f"Competitor average: {_round_half_up(t_competitor_avg)}/100"
             if isinstance(t_competitor_avg, (int, float))
             else "Competitor average: not enough data yet"
         )
@@ -1362,7 +1376,7 @@ def _build_combined_weekly_email(
               </table>
             </div>"""
         tracker_section_text = (
-            f"Wonder Score: {round(t_current)}/100 (Grade {t_grade}) — {delta_text}\n"
+            f"Wonder Score: {_round_half_up(t_current)}/100 (Grade {t_grade}) — {delta_text}\n"
             f"{competitor_line}\n\n"
             f"What moved:\n{moved_text}\n\n"
             f"Top things to fix:\n{actions_text}\n\n"
