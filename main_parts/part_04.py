@@ -464,6 +464,7 @@ async def api_user_business_upsert(
         services=request.services,
         target_audience=request.targetAudience,
         question_generation=request.questionGeneration,
+        tracked_questions=request.trackedQuestions,
         competitors=request.competitors,
         system_competitors=request.systemCompetitors,
         tracked_pages=request.trackedPages,
@@ -482,6 +483,40 @@ async def api_user_business_upsert(
         ))
     except Exception as e:
         print(f"[Blogs] failed to queue initial weekly blogs: {e}")
+    return public
+
+
+@app.post("/api/user/businesses/{business_id}/lock-questions", response_model=BusinessResponse)
+async def api_user_business_lock_questions(
+    business_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    # Locking the core 20 is what makes the Wonder Score comparable week to
+    # week — same basis for every customer (Part 3 / Part 6 rule 3 of the
+    # platform-flow spec). One-way from here: unlocking isn't exposed at
+    # all, only editing-with-warning after the fact (frontend gates that).
+    if businesses_col is None:
+        raise HTTPException(status_code=503, detail="business storage unavailable")
+    try:
+        oid = ObjectId(business_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid business ID format")
+
+    existing = await businesses_col.find_one({"_id": oid, "user_id": current_user["id"]})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Business not found")
+    if existing.get("questionsLocked"):
+        return _public_business_doc(existing)
+
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    await businesses_col.update_one(
+        {"_id": oid, "user_id": current_user["id"]},
+        {"$set": {"questionsLocked": True, "questionsLockedAt": now_iso, "updated_at": now_iso}},
+    )
+    updated = await businesses_col.find_one({"_id": oid, "user_id": current_user["id"]})
+    public = _public_business_doc(updated)
+    if not public:
+        raise HTTPException(status_code=500, detail="Could not lock questions")
     return public
 
 
@@ -507,6 +542,149 @@ async def api_user_business_delete(
         raise HTTPException(status_code=404, detail="Business profile not found")
 
     return {"message": "Business profile deleted successfully"}
+
+
+@app.post("/api/reports/share-link")
+async def api_reports_share_link(
+    request: ReportShareLinkRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """The PDF spec's "Share report" (Part 4): a shareable weekly summary
+    link, manager → owner or agency → client, that the recipient can open
+    with no account. Generates a stable random token once per business (a
+    second call for the same business returns the SAME link, not a new
+    one) and stores it on the business doc — the public report endpoint
+    below looks a business up by this token, nothing else."""
+    if businesses_col is None:
+        raise HTTPException(status_code=503, detail="business storage unavailable")
+
+    try:
+        oid = ObjectId(request.business_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid business ID format")
+
+    business = await businesses_col.find_one({"_id": oid, "user_id": current_user["id"]})
+    if not business:
+        raise HTTPException(status_code=404, detail="Business profile not found")
+
+    token = business.get("report_share_token")
+    if not token:
+        token = secrets.token_urlsafe(24)
+        await businesses_col.update_one({"_id": oid}, {"$set": {"report_share_token": token}})
+
+    frontend_url = (os.getenv("FRONTEND_APP_URL") or "http://localhost:3000").rstrip("/")
+    return {"token": token, "url": f"{frontend_url}/report/{token}"}
+
+
+@app.get("/api/public/reports/{token}")
+async def api_public_report(token: str):
+    """No auth — this is the recipient's side of "Share report." Per the
+    spec ("Dashboard — the weekly briefing... rank vs rivals... where AI
+    sees you (per-model x/20)... what moved"), this is the real weekly
+    briefing, not just the technical audit — score, grade, weekly change,
+    rank vs named competitors, per-model appearance out of 20, real
+    what-moved lines, and the technical breakdown underneath. Never the
+    account email or billing details, since this link goes to someone with
+    no account at all — but the actual AI-visibility performance is the
+    entire point of sharing this with an owner or client, so it's included
+    the same way the account owner already sees it on their own Dashboard."""
+    if businesses_col is None:
+        raise HTTPException(status_code=503, detail="report storage unavailable")
+
+    business = await businesses_col.find_one({"report_share_token": token})
+    if not business:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    visibility_score = business.get("latest_phase5_score")
+    technical_score = business.get("latest_phase1_score")
+    headline_score = visibility_score if isinstance(visibility_score, (int, float)) else technical_score
+
+    visibility_history = business.get("visibility_weekly_scores") or []
+    previous_score = None
+    if isinstance(visibility_history, list) and len(visibility_history) >= 2:
+        prev_entry = visibility_history[-2]
+        if isinstance(prev_entry.get("score"), (int, float)):
+            previous_score = prev_entry["score"]
+
+    system_competitors = business.get("systemCompetitors") or []
+    competitor_scores = [
+        float(c.get("score")) for c in system_competitors
+        if isinstance(c, dict) and isinstance(c.get("score"), (int, float))
+    ]
+    competitor_avg = (sum(competitor_scores) / len(competitor_scores)) if competitor_scores else None
+
+    # Rank vs named competitors — real ranking, not just an average.
+    named_competitors = sorted(
+        [
+            {"name": c.get("name") or c.get("domain"), "domain": c.get("domain"), "score": round(float(c.get("score")))}
+            for c in system_competitors
+            if isinstance(c, dict) and c.get("domain") and isinstance(c.get("score"), (int, float))
+        ],
+        key=lambda c: c["score"],
+        reverse=True,
+    )[:5]
+    rank = None
+    if isinstance(headline_score, (int, float)) and named_competitors:
+        rank = 1 + sum(1 for c in named_competitors if c["score"] > round(headline_score))
+
+    # Real Search Tracker data: per-model appearance and what-moved, from
+    # the business's most recent completed multi-model run (and the one
+    # before it, for a real diff — never a guessed number).
+    per_model: list[dict] = []
+    what_moved: list[str] = []
+    business_id = str(business.get("_id"))
+    if phase5_jobs_col is not None:
+        latest_job = await phase5_jobs_col.find_one(
+            {"business_id": business_id, "job_type": "core", "model": "multi", "status": "completed"},
+            sort=[("created_at", -1)],
+        )
+        if latest_job:
+            provider_scores = latest_job.get("provider_scores") or {}
+            model_labels = {"chatgpt": "ChatGPT", "perplexity": "Perplexity", "claude": "Claude", "gemini": "Gemini"}
+            for key, label in model_labels.items():
+                stats = provider_scores.get(key)
+                if isinstance(stats, dict) and isinstance(stats.get("total"), (int, float)):
+                    per_model.append({"model": label, "mentioned": int(stats.get("mentioned") or 0), "total": int(stats["total"])})
+
+            previous_job = await phase5_jobs_col.find_one(
+                {
+                    "business_id": business_id,
+                    "job_type": "core",
+                    "model": "multi",
+                    "status": "completed",
+                    "job_id": {"$ne": latest_job.get("job_id")},
+                },
+                sort=[("created_at", -1)],
+            )
+            question_text_by_id = {str(q.get("id")): str(q.get("text") or "") for q in (latest_job.get("questions") or [])}
+            what_moved, _ = _compute_weekly_diff(
+                current_results=latest_job.get("results") or {},
+                previous_results=(previous_job or {}).get("results") or {},
+                question_text_by_id=question_text_by_id,
+                target_domain=_normalize_domain(business.get("url") or ""),
+            )
+            # Strip the HTML entities/markup _compute_weekly_diff uses for
+            # the email template — this is a plain-JSON API, the frontend
+            # renders its own styling.
+            what_moved = [re.sub(r"&#\d+;|&\w+;", "", m).strip() for m in what_moved[:3]]
+
+    scrape = business.get("latest_scrape_result") or {}
+    audit_areas = _compute_audit_areas(scrape) if scrape else []
+
+    return {
+        "businessName": business.get("businessName") or "",
+        "domain": _normalize_site(business.get("url") or ""),
+        "score": round(headline_score) if isinstance(headline_score, (int, float)) else None,
+        "grade": get_grade(round(headline_score)) if isinstance(headline_score, (int, float)) else None,
+        "previousScore": round(previous_score) if isinstance(previous_score, (int, float)) else None,
+        "competitorAverage": round(competitor_avg) if isinstance(competitor_avg, (int, float)) else None,
+        "rank": rank,
+        "competitors": named_competitors,
+        "perModel": per_model,
+        "whatMoved": what_moved,
+        "auditAreas": audit_areas,
+        "updatedAt": business.get("latest_phase5_at") or business.get("latest_phase1_at") or business.get("updated_at"),
+    }
 
 
 @app.get(

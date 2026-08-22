@@ -437,14 +437,32 @@ async def api_phase5_generate_questions(
 ):
     try:
         business_doc = None
-        if current_user and businesses_col is not None and req.business_id:
-            try:
-                business_doc = await businesses_col.find_one({
-                    "_id": ObjectId(req.business_id),
-                    "user_id": current_user["id"],
-                })
-            except Exception:
-                business_doc = None
+        if current_user and businesses_col is not None:
+            if req.business_id:
+                try:
+                    business_doc = await businesses_col.find_one({
+                        "_id": ObjectId(req.business_id),
+                        "user_id": current_user["id"],
+                    })
+                except Exception:
+                    business_doc = None
+            if business_doc is None and req.url:
+                # business_id is frequently absent here (a stale/empty
+                # activeBusiness.id on the frontend at call time — e.g. right
+                # after switching businesses), even though the business is
+                # genuinely already saved. Without this fallback, a saved
+                # business with real category/location on file gets treated
+                # as brand new and question generation fails outright asking
+                # for context that already exists in the DB.
+                normalized_domain = _normalize_site(req.url)
+                if normalized_domain:
+                    try:
+                        business_doc = await businesses_col.find_one({
+                            "user_id": current_user["id"],
+                            "normalized_domain": normalized_domain,
+                        })
+                    except Exception:
+                        business_doc = None
 
         def _first_text(*values):
             for value in values:

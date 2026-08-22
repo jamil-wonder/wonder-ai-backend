@@ -406,6 +406,38 @@ async def api_delete_wishlist(email: str):
         print(f"[API] ERROR deleting wishlist email {email}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/public/scan-unlock")
+async def api_public_scan_unlock(request: PublicScanUnlockRequest):
+    # The email gate from Part 1 of the platform-flow spec: one email field
+    # unlocks the full free-scan breakdown for an anonymous visitor. This
+    # deliberately does NOT run the OTP/verification flow — that only
+    # happens later, when the visitor actually creates an account. Here
+    # it's just a real lead, captured with the scan context that produced
+    # it so a follow-up email/sales touch has something concrete to point
+    # to, not a bare address with no story.
+    email = str(request.email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid email is required")
+    try:
+        if public_scan_leads_col is not None:
+            await public_scan_leads_col.update_one(
+                {"email": email, "url": request.url},
+                {
+                    "$set": {
+                        "email": email,
+                        "url": request.url,
+                        "score": request.score,
+                        "unlocked_at": datetime.utcnow().isoformat(),
+                    },
+                },
+                upsert=True,
+            )
+        return {"success": True}
+    except Exception as e:
+        print(f"[API] ERROR saving public scan lead {email}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/track-url")
 async def api_track_url(request: TrackUrlRequest, current_user: dict = Depends(get_current_user_optional)):
     try:

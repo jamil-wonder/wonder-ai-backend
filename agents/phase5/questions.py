@@ -2,7 +2,7 @@ import asyncio
 import json
 import re
 
-from .config import PERPLEXITY_PHASE5_TIMEOUT_SEC
+from .config import PHASE5_QUESTION_GEN_TIMEOUT_SEC
 from .context import _fetch_page_context
 from .helpers import (
     _extract_brand_terms,
@@ -124,48 +124,6 @@ def _matches_best_in_location_pattern(text: str, category: str, location: str, s
     return _includes_category_or_service(before_in, category, services) and _includes_location(after_in, location)
 
 
-def _append_unique_valid_question(
-    target: list[str],
-    candidate: str,
-    seen: set[str],
-    *,
-    validators: list,
-    brand_name_for_quality: str = "",
-) -> bool:
-    text = _clean_question(candidate)
-    key = text.lower().rstrip("?.!")
-    if len(text) < 12 or key in seen:
-        return False
-    quality_text = text
-    if brand_name_for_quality:
-        quality_text = re.sub(re.escape(_text(brand_name_for_quality)), "", quality_text, flags=re.IGNORECASE)
-    if _is_low_quality_query(quality_text):
-        return False
-    for validator in validators:
-        if not validator(text):
-            return False
-    seen.add(key)
-    target.append(text)
-    return True
-
-
-def _deterministic_branded_questions(
-    *,
-    brand_name: str,
-    category: str,
-    location: str,
-    services: list[str],
-) -> list[str]:
-    service = services[0] if services else category
-    return [
-        f"Is {brand_name} a good {category} in {location}?",
-        f"What is {brand_name} known for as a {category} in {location}?",
-        f"Does {brand_name} have good reviews for {service} in {location}?",
-        f"Is {brand_name} suitable for booking {service} in {location}?",
-        f"How does {brand_name} compare with other {category} options in {location}?",
-    ]
-
-
 def _normalize_question_counts(question_counts: dict | None) -> dict[str, int]:
     source = question_counts if isinstance(question_counts, dict) else {}
     def _safe_count(key: str, default: int) -> int:
@@ -229,6 +187,74 @@ def _extract_query_groups(response: dict | None) -> tuple[list[str], list[str], 
         if len(line.strip()) > 10 and "?" in line
     ]
     return lines[:5], [], lines[5:], []
+
+
+async def generate_preview_questions(
+    url: str,
+    business_context: dict | None = None,
+) -> list[dict]:
+    """One real, un-retried AI call producing up to 3 sample questions (one
+    branded, one non-branded, one local-SEO) for the anonymous /scan "full
+    results" preview. `generate_brand_questions` is deliberately NOT reused
+    here — it's tuned for the authenticated locked-20 flow and retries up to
+    6 times until it hits an exact 20-question quality bar, which is the
+    right trade-off when the result is a durable weekly baseline but is a
+    2-3 minute wait for a public preview that only ever samples 3 of them.
+    A single honest pass is the correct trade for this surface: real
+    content, just not exhaustively re-tried."""
+    page_ctx = await _fetch_page_context(url)
+    ctx = _merge_context(page_ctx, business_context)
+
+    brand_name = _text(ctx.get("name"))
+    category = _text(ctx.get("category"))
+    location = _text(ctx.get("location"))
+    description = _text(ctx.get("description"))
+    services = ctx.get("services") if isinstance(ctx.get("services"), list) else []
+    services = [_text(item) for item in services if _text(item)][:8]
+
+    if not brand_name or not category:
+        return []
+
+    prompt = f"""
+    Business name: {brand_name}
+    Category: {category}
+    Location: {location or "unknown"}
+    Description: {description or "no description available"}
+    Services: {", ".join(services) if services else "unknown"}
+
+    Write 3 real questions a customer might ask an AI assistant (like ChatGPT or Perplexity) while
+    looking for a business like this one:
+    1. "branded" — mentions "{brand_name}" by name.
+    2. "nonBranded" — a category/service search that does NOT name this business, e.g. "Which {category} is best for X?".
+    3. "localSeo" — a "Best {category} in {location or '[location]'}?" style local-search question.
+
+    Return JSON only, this exact shape:
+    {{"branded": "...", "nonBranded": "...", "localSeo": "..."}}
+
+    Rules:
+    - Every question must be realistic, specific to this real business's category/location, and end with "?".
+    - Never mention the business name in nonBranded or localSeo.
+    - JSON only, no markdown.
+    """
+    try:
+        parsed = await _call_openai_chat_json(prompt, timeout_sec=PHASE5_QUESTION_GEN_TIMEOUT_SEC)
+    except Exception as e:
+        print(f"[Phase5] preview question-gen failed: {e}")
+        return []
+
+    if not isinstance(parsed, dict):
+        return []
+
+    out: list[dict] = []
+    for key, type_key, label in [
+        ("branded", "branded", "Branded"),
+        ("nonBranded", "non-branded", "Non-Branded"),
+        ("localSeo", "local-seo", "Local SEO"),
+    ]:
+        text = _clean_question(parsed.get(key))
+        if text and not _is_low_quality_query(text):
+            out.append({"text": text, "type": type_key, "label": label})
+    return out
 
 
 async def generate_brand_questions(
@@ -369,8 +395,11 @@ Return ONLY valid JSON:
     blocked_tokens, blocked_phrases, blocked_domain = _extract_brand_terms(url, ctx)
     blocked_tokens.add(_normalize_domain(brand_name))
 
-    perplexity_attempts = 2
-    openai_attempts = 2
+    # More real attempts, not a synthetic fill-in — this only costs extra
+    # time on the runs that are already retrying because a category came up
+    # short; a run that succeeds on attempt 1 still returns on attempt 1.
+    perplexity_attempts = 3
+    openai_attempts = 3
     quality_attempts = perplexity_attempts + openai_attempts
     last_counts = {"branded": 0, "nonBranded": 0, "localSeo": 0, "broadSeo": 0}
     best_branded: list[str] = []
@@ -418,7 +447,7 @@ Return ONLY valid JSON:
             try:
                 response = await _call_openai_chat_json(
                     prompt,
-                    timeout_sec=max(PERPLEXITY_PHASE5_TIMEOUT_SEC, 30),
+                    timeout_sec=PHASE5_QUESTION_GEN_TIMEOUT_SEC,
                 )
             except Exception as e:
                 print(f"[Phase5] OpenAI question-gen fallback unavailable: {type(e).__name__}: {e}")
@@ -427,7 +456,7 @@ Return ONLY valid JSON:
             response = await _call_perplexity_with_retry(
                 prompt,
                 retry_once=True,
-                timeout_sec=PERPLEXITY_PHASE5_TIMEOUT_SEC,
+                timeout_sec=PHASE5_QUESTION_GEN_TIMEOUT_SEC,
             )
         if response is None:
             await asyncio.sleep(0.3)
@@ -565,32 +594,16 @@ Return ONLY valid JSON:
             f"broad_seo={len(broad_seo)}/{broad_seo_target}"
         )
 
-    seen = {q.lower().rstrip("?.!") for q in [*best_branded, *best_non_branded, *best_local_seo, *best_broad_seo]}
+    # No hardcoded/templated fallback questions, for any category — every
+    # question a customer sees must come from the AI actually reasoning
+    # about this business, never a fill-in-the-blank template standing in
+    # for a real one. If validation kept rejecting the AI's candidates for
+    # a category, the honest result is fewer real questions in that
+    # category, not a synthetic one dressed up to look real.
     final_branded = best_branded[:branded_target]
     final_non_branded = best_non_branded[:non_branded_target]
     final_local_seo = best_local_seo[:local_seo_target]
     final_broad_seo = best_broad_seo[:broad_seo_target]
-
-    if len(final_branded) < branded_target:
-        for candidate in _deterministic_branded_questions(
-            brand_name=brand_name,
-            category=category,
-            location=location,
-            services=services,
-        ):
-            _append_unique_valid_question(
-                final_branded,
-                candidate,
-                seen,
-                validators=[
-                    lambda text: _includes_brand(text, brand_name),
-                    lambda text: _includes_location(text, location)
-                    or _includes_category_or_service(text, category, services),
-                ],
-                brand_name_for_quality=brand_name,
-            )
-            if len(final_branded) == branded_target:
-                break
 
     total_generated = len(final_branded) + len(final_non_branded) + len(final_local_seo) + len(final_broad_seo)
     if total_generated > 0:

@@ -90,8 +90,28 @@ class AiInsightsResult(BaseModel):
     insights: List[AiModelInsight] = Field(default_factory=list)
     error: Optional[str] = None
 
+class OnboardingSuggestionsRequest(BaseModel):
+    url: str
+    businessName: str
+    category: Optional[str] = None
+    location: Optional[str] = None
+    scrapedDescription: Optional[str] = None
+
+class OnboardingSuggestionsResult(BaseModel):
+    success: bool
+    businessDescription: str = ""
+    aiDescription: str = ""
+    services: List[str] = Field(default_factory=list)
+    targetAudience: List[str] = Field(default_factory=list)
+    error: Optional[str] = None
+
 class WishlistRequest(BaseModel):
     email: str
+
+class PublicScanUnlockRequest(BaseModel):
+    email: str
+    url: str
+    score: Optional[int] = None
 
 class TrackUrlRequest(BaseModel):
     url: str
@@ -157,6 +177,13 @@ class BusinessUpsertRequest(BaseModel):
     blogVoice: Optional[str] = None
     blogKeywords: Optional[List[str]] = None
     questionGeneration: Optional[Dict[str, int]] = None
+    # The actual 20 tracked questions (id/type/label/query only — no live
+    # run results, those already live in phase5 job/query history). This is
+    # the real "locked baseline" — questionsLocked alone only recorded THAT
+    # a lock happened, not WHAT was locked, leaving the real question text
+    # to live only in a 2-hour browser cache that could silently regenerate
+    # a different set once it expired.
+    trackedQuestions: Optional[List[Dict[str, Any]]] = None
     competitors: Optional[List[str]] = None
     systemCompetitors: Optional[List[Dict[str, Any]]] = None
     trackedPages: Optional[List[str]] = None
@@ -181,6 +208,9 @@ class BusinessResponse(BaseModel):
     questionGeneration: Dict[str, int] = Field(
         default_factory=lambda: {"branded": 5, "nonBranded": 5, "localSeo": 5, "broadSeo": 5}
     )
+    questionsLocked: bool = False
+    questionsLockedAt: Optional[str] = None
+    trackedQuestions: List[Dict[str, Any]] = Field(default_factory=list)
     competitors: List[str] = Field(default_factory=list)
     systemCompetitors: List[Dict[str, Any]] = Field(default_factory=list)
     trackedPages: List[str] = Field(default_factory=list)

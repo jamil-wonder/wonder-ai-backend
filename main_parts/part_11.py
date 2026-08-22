@@ -185,6 +185,44 @@ async def api_phase5_job_status(job_id: str):
     }
 
 
+@app.get("/api/phase5/latest-job")
+async def api_phase5_latest_job(business_id: str, current_user: dict = Depends(get_current_user)):
+    """The Search Tracker page only ever showed real per-question results
+    for a run started live in that browser tab — anything that ran
+    elsewhere (the weekly Sunday scheduler, a manual backend-triggered run,
+    a different device) left every row stuck on "Pending" forever with no
+    way to tell it had actually run at all. This returns the business's
+    most recent COMPLETED run so the page can load real results on open
+    instead of only ever showing evidence from a run the user personally
+    clicked "Run" for and watched live."""
+    if phase5_jobs_col is None or businesses_col is None:
+        raise HTTPException(status_code=503, detail="phase5 job storage unavailable")
+
+    try:
+        business = await businesses_col.find_one({"_id": ObjectId(business_id), "user_id": current_user["id"]})
+    except Exception:
+        business = None
+    if not business:
+        raise HTTPException(status_code=404, detail="business not found")
+
+    job = await phase5_jobs_col.find_one(
+        {"business_id": business_id, "job_type": "core", "status": "completed", "results": {"$ne": {}}},
+        sort=[("created_at", -1)],
+        projection={"_id": 0, "job_id": 1, "results": 1, "deep_competitors": 1, "overall_score": 1, "created_at": 1},
+    )
+    if not job:
+        return {"found": False}
+
+    return {
+        "found": True,
+        "job_id": job.get("job_id"),
+        "results": job.get("results") or {},
+        "deep_competitors": job.get("deep_competitors") or [],
+        "overall_score": job.get("overall_score"),
+        "created_at": job.get("created_at"),
+    }
+
+
 @app.get("/api/phase5/job-stream/{job_id}")
 async def api_phase5_job_stream(job_id: str, request: Request):
     """Stream Phase 5 job progress via Server-Sent Events."""

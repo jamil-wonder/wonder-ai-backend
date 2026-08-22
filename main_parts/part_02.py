@@ -1,4 +1,6 @@
 # Generated from the former backend/main.py lines 439-857.
+
+
 async def _get_public_limit_doc(request: Request) -> dict:
     now = datetime.utcnow()
     key = _public_limit_key(request)
@@ -33,7 +35,7 @@ def _raise_public_limit(doc: dict):
         status_code=429,
         detail={
             "code": "public_preview_limit_reached",
-            "message": "You have used today's free Wonder Score preview. Please sign up or try again after the limit resets.",
+            "message": "You have used today's free Wonder Score previews. Please sign up or try again after the limit resets.",
             "resetAt": reset_text,
         },
     )
@@ -47,6 +49,12 @@ async def _reserve_public_preview_attempt(
 ) -> dict | None:
     if current_user:
         return None
+    if not PUBLIC_PREVIEW_RATE_LIMIT_ENABLED:
+        # scan_id/key still handed back so downstream calls (e.g. the
+        # unlock endpoint's allowed_scan_ids check in _enforce_public_child_call)
+        # keep working the same shape either way — only the limit itself
+        # is skipped.
+        return {"key": _public_limit_key(request), "scan_id": _get_public_scan_id(request)}
 
     doc = await _get_public_limit_doc(request)
     if (
@@ -95,6 +103,8 @@ async def _enforce_public_child_call(
     max_calls: int = 1,
 ):
     if current_user:
+        return
+    if not PUBLIC_PREVIEW_RATE_LIMIT_ENABLED:
         return
 
     doc = await _get_public_limit_doc(request)
@@ -179,6 +189,9 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "blogVoice": doc.get("blogVoice"),
         "blogKeywords": doc.get("blogKeywords") if isinstance(doc.get("blogKeywords"), list) else [],
         "questionGeneration": _normalize_question_generation_settings(doc.get("questionGeneration")),
+        "questionsLocked": bool(doc.get("questionsLocked")),
+        "questionsLockedAt": doc.get("questionsLockedAt"),
+        "trackedQuestions": doc.get("trackedQuestions") if isinstance(doc.get("trackedQuestions"), list) else [],
         "competitors": doc.get("competitors") if isinstance(doc.get("competitors"), list) else [],
         "systemCompetitors": doc.get("systemCompetitors") if isinstance(doc.get("systemCompetitors"), list) else [],
         "trackedPages": doc.get("trackedPages") if isinstance(doc.get("trackedPages"), list) else [],

@@ -1,5 +1,8 @@
+import asyncio
 import json
 import re
+
+import httpx
 
 from .config import NON_COMPETITOR_DOMAINS
 from .context import _fetch_page_context
@@ -75,6 +78,64 @@ def _clean_business_name(value: str, domain: str) -> str:
     return root.title() if root else domain
 
 
+# Registrar/reseller domain-parking services almost always answer with a
+# normal 200, so a plain reachability check waves them straight through —
+# they just aren't a real competitor's site. These are the actual markers
+# their parking pages carry (script/iframe hosts, or literal for-sale copy).
+_PARKING_HOST_MARKERS = (
+    "sedoparking.com", "parkingcrew.net", "above.com", "bodis.com",
+    "hugedomains.com", "dan.com", "afternic.com", "parklogic.com",
+    "voodoo.com", "godaddy.com/domains", "uniregistry.com",
+)
+_PARKING_TEXT_MARKERS = (
+    "domain is for sale", "domain name is for sale", "buy this domain",
+    "this domain may be for sale", "make an offer", "inquire about this domain",
+    "domain parking", "purchase this domain",
+    # Tracking-script markers used by parking networks (e.g. Bodis) whose
+    # "lander" pages have no real for-sale copy at all, just this JS stub.
+    'ap:"parking"', "lander_system", "_trfd",
+)
+
+
+async def _domain_is_reachable(url: str) -> bool:
+    # Without live web search (the anonymous /scan path, which skips Claude
+    # for cost), the model has no way to confirm a domain it names actually
+    # exists — it's reciting a plausible-looking guess from training data,
+    # and sometimes that guess is simply wrong (dead domain, wrong TLD, site
+    # never existed, or the domain lapsed and is now just parked/for-sale).
+    # A real GET — not just a HEAD — is the only way to catch a domain that
+    # technically answers but isn't actually a competitor's business site.
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=6.0) as client:
+            resp = await client.get(url)
+            if resp.status_code >= 500:
+                # A 5xx from the target's own server isn't our hallucination
+                # to catch.
+                return False
+
+            body = (resp.text or "").lower()
+            if any(marker in body for marker in _PARKING_HOST_MARKERS):
+                return False
+            if any(marker in body for marker in _PARKING_TEXT_MARKERS):
+                return False
+
+            # A near-blank page (a "lander" stub with no real content) isn't
+            # a usable competitor result either, even if nothing marks it as
+            # parked specifically. Script/style content must be stripped
+            # BEFORE counting "visible" text — otherwise a page that's
+            # genuinely empty except for a tracking script (exactly what a
+            # parking lander is) reads as having real content.
+            stripped = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", resp.text or "", flags=re.IGNORECASE | re.DOTALL)
+            visible_text = re.sub(r"<[^>]+>", " ", stripped)
+            visible_text = re.sub(r"\s+", " ", visible_text).strip()
+            if len(visible_text) < 80:
+                return False
+
+            return True
+    except Exception:
+        return False
+
+
 def _normalize_competitor_item(item: dict, target_domain: str) -> dict | None:
     if not isinstance(item, dict):
         return None
@@ -82,8 +143,13 @@ def _normalize_competitor_item(item: dict, target_domain: str) -> dict | None:
     raw_url = str(item.get("url") or item.get("homepage_url") or item.get("source_url") or "").strip()
     raw_domain = str(item.get("domain") or raw_url or "").strip()
     domain = _normalize_domain(raw_domain)
+    # _normalize_domain only strips protocol/www — it has no idea "unknown",
+    # "n/a", or "none" aren't real domains, so a model reporting a
+    # competitor it couldn't actually find a site for was passing straight
+    # through as a clickable, literal "unknown" entry.
     if (
         not domain
+        or "." not in domain
         or domain == target_domain
         or _is_non_competitor_domain(domain)
         or _looks_like_platform_domain(domain)
@@ -649,6 +715,7 @@ async def generate_public_competitor_suggestions(
     location: str = "",
     description: str = "",
     desired_count: int = 4,
+    openai_only: bool = False,
 ) -> list[dict]:
     """Fast competitor suggestions for public signup/onboarding.
 
@@ -656,7 +723,7 @@ async def generate_public_competitor_suggestions(
     deeper multi-pass competitor scoring path.
     """
     domain = _normalize_domain(url)
-    desired_count = max(1, min(4, desired_count))
+    desired_count = max(1, min(8, desired_count))
     compact_questions = [str(q.get("text", "")).strip() for q in questions if str(q.get("text", "")).strip()][:8]
 
     prompt = f"""
@@ -690,7 +757,7 @@ async def generate_public_competitor_suggestions(
     - Return exactly {desired_count} competitors if direct competitors can be verified.
     - Return fewer only when fewer verified direct competitors are found.
     - Direct competitors must match the category and customer intent.
-    - Prefer businesses in or near the specified location.
+    {"- The target's location is " + location + " — every competitor MUST be based in the same country (same city/region where possible). Never return a competitor from a different country than the target, even if the business name or category matches closely." if location else "- Location is unknown for the target — do not assume any specific country; do not return competitors just because they share a category with no location signal to confirm."}
     - Use the official homepage or official business website.
     - Do not include review sites, directories, booking platforms, articles, social media, or the target domain.
     - Do not invent domains.
@@ -698,26 +765,40 @@ async def generate_public_competitor_suggestions(
     - score must be an integer from 70 to 95 based on competitor strength.
     """
 
-    response = await _call_claude_web_search_with_retry(
-        prompt,
-        retry_once=False,
-        timeout_sec=32,
-        max_uses=6,
+    openai_prompt = prompt.replace(
+        "Use live web search and return direct competitor business websites for this target.",
+        "Return likely direct competitor business websites for this target using the supplied business context. Prefer well-known official websites and do not include directories or review platforms.",
     )
-    provider_label = "claude-web-search"
 
-    if not isinstance(response, dict):
-        print(f"[Phase5][PublicCompetitors] Claude unavailable for {domain}; falling back to OpenAI")
-        openai_prompt = prompt.replace(
-            "Use live web search and return direct competitor business websites for this target.",
-            "Return likely direct competitor business websites for this target using the supplied business context. Prefer well-known official websites and do not include directories or review platforms.",
-        )
+    if openai_only:
+        # Anonymous /scan preview — Claude's web-search call here regularly
+        # takes 30s+ and had been timing out outright, falling back to
+        # OpenAI anyway after burning that time. For unauthenticated
+        # traffic, skip straight to the fast/cheap path instead of paying
+        # for the slow one first.
         response = await _call_openai_with_retry(
             openai_prompt,
             retry_once=True,
             timeout_sec=45,
         )
         provider_label = "openai-fallback"
+    else:
+        response = await _call_claude_web_search_with_retry(
+            prompt,
+            retry_once=False,
+            timeout_sec=32,
+            max_uses=6,
+        )
+        provider_label = "claude-web-search"
+
+        if not isinstance(response, dict):
+            print(f"[Phase5][PublicCompetitors] Claude unavailable for {domain}; falling back to OpenAI")
+            response = await _call_openai_with_retry(
+                openai_prompt,
+                retry_once=True,
+                timeout_sec=45,
+            )
+            provider_label = "openai-fallback"
 
     parsed = response if isinstance(response, dict) else {}
     if not isinstance(parsed.get("competitors"), list):
@@ -727,7 +808,7 @@ async def generate_public_competitor_suggestions(
     if not isinstance(raw, list):
         return []
 
-    out: list[dict] = []
+    candidates: list[dict] = []
     seen = set()
     for item in raw:
         if not isinstance(item, dict):
@@ -740,8 +821,22 @@ async def generate_public_competitor_suggestions(
             continue
         seen.add(competitor_domain)
         normalized["confidence"] = "verified" if provider_label == "claude-web-search" else "openai-fallback"
-        out.append(normalized)
-        if len(out) >= desired_count:
-            break
+        candidates.append(normalized)
+
+    if not candidates:
+        return []
+
+    # Claude's web-search path already confirms pages exist as it browses,
+    # so this check is mainly to catch OpenAI's un-verified guesses (the
+    # anonymous /scan path) — but running it either way costs nothing when
+    # there's nothing to check and protects both paths the same way.
+    reachable_flags = await asyncio.gather(
+        *[_domain_is_reachable(c["url"]) for c in candidates],
+        return_exceptions=True,
+    )
+    out = [
+        c for c, ok in zip(candidates, reachable_flags)
+        if ok is True
+    ]
 
     return out[:desired_count]

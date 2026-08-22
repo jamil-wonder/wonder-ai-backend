@@ -169,13 +169,26 @@ async def api_user_history_clear(current_user: dict = Depends(get_current_user))
 
 
 @app.get("/api/user/history/site-trend")
-async def api_user_history_site_trend(site: str, range: str = "month", current_user: dict = Depends(get_current_user)):
+async def api_user_history_site_trend(
+    site: str,
+    range: str = "month",
+    metric: str = "technical",
+    current_user: dict = Depends(get_current_user),
+):
+    """`metric=technical` (default, unchanged) returns the Phase 1 audit
+    score history from businesses_col.weekly_scores. `metric=visibility`
+    returns the AI-recommendation score history instead — same formula
+    competitors are scored on — by going straight to the phase5_jobs_col
+    query below (already visibility data; previously only reached as a
+    fallback when weekly_scores was empty). This is what the Dashboard
+    headline now reads as the reconciled single Wonder Score, instead of
+    the technical score competing as its own standalone number."""
     site_host = _normalize_site(site)
     if not site_host:
         raise HTTPException(status_code=400, detail="A valid site is required")
 
     # 1. Check if business profile has weekly_scores saved in MongoDB
-    if businesses_col is not None:
+    if metric != "visibility" and businesses_col is not None:
         biz = await businesses_col.find_one({
             "user_id": current_user["id"],
             "normalized_domain": site_host,

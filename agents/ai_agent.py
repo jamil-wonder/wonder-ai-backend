@@ -618,6 +618,101 @@ async def get_ai_insights_openai(business_name: str, url: str) -> dict:
         }, fallback_model)
 
 
+async def infer_business_category(
+    *,
+    url: str,
+    business_name: str,
+    scraped_description: str = "",
+) -> str:
+    """One cheap OpenAI call to infer a short business category from real
+    scraped context — used where a category was never collected (e.g. the
+    anonymous /scan flow, which per spec never asks for it up front) but a
+    downstream feature genuinely needs one to generate relevant questions."""
+    prompt = f"""
+    Business name: {business_name or "unknown"}
+    Website: {url}
+    What the site itself says about the business: {(scraped_description or "no description available")[:500]}
+
+    In 2-5 words, what category of business is this (e.g. "Luxury Hotel", "Family Dentist",
+    "SaaS Project Management Tool")? Return JSON only: {{"category": "..."}}
+    """
+    try:
+        parsed, _model = await _openai_chat_json(
+            prompt=prompt,
+            timeout_seconds=20,
+            temperature=0.2,
+            max_tokens=60,
+        )
+        if isinstance(parsed, dict):
+            return str(parsed.get("category") or "").strip()
+    except Exception as e:
+        print(f"Error inferring business category: {e}")
+    return ""
+
+
+async def get_onboarding_suggestions(
+    *,
+    url: str,
+    business_name: str,
+    category: str = "",
+    location: str = "",
+    scraped_description: str = "",
+) -> dict:
+    """One cheap OpenAI call, tailored to THIS business's real scraped
+    context — replaces onboarding's old hardcoded generic service/audience
+    chip lists ("Free consultation", "Local residents", ...) with real
+    suggestions specific to what the business actually is. Regenerate just
+    calls this again with a nudge for variety, not a different pipeline."""
+    context_block = f"""
+    Business name: {business_name or "unknown"}
+    Website: {url}
+    Category (may be empty — infer it if so): {category or "unknown, infer from context below"}
+    Location: {location or "unknown"}
+    What the site itself says about the business: {(scraped_description or "no description available")[:600]}
+    """
+    prompt = f"""
+    You are helping a real business owner fill in their profile during signup. Based on the business
+    context below, write real, specific suggestions — never generic filler that could apply to any
+    business.
+
+    {context_block}
+
+    Return JSON only, this exact shape:
+    {{
+      "businessDescription": "2-3 plain-English sentences describing what this specific business actually does and who it serves — written for a human reader, not SEO copy.",
+      "aiDescription": "2-3 sentences of extra context specifically useful for an AI assistant answering questions about this business — specific facts, specialties, or details an AI should know to describe it accurately.",
+      "services": ["4-8 specific services or offerings this exact business provides, based on its real category/context — not generic placeholders"],
+      "targetAudience": ["3-6 specific customer types this exact business actually serves, based on its real category/context — not generic placeholders"]
+    }}
+
+    Rules:
+    - Every field must be specific to THIS business, not boilerplate that could describe any company.
+    - If the category is unknown, infer the most likely one from the business name/description before writing services and audience.
+    - services and targetAudience must be short phrases (2-5 words each), not full sentences.
+    - JSON only, no markdown.
+    """
+    try:
+        parsed, _model = await _openai_chat_json(
+            prompt=prompt,
+            timeout_seconds=45,
+            temperature=0.6,
+            max_tokens=900,
+        )
+        if not isinstance(parsed, dict):
+            parsed = {}
+        services = parsed.get("services")
+        audience = parsed.get("targetAudience")
+        return {
+            "businessDescription": str(parsed.get("businessDescription") or "").strip(),
+            "aiDescription": str(parsed.get("aiDescription") or "").strip(),
+            "services": [str(s).strip() for s in services if str(s or "").strip()] if isinstance(services, list) else [],
+            "targetAudience": [str(a).strip() for a in audience if str(a or "").strip()] if isinstance(audience, list) else [],
+        }
+    except Exception as e:
+        print(f"Error generating onboarding suggestions: {e}")
+        return {"businessDescription": "", "aiDescription": "", "services": [], "targetAudience": []}
+
+
 async def get_ai_insights_claude(business_name: str, url: str) -> dict:
     prompt = f"""
     You are an AI research assistant. A user has a local business or website and wants to know what is known online.

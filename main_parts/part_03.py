@@ -12,6 +12,7 @@ async def _upsert_user_business(
     services: list[str] | None = None,
     target_audience: str | None = None,
     question_generation: dict | None = None,
+    tracked_questions: list[dict] | None = None,
     competitors: list[str] | None = None,
     system_competitors: list[dict] | None = None,
     tracked_pages: list[str] | None = None,
@@ -80,6 +81,25 @@ async def _upsert_user_business(
             set_fields[key] = cleaned
     if isinstance(question_generation, dict):
         set_fields["questionGeneration"] = _normalize_question_generation_settings(question_generation)
+    if isinstance(tracked_questions, list):
+        # This is the actual locked/tracked baseline — id/type/label/query
+        # only, no live run results (those come from phase5 jobs/query
+        # history separately). Saving it here is what makes the baseline
+        # real and durable instead of living only in a 2-hour browser cache.
+        cleaned_questions = []
+        for item in tracked_questions:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("query") or "").strip()
+            if not text:
+                continue
+            cleaned_questions.append({
+                "id": item.get("id"),
+                "type": str(item.get("type") or "").strip(),
+                "label": str(item.get("label") or "").strip(),
+                "query": text,
+            })
+        set_fields["trackedQuestions"] = cleaned_questions[:40]
     if isinstance(system_competitors, list):
         # Merge newly discovered competitors into the ones already saved on
         # this business profile, instead of replacing the list each run.
@@ -182,6 +202,48 @@ async def _upsert_user_business(
             weekly_scores = weekly_scores[-200:]
 
         set_fields["weekly_scores"] = weekly_scores
+
+    # Same append-only history pattern as weekly_scores, but for the
+    # visibility score (mention rate/position/citation — the same formula
+    # competitors are scored on). This is the score reconciliation fix: the
+    # Dashboard headline "Wonder Score" now reads from THIS history, not
+    # weekly_scores, so a competitor comparison is always apples-to-apples —
+    # weekly_scores (Phase 1 technical) becomes a labeled sub-component
+    # instead of competing as its own standalone number.
+    if phase5_score is not None:
+        dt5 = datetime.utcnow()
+        week_id5 = f"{dt5.isocalendar().year}-W{dt5.isocalendar().week:02d}"
+
+        # Reuses the `existing` doc already fetched at the top of this
+        # function (before any updates were applied) — same source the
+        # phase1_score branch above re-fetches fresh for weekly_scores; this
+        # one doesn't need to since visibility_weekly_scores can't have
+        # changed between that fetch and here within a single call.
+        visibility_weekly_scores = (existing.get("visibility_weekly_scores") if existing else []) or []
+
+        last_entry5 = visibility_weekly_scores[-1] if visibility_weekly_scores else None
+        is_accidental_duplicate5 = False
+        if last_entry5 and last_entry5.get("score") == float(phase5_score) and last_entry5.get("created_at"):
+            try:
+                last_dt5 = datetime.fromisoformat(str(last_entry5["created_at"]).rstrip("Z"))
+                is_accidental_duplicate5 = (dt5 - last_dt5).total_seconds() < 120
+            except Exception:
+                is_accidental_duplicate5 = False
+
+        if is_accidental_duplicate5:
+            last_entry5["updated_at"] = now_iso
+        else:
+            visibility_weekly_scores.append({
+                "week_id": week_id5,
+                "score": float(phase5_score),
+                "created_at": now_iso,
+                "updated_at": now_iso,
+            })
+
+        if len(visibility_weekly_scores) > 200:
+            visibility_weekly_scores = visibility_weekly_scores[-200:]
+
+        set_fields["visibility_weekly_scores"] = visibility_weekly_scores
 
     update_doc = {
         "$set": set_fields,

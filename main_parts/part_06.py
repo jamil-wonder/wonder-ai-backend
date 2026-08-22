@@ -14,7 +14,17 @@ async def api_ai_insights(
         )
         started_at = datetime.utcnow()
         print(f"[API] /api/ai-insights started: {request.url}")
-        insights = await asyncio.wait_for(get_ai_insights_multi(request.businessName, request.url), timeout=120)
+        if current_user:
+            insights = await asyncio.wait_for(get_ai_insights_multi(request.businessName, request.url), timeout=120)
+        else:
+            # Anonymous preview (Part 1 of the platform-flow spec) — one
+            # cheap, fast model instead of the full 4-model paid pipeline.
+            # Running Perplexity + GPT + Claude + Gemini for every anonymous
+            # visitor with no way to know who they are is a real cost risk;
+            # the rate limit above caps volume, but the per-call cost itself
+            # should also be small for traffic we haven't converted yet.
+            single_insight = await asyncio.wait_for(get_ai_insights_openai(request.businessName, request.url), timeout=60)
+            insights = [single_insight] if isinstance(single_insight, dict) else []
         if not isinstance(insights, list):
             insights = []
 
@@ -54,6 +64,42 @@ async def api_ai_insights(
     except Exception as e:
         traceback.print_exc()
         return AiInsightsResult(success=False, insights=[], error=str(e))
+
+
+@app.post("/api/onboarding/suggestions", response_model=OnboardingSuggestionsResult)
+async def api_onboarding_suggestions(
+    request: OnboardingSuggestionsRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    # Onboarding-only, so this always requires a real signed-in user — no
+    # anonymous path, no rate limiter needed on top of that.
+    try:
+        result = await asyncio.wait_for(
+            get_onboarding_suggestions(
+                url=request.url,
+                business_name=request.businessName,
+                category=request.category or "",
+                location=request.location or "",
+                scraped_description=request.scrapedDescription or "",
+            ),
+            timeout=50,
+        )
+        await _log_ai_usage_event({
+            "feature": "onboarding_suggestions",
+            "endpoint": "/api/onboarding/suggestions",
+            "url": request.url,
+            "user_id": current_user.get("id") if current_user else None,
+            "user_email": current_user.get("email") if current_user else None,
+            "model_provider": "openai",
+            "ai_calls_estimate": 1,
+            "details": {},
+        })
+        return OnboardingSuggestionsResult(success=True, **result)
+    except asyncio.TimeoutError:
+        return OnboardingSuggestionsResult(success=False, error="Suggestions took too long. Please retry.")
+    except Exception as e:
+        traceback.print_exc()
+        return OnboardingSuggestionsResult(success=False, error=str(e))
 
 
 @app.post("/api/notify/scan-complete")
@@ -142,7 +188,14 @@ async def api_public_competitors(
                 category=request.category or "",
                 location=request.location or "",
                 description=request.description or "",
-                desired_count=4,
+                # Ask for more real candidates than we intend to show — the
+                # reachability check (_domain_is_reachable) drops a good
+                # chunk of them (parked pages, dead domains), so requesting
+                # only 4 up front often left just 1 survivor on the public
+                # preview. More real candidates in means more real survivors
+                # out, not a change to the filtering itself.
+                desired_count=8,
+                openai_only=not current_user,
             ),
             timeout=public_competitor_timeout_seconds,
         )
@@ -172,7 +225,7 @@ async def api_public_competitors(
                 "confidence": confidence or "validated",
                 "faviconUrl": f"https://www.google.com/s2/favicons?domain={domain}&sz=64",
             })
-            if len(competitors) >= 4:
+            if len(competitors) >= 6:
                 break
 
         await _log_ai_usage_event({
@@ -199,6 +252,110 @@ async def api_public_competitors(
     except Exception as e:
         traceback.print_exc()
         return PublicCompetitorsResponse(success=False, competitors=[], error=str(e))
+
+
+@app.post("/api/public/full-results", response_model=PublicFullResultsResponse)
+async def api_public_full_results(
+    request: PublicFullResultsRequest,
+    http_request: Request,
+    current_user: dict = Depends(get_current_user_optional),
+):
+    # Part 1 of the platform-flow spec: "Full results. Every question, who
+    # wins it, the sources AI cites." — this is the piece the email-gated
+    # unlock was missing; it only showed competitors before. Real questions
+    # (the same generator the paid 20-question flow uses, no hardcoded
+    # text), but only a small SAMPLE actually gets run against a model —
+    # generation is one call regardless of size, the expensive part is
+    # answering each one, and that's what needs to stay cheap for
+    # anonymous traffic.
+    try:
+        await _enforce_public_child_call(
+            request=http_request,
+            current_user=current_user,
+            endpoint_key="full_results",
+            max_calls=1,
+        )
+        target_domain = _normalize_domain(request.url)
+        category = request.category or ""
+        if not category:
+            # /scan never asks for category up front (per spec) — infer it
+            # for real from the scraped context rather than skipping question
+            # generation, which hard-requires one.
+            category = await infer_business_category(
+                url=request.url,
+                business_name=request.businessName or "",
+                scraped_description=request.description or "",
+            )
+        business_context = {
+            "name": request.businessName or "",
+            "category": category,
+            "location": request.location or "",
+            "description": request.description or "",
+        }
+        preview_questions = await asyncio.wait_for(
+            generate_preview_questions(
+                request.url,
+                business_context=business_context,
+            ),
+            timeout=PHASE5_QUESTION_GEN_TIMEOUT_SEC + 15,
+        )
+        sample_texts: list[tuple[str, str, str]] = [
+            (q["text"], q["type"], q["label"]) for q in preview_questions
+        ]
+
+        if not sample_texts:
+            return PublicFullResultsResponse(success=True, questions=[])
+
+        sample_questions = [{"id": f"public-{i}", "text": text} for i, (text, _, _) in enumerate(sample_texts)]
+        results = await asyncio.gather(
+            *[
+                # Perplexity does real web search and returns real cited
+                # sources — OpenAI's plain chat completion here never had
+                # any to give, so "who's winning it" and "sources cited"
+                # were silently always empty. Three Perplexity calls for an
+                # anonymous preview is still cheap and bounded.
+                _run_with_backoff(request.url, q, model_provider="perplexity")
+                for q in sample_questions
+            ],
+            return_exceptions=True,
+        )
+
+        out: list[dict] = []
+        for (text, type_key, label), result in zip(sample_texts, results):
+            if not isinstance(result, dict):
+                out.append({"query": text, "type": type_key, "label": label, "mentioned": False, "sources": [], "topCompetitor": None})
+                continue
+            mentioned = result.get("status") == "Mentioned"
+            sources = [s for s in (result.get("sources") or []) if s and s != target_domain][:5]
+            top_competitor = next((s for s in sources), None)
+            out.append({
+                "query": text,
+                "type": type_key,
+                "label": label,
+                "mentioned": mentioned,
+                "sources": sources,
+                "topCompetitor": None if mentioned else top_competitor,
+            })
+
+        await _log_ai_usage_event({
+            "feature": "public_full_results",
+            "endpoint": "/api/public/full-results",
+            "url": request.url,
+            "user_id": current_user.get("id") if current_user else None,
+            "user_email": current_user.get("email") if current_user else None,
+            "model_provider": "openai",
+            "ai_calls_estimate": len(sample_questions),
+            "details": {"question_count": len(sample_questions)},
+        })
+
+        return PublicFullResultsResponse(success=True, questions=out)
+    except asyncio.TimeoutError:
+        return PublicFullResultsResponse(success=False, questions=[], error="This took too long. Please retry.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        return PublicFullResultsResponse(success=False, questions=[], error=str(e))
 
 
 @app.post("/api/scan/content", response_model=ContentAnalysisResponse)

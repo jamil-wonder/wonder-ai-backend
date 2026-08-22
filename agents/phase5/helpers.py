@@ -302,12 +302,25 @@ def _extract_brand_terms(url: str, ctx: dict) -> tuple[set[str], set[str], str]:
         "restaurant", "restaurants", "london", "belgravia", "bar", "hotel", "cafe",
         "grill", "kitchen", "club", "store", "shop", "salon", "spa", "clinic",
     }
+    # A business name often contains its own category/product word (e.g.
+    # "Flat Iron STEAK Restaurants", "Bristol PIZZA Co") — treating that word
+    # as brand-identifying meant every non-branded question about the
+    # category ("best steak in London?") got wrongly rejected as branded,
+    # since it necessarily reuses the same word. Confirmed live: non-branded
+    # generation returned 0/5 every single attempt for a steak restaurant
+    # whose own name contains "steak". These words describe what the
+    # business IS, not who it is, so they can't double as brand tokens.
+    services_list = ctx.get("services") if isinstance(ctx.get("services"), list) else []
+    category_service_tokens: set[str] = set()
+    for phrase in [str(ctx.get("category") or ""), *[str(s) for s in services_list]]:
+        category_service_tokens.update(t for t in re.findall(r"[a-z0-9]+", phrase.lower()) if len(t) >= 4)
+
     blocked_tokens: set[str] = set()
     for token in [*domain_tokens, *name_tokens]:
         t = token.strip().lower()
         if len(t) < 4:
             continue
-        if t in keep_words:
+        if t in keep_words or t in category_service_tokens:
             continue
         blocked_tokens.add(t)
 

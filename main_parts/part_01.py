@@ -17,6 +17,9 @@ from models import (
     AiInsightsRequest,
     AiInsightsResult,
     WishlistRequest,
+    PublicScanUnlockRequest,
+    OnboardingSuggestionsRequest,
+    OnboardingSuggestionsResult,
     TrackUrlRequest,
     BlogAnalyzeRequest,
     BlogAnalysisResponse,
@@ -36,9 +39,12 @@ from models import (
     CompetitorTrackingRunResponse,
     CompetitorTrackingStatusResponse,
 )
-from scraping.scraper import scrape_website
+from scraping.scraper import scrape_website, get_grade
 from agents.ai_agent import (
     get_ai_insights_multi,
+    get_ai_insights_openai,
+    get_onboarding_suggestions,
+    infer_business_category,
     get_blog_analysis_perplexity,
     generate_seo_blog,
     generate_weekly_blog_ideas,
@@ -61,9 +67,10 @@ from models.phase5_models import (
     Phase5StartJobResponse,
     Phase5JobStatusResponse,
 )
-from agents.phase5.config import PHASE5_ENABLE_GEMINI
+from agents.phase5.config import PHASE5_ENABLE_GEMINI, PHASE5_QUESTION_GEN_TIMEOUT_SEC
 from agents.phase5_agent import (
     generate_brand_questions,
+    generate_preview_questions,
     rank_brand_in_ai,
     analyze_single_question,
     analyze_single_question_multi,
@@ -129,6 +136,13 @@ PHASE5_WORKER_CONCURRENCY = max(1, min(2, int(os.getenv("PHASE5_WORKER_CONCURREN
 PHASE5_WORKER_POLL_INTERVAL = float(os.getenv("PHASE5_WORKER_POLL_INTERVAL", "0.5"))
 PHASE5_JOB_PARALLELISM = max(1, min(8, int(os.getenv("PHASE5_JOB_PARALLELISM", "4"))))
 PHASE5_MODEL_MAX_THREADS = max(4, min(16, int(os.getenv("PHASE5_MODEL_MAX_THREADS", "8"))))
+# How many businesses the Sunday weekly re-run processes at once. Was a
+# strict one-at-a-time loop — fine at today's scale (a couple of locked
+# businesses) but would take many hours to clear a real user base doing it
+# fully sequentially. Bounded rather than "all at once" so this doesn't spike
+# past the AI providers' rate limits the moment there are dozens of
+# businesses locked in the same week.
+SUNDAY_SCHEDULER_CONCURRENCY = max(1, min(10, int(os.getenv("SUNDAY_SCHEDULER_CONCURRENCY", "3"))))
 PHASE5_QUESTION_TIMEOUT_GEMINI_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_GEMINI_SEC", "140"))
 PHASE5_QUESTION_TIMEOUT_OPENAI_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_OPENAI_SEC", "40"))
 PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC = int(os.getenv("PHASE5_QUESTION_TIMEOUT_PERPLEXITY_SEC", "45"))
@@ -176,6 +190,7 @@ auth_handoffs_col = None
 google_integrations_col = None
 analytics_snapshots_col = None
 email_verifications_col = None
+public_scan_leads_col = None
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
     db = mongo_client.get_database("wonderai")
@@ -194,6 +209,7 @@ try:
     user_history_meta_col = db.get_collection("user_history_meta")
     public_rate_limits_col = db.get_collection("public_rate_limits")
     email_verifications_col = db.get_collection("email_verifications")
+    public_scan_leads_col = db.get_collection("public_scan_leads")
 except Exception as e:
     print(f"[API] Error connecting to MongoDB: {type(e).__name__}")
 
@@ -988,6 +1004,510 @@ async def send_scan_complete_email(
     return await send_email(to_email, f"Your Wonderscore scan for {label} is ready", html_body, text_body)
 
 
+def _question_mention_summary(result: dict | None) -> tuple[bool, int, list[str]]:
+    """From one question's multi-model result, return (mentioned in at
+    least one model, how many of the 4, real competitor domains other
+    providers surfaced instead)."""
+    providers = (result or {}).get("providers") or {}
+    mentioned_count = 0
+    other_domains: list[str] = []
+    for provider_result in providers.values():
+        if not isinstance(provider_result, dict):
+            continue
+        if provider_result.get("mentioned"):
+            mentioned_count += 1
+        else:
+            for s in (provider_result.get("sources") or []):
+                if s and s not in other_domains:
+                    other_domains.append(s)
+    return mentioned_count > 0, mentioned_count, other_domains
+
+
+def _compute_weekly_diff(
+    *,
+    current_results: dict,
+    previous_results: dict,
+    question_text_by_id: dict[str, str],
+    target_domain: str,
+) -> tuple[list[str], list[str]]:
+    """Real week-over-week diff for the weekly report email. Returns
+    (what_moved, top_actions), both already-formatted HTML fragments.
+
+    A question missing from `previous_results` (question set changed since
+    last run — edited, regenerated, or the two jobs just don't overlap) is
+    skipped from the diff entirely rather than defaulted to "was not
+    mentioned" — that earlier bug fabricated 15 false "now appearing" gains
+    against a job with a different question set, and hid a real -4.0 score
+    drop behind an all-good-news email. Live-tested against that exact
+    scenario after the fix: correctly falls back to an honest "no
+    comparison" message instead.
+
+    Drops are shown before gains, always — a score drop must never be
+    invisible just because more positive changes happened to exist too.
+    """
+    comparable_ids = set(question_text_by_id) & set(previous_results)
+    drops: list[str] = []
+    gains: list[str] = []
+    count_changes: list[str] = []
+    top_actions: list[str] = []
+
+    for qid, qtext in question_text_by_id.items():
+        cur_mentioned, cur_count, cur_domains = _question_mention_summary(current_results.get(qid))
+
+        if qid in comparable_ids:
+            prev_mentioned, prev_count, _ = _question_mention_summary(previous_results.get(qid))
+            if cur_mentioned and not prev_mentioned:
+                gains.append(f"&#9989;&nbsp; Now appearing for &ldquo;{qtext}&rdquo;")
+            elif not cur_mentioned and prev_mentioned:
+                drops.append(f"&#9888;&nbsp; Dropped out of &ldquo;{qtext}&rdquo;")
+            elif cur_count != prev_count:
+                direction = "up" if cur_count > prev_count else "down"
+                count_changes.append(f"&#128200;&nbsp; {qtext[:60]} — mentions {direction} to {cur_count}/4 models")
+
+        if not cur_mentioned:
+            real_competitor = next((d for d in cur_domains if d and d != target_domain), None)
+            if real_competitor:
+                top_actions.append(
+                    f"You're missing from &ldquo;{qtext}&rdquo; — <strong>{real_competitor}</strong> is showing up instead"
+                )
+
+    if not comparable_ids and previous_results:
+        what_moved = ["Your tracked questions changed since last week, so this week has no direct comparison yet."]
+    else:
+        what_moved = [*drops, *count_changes, *gains]
+
+    return what_moved, top_actions
+
+
+# Alert triggers (Part 5 of the flow spec): "competitor alert only on a
+# real event... Hard cap 2-3 marketing emails/week." Only the two triggers
+# with real, reliably-computable signal are implemented — score drop (from
+# the same visibility-score history the weekly email already uses) and a
+# genuinely new competitor appearing (comparing this week's deep_competitors
+# domains against last week's). The others named in the spec (competitor
+# surge, first appearance, milestone, lost citation) would need historical
+# per-competitor score tracking and per-source citation history that don't
+# exist yet — not built here rather than faked with an approximation.
+ALERT_SCORE_DROP_THRESHOLD = 5.0
+
+
+def _detect_alerts(
+    *,
+    current_score: float | None,
+    previous_score: float | None,
+    current_competitors: list[dict],
+    previous_competitors: list[dict],
+) -> list[dict]:
+    alerts: list[dict] = []
+
+    if isinstance(current_score, (int, float)) and isinstance(previous_score, (int, float)):
+        drop = previous_score - current_score
+        if drop >= ALERT_SCORE_DROP_THRESHOLD:
+            alerts.append({
+                "category": "Score drop",
+                "headline": f"Your Wonder Score dropped {round(drop, 1)} points this week",
+                "detail": f"{round(previous_score)} → {round(current_score)}. Worth checking this week's Search Tracker results for what changed.",
+            })
+
+    previous_domains = {c.get("domain") for c in previous_competitors if isinstance(c, dict) and c.get("domain")}
+    new_competitors = [
+        c for c in current_competitors
+        if isinstance(c, dict) and c.get("domain") and c.get("domain") not in previous_domains
+    ]
+    # Only alert on a genuine week-over-week comparison, not a business's
+    # very first tracked week (when "previous" is simply empty and every
+    # competitor would wrongly look "new").
+    if new_competitors and previous_competitors:
+        top_new = new_competitors[0]
+        alerts.append({
+            "category": "New competitor",
+            "headline": f"AI started recommending a new competitor: {top_new.get('name') or top_new.get('domain')}",
+            "detail": f"{top_new.get('domain')} is now showing up in AI answers for your tracked questions, scoring {round(float(top_new.get('score') or 0))}/100.",
+        })
+
+    return alerts
+
+
+def _build_alert_email(
+    *,
+    name: str,
+    business_name: str,
+    domain: str,
+    alerts: list[dict],
+    dashboard_url: str,
+) -> tuple[str, str]:
+    display_name = name or "there"
+    label = business_name or domain or "your business"
+
+    alerts_html = "".join(
+        f"""
+        <div style="margin:0 0 12px 0;padding:14px 16px;background:#fdfcf8;border:1px solid #ece3d1;border-left:4px solid #b1442a;border-radius:10px;">
+          <div style="font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#b1442a;margin-bottom:4px;">{a['category']}</div>
+          <div style="font-size:14px;font-weight:700;color:#23211b;margin-bottom:4px;">{a['headline']}</div>
+          <p style="margin:0;font-size:13px;line-height:19px;color:#6f6757;">{a['detail']}</p>
+        </div>"""
+        for a in alerts
+    )
+    alerts_text = "\n\n".join(f"{a['category']}: {a['headline']}\n{a['detail']}" for a in alerts)
+
+    text_body = (
+        f"Hi {display_name},\n\n"
+        f"A real change happened for {label} ({domain}) worth flagging before your regular weekly report:\n\n"
+        f"{alerts_text}\n\n"
+        f"View your dashboard: {dashboard_url}\n"
+    )
+
+    html_body = f"""
+    <div style="margin:0;padding:0;background:#faf8f3;">
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;padding:28px 16px;color:#23211b;">
+        <div style="background:#ffffff;border:1px solid #ece3d1;border-radius:24px;overflow:hidden;box-shadow:0 18px 45px rgba(21,70,59,0.10);">
+          <div style="padding:20px 28px;background:#b1442a;">
+            <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+              <tr>
+                <td width="36" style="vertical-align:middle;">
+                  <div style="width:36px;height:36px;line-height:36px;text-align:center;border-radius:10px;background:rgba(255,255,255,0.18);color:#ffffff;font-size:18px;font-weight:700;">&#9888;</div>
+                </td>
+                <td style="vertical-align:middle;padding-left:12px;">
+                  <div style="font-size:15px;font-weight:700;color:#ffffff;">Wonderscore alert</div>
+                </td>
+              </tr>
+            </table>
+          </div>
+
+          <div style="padding:26px 28px;">
+            <h1 style="margin:0 0 8px 0;font-size:20px;line-height:27px;font-weight:700;color:#23211b;letter-spacing:-0.02em;">Something changed for {label}</h1>
+            <p style="margin:0 0 20px 0;font-size:13.5px;line-height:21px;color:#6f6757;">
+              Hi {display_name}, this is a real event — not your regular weekly report, which still arrives Sunday night as usual.
+            </p>
+
+            {alerts_html}
+
+            <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;margin-top:6px;">
+              <tr>
+                <td style="border-radius:12px;background:#15463b;">
+                  <a href="{dashboard_url}" style="display:inline-block;padding:12px 22px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;">View dashboard</a>
+                </td>
+              </tr>
+            </table>
+          </div>
+        </div>
+
+        <p style="margin:18px 0 0 0;text-align:center;font-size:11px;line-height:18px;color:#9b927f;">
+          You're getting this because scan-complete emails are on in your Wonderscore settings. Alerts only fire on real events, capped well under a few per week.
+        </p>
+      </div>
+    </div>
+    """
+    return html_body, text_body
+
+
+async def send_alert_email(
+    *,
+    to_email: str,
+    name: str,
+    business_name: str,
+    domain: str,
+    alerts: list[dict],
+) -> bool:
+    if not to_email or not alerts:
+        return False
+    frontend_url = (os.getenv("FRONTEND_APP_URL") or "http://localhost:3000").rstrip("/")
+    dashboard_url = f"{frontend_url}/overview"
+    html_body, text_body = _build_alert_email(
+        name=name,
+        business_name=business_name,
+        domain=domain,
+        alerts=alerts,
+        dashboard_url=dashboard_url,
+    )
+    label = business_name or domain or "your business"
+    subject = alerts[0]["headline"] if len(alerts) == 1 else f"{len(alerts)} real changes for {label}"
+    return await send_email(to_email, subject, html_body, text_body)
+
+
+# _build_weekly_search_tracker_email / send_weekly_search_tracker_email
+# (the standalone, non-combined Search Tracker email) were removed —
+# there's now exactly one weekly email per business (_build_combined_weekly_email),
+# and the manual on-demand Search Tracker notification was removed by
+# request in favor of that single Sunday send.
+
+
+def _build_combined_weekly_email(
+    *,
+    name: str,
+    business_name: str,
+    domain: str,
+    scrape: dict,
+    ai_insights: list,
+    areas: list | None,
+    dashboard_url: str,
+    tracker: dict | None,
+) -> tuple[str, str]:
+    """One email per business per week, not two. Always has the Phase 1
+    technical section (same content as the old standalone scan-complete
+    email); when `tracker` is provided (the business has a locked Search
+    Tracker baseline and a real completed weekly run), a second section with
+    the visibility score, weekly change, competitor average, what moved, and
+    top things to fix is appended below it — same real data the standalone
+    weekly Search Tracker email used, just in one send instead of two."""
+    display_name = name or "there"
+    label = business_name or domain or "your business"
+    scores = (scrape or {}).get("scores") or {}
+    total = int(scores.get("total") or 0)
+    grade = str(scores.get("grade") or "-")
+    grade_color, grade_bg = _grade_pill_color(grade)
+    score_badge = _score_badge_html(total)
+    areas_html, areas_text = _audit_areas_html(areas or _compute_audit_areas(scrape))
+
+    insight = _pick_ai_insight(ai_insights)
+    insight_html = ""
+    insight_text = ""
+    if insight:
+        model_label, model_bg, model_color = _model_badge(insight.get("modelName"))
+        summary = str(insight.get("summary") or "").strip()
+        if len(summary) > 160:
+            summary = summary[:157].rstrip() + "..."
+        insight_html = f"""
+        <div style="margin:0 0 20px 0;padding:14px 16px;background:#ffffff;border:1px solid #ece3d1;border-radius:14px;">
+          <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#9b927f;margin-bottom:8px;">AI model insight</div>
+          <span style="display:inline-block;margin-bottom:8px;padding:3px 9px;border-radius:999px;background:{model_bg};color:{model_color};font-size:11px;font-weight:700;">{model_label}</span>
+          <p style="margin:0;font-size:13px;line-height:20px;color:#3a352b;">{summary}</p>
+        </div>"""
+        insight_text = f"\n{model_label} on {label}: {summary}\n"
+
+    entity_rows = _entity_signal_rows(scrape)
+    technical_line = _technical_summary_line(scrape)
+
+    top_findings = [str(w).strip() for w in ((scrape or {}).get("warnings") or []) if str(w or "").strip()][:3]
+    if top_findings:
+        findings_intro = "A few things worth a look:"
+        findings_html = "".join(
+            f'<tr><td style="padding:5px 0;font-size:13px;line-height:19px;color:#6f6757;">&#8226;&nbsp; {f}</td></tr>'
+            for f in top_findings
+        )
+        findings_text = "\n".join(f"  - {f}" for f in top_findings)
+    else:
+        findings_intro = "No major gaps found this run — nice work."
+        findings_html = ""
+        findings_text = ""
+
+    tracker_section_html = ""
+    tracker_section_text = ""
+    if tracker:
+        t_current = tracker.get("current_score")
+        t_previous = tracker.get("previous_score")
+        t_grade = get_grade(round(t_current)) if isinstance(t_current, (int, float)) else "-"
+        t_grade_color, t_grade_bg = _grade_pill_color(t_grade)
+        t_score_badge = _score_badge_html(round(t_current)) if isinstance(t_current, (int, float)) else _score_badge_html(0)
+
+        if isinstance(t_previous, (int, float)) and isinstance(t_current, (int, float)):
+            delta = round(t_current - t_previous, 1)
+            if delta > 0:
+                delta_text, delta_color = f"+{delta} vs last week", "#0f7a4d"
+            elif delta < 0:
+                delta_text, delta_color = f"{delta} vs last week", "#b1442a"
+            else:
+                delta_text, delta_color = "No change vs last week", "#8a8273"
+        else:
+            delta_text, delta_color = "First tracked week — no comparison yet", "#8a8273"
+
+        t_competitor_avg = tracker.get("competitor_avg")
+        competitor_line = (
+            f"Competitor average: {round(t_competitor_avg)}/100"
+            if isinstance(t_competitor_avg, (int, float))
+            else "Competitor average: not enough data yet"
+        )
+
+        what_moved = tracker.get("what_moved") or []
+        top_actions = tracker.get("top_actions") or []
+        moved_html = "".join(
+            f'<tr><td style="padding:5px 0;font-size:13px;line-height:19px;color:#3a352b;">{m}</td></tr>'
+            for m in what_moved[:3]
+        ) or '<tr><td style="padding:5px 0;font-size:13px;line-height:19px;color:#8a8273;">This is your first tracked week — the trend starts here.</td></tr>'
+        moved_text = "\n".join(f"  - {m}" for m in what_moved[:3]) or "  - First tracked week — the trend starts here."
+        actions_html = "".join(
+            f'<tr><td style="padding:5px 0;font-size:13px;line-height:19px;color:#3a352b;">{a}</td></tr>'
+            for a in top_actions[:3]
+        ) or '<tr><td style="padding:5px 0;font-size:13px;line-height:19px;color:#8a8273;">You\'re appearing across the board this week — nothing urgent to fix.</td></tr>'
+        actions_text = "\n".join(f"  - {a}" for a in top_actions[:3]) or "  - Appearing across the board — nothing urgent."
+
+        # This is the reconciled headline "Wonder Score" — same formula
+        # competitors are scored on, so it's the primary number in the
+        # email (printed first below), not a secondary section under the
+        # technical score like it used to be.
+        tracker_section_html = f"""
+            <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#9b927f;margin-bottom:10px;">Wonder Score — this week</div>
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;margin-bottom:18px;">
+              <tr>
+                <td width="112" style="vertical-align:middle;">
+                  {t_score_badge}
+                </td>
+                <td style="vertical-align:middle;padding-left:14px;">
+                  <span style="display:inline-block;padding:4px 10px;border-radius:999px;background:{t_grade_bg};color:{t_grade_color};font-size:12px;font-weight:700;">Grade {t_grade}</span>
+                  <div style="margin-top:8px;font-size:13px;line-height:20px;font-weight:700;color:{delta_color};">{delta_text}</div>
+                  <div style="margin-top:2px;font-size:12.5px;line-height:18px;color:#8a8273;">{competitor_line}</div>
+                </td>
+              </tr>
+            </table>
+            <div style="margin:0 0 16px 0;padding:14px 16px;background:#fdfcf8;border:1px solid #ece3d1;border-radius:14px;">
+              <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#9b927f;margin-bottom:6px;">What moved</div>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+                {moved_html}
+              </table>
+            </div>
+            <div style="margin:0 0 26px 0;padding:14px 16px;background:#f6f3ec;border:1px solid #ece3d1;border-radius:14px;">
+              <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#9b927f;margin-bottom:6px;">Top things to fix</div>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+                {actions_html}
+              </table>
+            </div>"""
+        tracker_section_text = (
+            f"Wonder Score: {round(t_current)}/100 (Grade {t_grade}) — {delta_text}\n"
+            f"{competitor_line}\n\n"
+            f"What moved:\n{moved_text}\n\n"
+            f"Top things to fix:\n{actions_text}\n\n"
+        )
+
+    heading = f"{label}'s weekly report" if tracker else f"{label}'s visibility scan is ready"
+    intro = (
+        "Here's your AI-visibility update for this week, with the technical detail behind it below."
+        if tracker
+        else f"Hi {display_name}, we just finished scanning <strong style=\"color:#23211b;\">{domain}</strong>. Here's the short version."
+    )
+    badge_text = "Weekly report" if tracker else "Scan complete"
+    # When there's no visibility data yet (no locked Search Tracker
+    # baseline), the technical score is all there is to show, so it stays
+    # labeled as the headline the way it always was. Once a tracker section
+    # exists, this becomes a secondary, clearly-labeled component — never a
+    # second number competing with the real headline above it.
+    technical_block_label = "Technical readiness" if tracker else "Wonder Score, based on 6 audit areas"
+
+    text_body = (
+        f"Hi {display_name},\n\n"
+        f"Your Wonderscore update for {label} ({domain}) is ready.\n\n"
+        f"{tracker_section_text}"
+        f"Technical readiness score: {total}/100 (Grade {grade})\n"
+        + (f"\n{areas_text}\n" if areas_text else "")
+        + f"{insight_text}\n"
+        f"Technical readiness: {technical_line}\n\n"
+        f"{findings_intro}\n{findings_text}\n\n"
+        f"View the full report: {dashboard_url}\n"
+    )
+
+    html_body = f"""
+    <div style="margin:0;padding:0;background:#faf8f3;">
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;padding:28px 16px;color:#23211b;">
+        <div style="background:#ffffff;border:1px solid #ece3d1;border-radius:24px;overflow:hidden;box-shadow:0 18px 45px rgba(21,70,59,0.10);">
+          <div style="padding:26px 28px 20px 28px;border-bottom:1px solid #f0e8d8;background:#fdfcf8;">
+            <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+              <tr>
+                <td width="42" style="vertical-align:middle;">
+                  <div style="width:42px;height:42px;line-height:42px;text-align:center;border-radius:14px;background:#15463b;color:#ffffff;font-size:24px;font-weight:700;">&#10022;</div>
+                </td>
+                <td style="vertical-align:middle;padding-left:12px;">
+                  <div style="font-size:20px;font-weight:700;letter-spacing:-0.02em;color:#15463b;">Wonderscore</div>
+                  <div style="font-size:12px;line-height:18px;color:#8a8273;">AI visibility dashboard</div>
+                </td>
+              </tr>
+            </table>
+          </div>
+
+          <div style="padding:30px 28px 24px 28px;">
+            <div style="display:inline-block;margin-bottom:14px;padding:5px 9px;border-radius:999px;background:#edf8f1;border:1px solid #ccebd8;color:#0f7a4d;font-size:10px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;">
+              {badge_text}
+            </div>
+            <h1 style="margin:0 0 10px 0;font-size:26px;line-height:32px;font-weight:700;color:#15463b;letter-spacing:-0.03em;">{heading}</h1>
+            <p style="margin:0 0 22px 0;font-size:14px;line-height:22px;color:#6f6757;">
+              {intro}
+            </p>
+
+            {tracker_section_html}
+
+            <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#9b927f;margin-bottom:10px;">{technical_block_label}</div>
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;margin-bottom:22px;">
+              <tr>
+                <td width="112" style="vertical-align:middle;">
+                  {score_badge}
+                </td>
+                <td style="vertical-align:middle;padding-left:14px;">
+                  <span style="display:inline-block;padding:4px 10px;border-radius:999px;background:{grade_bg};color:{grade_color};font-size:12px;font-weight:700;">Grade {grade}</span>
+                  <div style="margin-top:8px;font-size:13px;line-height:20px;color:#6f6757;">{"Based on 6 technical audit areas" if tracker else "Wonder Score, based on 6 audit areas"}</div>
+                </td>
+              </tr>
+            </table>
+
+            {areas_html}
+
+            {insight_html}
+
+            <div style="margin:0 0 16px 0;">
+              <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#9b927f;margin-bottom:6px;">Entity &amp; contact signals</div>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+                {entity_rows}
+              </table>
+            </div>
+
+            <div style="margin:0 0 16px 0;padding:12px 14px;background:#f6f3ec;border:1px solid #ece3d1;border-radius:12px;">
+              <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#9b927f;margin-bottom:4px;">Technical readiness</div>
+              <p style="margin:0;font-size:13px;line-height:19px;color:#3a352b;">{technical_line}</p>
+            </div>
+
+            <div style="margin:0;padding:14px 16px;background:#fdfcf8;border:1px solid #ece3d1;border-radius:14px;">
+              <div style="font-size:13px;font-weight:700;color:#23211b;margin-bottom:{"6px" if findings_html else "0"};">{findings_intro}</div>
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+                {findings_html}
+              </table>
+            </div>
+
+            <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;margin-top:22px;">
+              <tr>
+                <td style="border-radius:12px;background:#15463b;">
+                  <a href="{dashboard_url}" style="display:inline-block;padding:12px 22px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;">View full report</a>
+                </td>
+              </tr>
+            </table>
+          </div>
+        </div>
+
+        <p style="margin:18px 0 0 0;text-align:center;font-size:11px;line-height:18px;color:#9b927f;">
+          You're getting this because scan-complete emails are on in your Wonderscore settings.
+        </p>
+      </div>
+    </div>
+    """
+    return html_body, text_body
+
+
+async def send_combined_weekly_email(
+    *,
+    to_email: str,
+    name: str,
+    business_name: str,
+    domain: str,
+    scrape: dict,
+    ai_insights: list | None = None,
+    areas: list | None = None,
+    tracker: dict | None = None,
+) -> bool:
+    if not to_email:
+        return False
+    frontend_url = (os.getenv("FRONTEND_APP_URL") or "http://localhost:3000").rstrip("/")
+    dashboard_url = f"{frontend_url}/overview"
+    html_body, text_body = _build_combined_weekly_email(
+        name=name,
+        business_name=business_name,
+        domain=domain,
+        scrape=scrape or {},
+        ai_insights=ai_insights or [],
+        areas=areas,
+        dashboard_url=dashboard_url,
+        tracker=tracker,
+    )
+    label = business_name or domain or "your business"
+    subject = f"{label}'s weekly report" if tracker else f"Your Wonderscore scan for {label} is ready"
+    return await send_email(to_email, subject, html_body, text_body)
+
+
 # --- Email quality gate ---
 # EmailStr on the request models only checks that an address is *shaped*
 # like an email. That's not enough on its own: "user@mailinator.com" is
@@ -1077,6 +1597,10 @@ class NotificationPreferencesUpdateRequest(BaseModel):
     notify_scan_complete: bool
 
 
+class ReportShareLinkRequest(BaseModel):
+    business_id: str
+
+
 class ScanCompleteNotifyRequest(BaseModel):
     url: str
     businessName: str = ""
@@ -1118,10 +1642,28 @@ class PublicCompetitorsResponse(BaseModel):
     error: str | None = None
 
 
+class PublicFullResultsRequest(BaseModel):
+    url: str
+    businessName: str | None = None
+    category: str | None = None
+    location: str | None = None
+    description: str | None = None
+
+
+class PublicFullResultsResponse(BaseModel):
+    success: bool
+    questions: list[dict] = []
+    error: str | None = None
+
+
+# Off by default in local/dev — flip this on (or just don't set it, since
+# the default is "true") when deploying to production. Everything else
+# about the limiter is unchanged; this is the single switch.
+PUBLIC_PREVIEW_RATE_LIMIT_ENABLED = os.getenv("PUBLIC_PREVIEW_RATE_LIMIT_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
 PUBLIC_PREVIEW_ATTEMPT_LIMIT = int(os.getenv("PUBLIC_PREVIEW_ATTEMPT_LIMIT", "3"))
-PUBLIC_PREVIEW_SUCCESS_LIMIT = int(os.getenv("PUBLIC_PREVIEW_SUCCESS_LIMIT", "1"))
+PUBLIC_PREVIEW_SUCCESS_LIMIT = int(os.getenv("PUBLIC_PREVIEW_SUCCESS_LIMIT", "2"))
 PUBLIC_PREVIEW_WINDOW_HOURS = int(os.getenv("PUBLIC_PREVIEW_WINDOW_HOURS", "24"))
-PUBLIC_COMPETITOR_LOOKUP_LIMIT = int(os.getenv("PUBLIC_COMPETITOR_LOOKUP_LIMIT", "8"))
+PUBLIC_COMPETITOR_LOOKUP_LIMIT = int(os.getenv("PUBLIC_COMPETITOR_LOOKUP_LIMIT", "1"))
 
 
 def _normalize_site(value: str) -> str:
