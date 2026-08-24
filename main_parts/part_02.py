@@ -194,6 +194,7 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "trackedQuestions": doc.get("trackedQuestions") if isinstance(doc.get("trackedQuestions"), list) else [],
         "competitors": doc.get("competitors") if isinstance(doc.get("competitors"), list) else [],
         "systemCompetitors": doc.get("systemCompetitors") if isinstance(doc.get("systemCompetitors"), list) else [],
+        "completedActions": doc.get("completedActions") if isinstance(doc.get("completedActions"), list) else [],
         "trackedPages": doc.get("trackedPages") if isinstance(doc.get("trackedPages"), list) else [],
         "latest_phase1_score": doc.get("latest_phase1_score"),
         "latest_phase5_score": doc.get("latest_phase5_score"),

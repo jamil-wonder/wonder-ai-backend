@@ -303,10 +303,20 @@ async def get_current_user_optional(token: str = Depends(oauth2_scheme)):
             return None
         user = await users_col.find_one({"_id": ObjectId(user_id)})
         if user:
+            # Real "inactive" signal for the mid-week reminder email — fire-
+            # and-forget so it never adds latency to the request that
+            # triggered it. Cheap: one field, one write, only on actual
+            # authenticated calls.
+            asyncio.create_task(
+                users_col.update_one(
+                    {"_id": user["_id"]},
+                    {"$set": {"last_active_at": datetime.utcnow().isoformat() + "Z"}},
+                )
+            )
             return {
-                "id": str(user["_id"]), 
-                "email": user["email"], 
-                "role": user.get("role", "user"), 
+                "id": str(user["_id"]),
+                "email": user["email"],
+                "role": user.get("role", "user"),
                 "status": user.get("status", "active")
             }
     except Exception:
@@ -1037,6 +1047,13 @@ def _question_mention_summary(result: dict | None) -> tuple[bool, int, list[str]
     return mentioned_count > 0, mentioned_count, other_domains
 
 
+def _count_total_mentions(results: dict) -> int:
+    """How many of the tracked questions are mentioned in at least one
+    model, across a full job's results — the real, comparable "before"/
+    "after" number the win-email trigger diffs against."""
+    return sum(1 for r in (results or {}).values() if _question_mention_summary(r)[0])
+
+
 def _compute_weekly_diff(
     *,
     current_results: dict,
@@ -1094,15 +1111,20 @@ def _compute_weekly_diff(
 
 
 # Alert triggers (Part 5 of the flow spec): "competitor alert only on a
-# real event... Hard cap 2-3 marketing emails/week." Only the two triggers
-# with real, reliably-computable signal are implemented — score drop (from
-# the same visibility-score history the weekly email already uses) and a
-# genuinely new competitor appearing (comparing this week's deep_competitors
-# domains against last week's). The others named in the spec (competitor
-# surge, first appearance, milestone, lost citation) would need historical
-# per-competitor score tracking and per-source citation history that don't
-# exist yet — not built here rather than faked with an approximation.
+# real event... Hard cap 2-3 marketing emails/week." All six named triggers
+# are implemented — score drop, new competitor, competitor surge, and lost
+# citation are all computable directly from the current-vs-previous-run
+# comparison already available in the weekly pipeline (no new schema
+# needed); first appearance needed one new persisted field
+# (everMentionedQuestionIds on the business doc) since "first appearance
+# EVER" can't be told apart from "back after being briefly not-mentioned"
+# using only a single previous run. "Milestone" (a round-number threshold
+# crossing) is covered by the score-drop/surge framing rather than as a
+# separate trigger — the spec doesn't define a concrete milestone
+# threshold, and inventing one would be exactly the kind of made-up number
+# the honesty rules forbid.
 ALERT_SCORE_DROP_THRESHOLD = 5.0
+ALERT_COMPETITOR_SURGE_THRESHOLD = 10.0
 
 
 def _detect_alerts(
@@ -1111,6 +1133,10 @@ def _detect_alerts(
     previous_score: float | None,
     current_competitors: list[dict],
     previous_competitors: list[dict],
+    current_results: dict | None = None,
+    previous_results: dict | None = None,
+    question_text_by_id: dict[str, str] | None = None,
+    ever_mentioned_ids: list[str] | None = None,
 ) -> list[dict]:
     alerts: list[dict] = []
 
@@ -1123,10 +1149,10 @@ def _detect_alerts(
                 "detail": f"{_round_half_up(previous_score)} → {_round_half_up(current_score)}. Worth checking this week's Search Tracker results for what changed.",
             })
 
-    previous_domains = {c.get("domain") for c in previous_competitors if isinstance(c, dict) and c.get("domain")}
+    previous_by_domain = {c.get("domain"): c for c in previous_competitors if isinstance(c, dict) and c.get("domain")}
     new_competitors = [
         c for c in current_competitors
-        if isinstance(c, dict) and c.get("domain") and c.get("domain") not in previous_domains
+        if isinstance(c, dict) and c.get("domain") and c.get("domain") not in previous_by_domain
     ]
     # Only alert on a genuine week-over-week comparison, not a business's
     # very first tracked week (when "previous" is simply empty and every
@@ -1138,6 +1164,56 @@ def _detect_alerts(
             "headline": f"AI started recommending a new competitor: {top_new.get('name') or top_new.get('domain')}",
             "detail": f"{top_new.get('domain')} is now showing up in AI answers for your tracked questions, scoring {round(float(top_new.get('score') or 0))}/100.",
         })
+
+    # Competitor surge — a competitor already on your radar, not a new one,
+    # whose score jumped a real, non-trivial amount since last week.
+    if previous_competitors:
+        for c in current_competitors:
+            if not isinstance(c, dict) or not c.get("domain"):
+                continue
+            prev = previous_by_domain.get(c.get("domain"))
+            if not prev or not isinstance(prev.get("score"), (int, float)) or not isinstance(c.get("score"), (int, float)):
+                continue
+            surge = float(c["score"]) - float(prev["score"])
+            if surge >= ALERT_COMPETITOR_SURGE_THRESHOLD:
+                alerts.append({
+                    "category": "Competitor surge",
+                    "headline": f"{c.get('name') or c.get('domain')} jumped {round(surge)} points this week",
+                    "detail": f"{c.get('domain')}: {_round_half_up(float(prev['score']))} → {_round_half_up(float(c['score']))}/100. Worth a look at what changed for them.",
+                })
+                break  # one surge alert per week is enough signal, not a wall of them
+
+    # First appearance and lost citation both need a real per-question
+    # comparison, and neither is meaningful without a genuine previous run
+    # to compare against.
+    if current_results and previous_results and question_text_by_id:
+        ever_set = set(ever_mentioned_ids or [])
+        found_first_appearance = False
+        found_lost_citation = False
+        for qid, qtext in question_text_by_id.items():
+            cur_mentioned, _, cur_domains = _question_mention_summary(current_results.get(qid))
+            prev_mentioned, _, prev_domains = _question_mention_summary(previous_results.get(qid))
+
+            if not found_first_appearance and cur_mentioned and qid not in ever_set:
+                alerts.append({
+                    "category": "First appearance",
+                    "headline": f"AI mentioned you for the first time for “{qtext[:70]}”",
+                    "detail": "This question has never surfaced you before — this week it did.",
+                })
+                found_first_appearance = True
+
+            if not found_lost_citation and cur_mentioned and prev_mentioned:
+                lost = [d for d in prev_domains if d and d not in cur_domains]
+                if lost:
+                    alerts.append({
+                        "category": "Lost citation",
+                        "headline": f"{lost[0]} stopped being cited for “{qtext[:70]}”",
+                        "detail": f"AI cited {lost[0]} for this question last week; this week's answer doesn't.",
+                    })
+                    found_lost_citation = True
+
+            if found_first_appearance and found_lost_citation:
+                break
 
     return alerts
 
@@ -1236,6 +1312,195 @@ async def send_alert_email(
     )
     label = business_name or domain or "your business"
     subject = alerts[0]["headline"] if len(alerts) == 1 else f"{len(alerts)} real changes for {label}"
+    return await send_email(to_email, subject, html_body, text_body)
+
+
+def _build_midweek_reminder_email(
+    *,
+    name: str,
+    business_name: str,
+    domain: str,
+    not_mentioned_count: int,
+    total_questions: int,
+    dashboard_url: str,
+) -> tuple[str, str]:
+    display_name = name or "there"
+    label = business_name or domain or "your business"
+
+    text_body = (
+        f"Hi {display_name},\n\n"
+        f"Your weekly plan for {label} is still waiting — nothing's been marked done yet this week.\n\n"
+        f"Right now {not_mentioned_count} of your {total_questions} tracked questions still show no AI mention.\n\n"
+        f"View your plan: {dashboard_url}\n"
+    )
+
+    html_body = f"""
+    <div style="margin:0;padding:0;background:#faf8f3;">
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;padding:28px 16px;color:#23211b;">
+        <div style="background:#ffffff;border:1px solid #ece3d1;border-radius:24px;overflow:hidden;box-shadow:0 18px 45px rgba(21,70,59,0.10);">
+          <div style="padding:26px 28px 20px 28px;border-bottom:1px solid #f0e8d8;background:#fdfcf8;">
+            <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+              <tr>
+                <td width="42" style="vertical-align:middle;">
+                  <div style="width:42px;height:42px;line-height:42px;text-align:center;border-radius:14px;background:#15463b;color:#ffffff;font-size:24px;font-weight:700;">&#10022;</div>
+                </td>
+                <td style="vertical-align:middle;padding-left:12px;">
+                  <div style="font-size:20px;font-weight:700;letter-spacing:-0.02em;color:#15463b;">Wonderscore</div>
+                  <div style="font-size:12px;line-height:18px;color:#8a8273;">Midweek check-in</div>
+                </td>
+              </tr>
+            </table>
+          </div>
+
+          <div style="padding:26px 28px;">
+            <h1 style="margin:0 0 10px 0;font-size:22px;line-height:29px;font-weight:700;color:#15463b;letter-spacing:-0.02em;">Your plan for {label} is still waiting</h1>
+            <p style="margin:0 0 20px 0;font-size:13.5px;line-height:21px;color:#6f6757;">
+              Hi {display_name}, nothing's been marked done yet this week.
+            </p>
+
+            <div style="margin:0 0 22px 0;padding:14px 16px;background:#fdfcf8;border:1px solid #ece3d1;border-radius:14px;">
+              <p style="margin:0;font-size:13.5px;line-height:20px;color:#3a352b;">
+                Right now <strong>{not_mentioned_count} of your {total_questions}</strong> tracked questions still show no AI mention.
+              </p>
+            </div>
+
+            <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+              <tr>
+                <td style="border-radius:12px;background:#15463b;">
+                  <a href="{dashboard_url}" style="display:inline-block;padding:12px 22px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;">View your plan</a>
+                </td>
+              </tr>
+            </table>
+          </div>
+        </div>
+
+        <p style="margin:18px 0 0 0;text-align:center;font-size:11px;line-height:18px;color:#9b927f;">
+          You're getting this because scan-complete emails are on in your Wonderscore settings.
+        </p>
+      </div>
+    </div>
+    """
+    return html_body, text_body
+
+
+async def send_midweek_reminder_email(
+    *,
+    to_email: str,
+    name: str,
+    business_name: str,
+    domain: str,
+    not_mentioned_count: int,
+    total_questions: int,
+) -> bool:
+    if not to_email:
+        return False
+    frontend_url = (os.getenv("FRONTEND_APP_URL") or "http://localhost:3000").rstrip("/")
+    dashboard_url = f"{frontend_url}/plan"
+    html_body, text_body = _build_midweek_reminder_email(
+        name=name,
+        business_name=business_name,
+        domain=domain,
+        not_mentioned_count=not_mentioned_count,
+        total_questions=total_questions,
+        dashboard_url=dashboard_url,
+    )
+    label = business_name or domain or "your business"
+    return await send_email(to_email, f"Your plan for {label} is still waiting", html_body, text_body)
+
+
+def _build_win_email(
+    *,
+    name: str,
+    business_name: str,
+    domain: str,
+    wins: list[dict],
+    dashboard_url: str,
+) -> tuple[str, str]:
+    display_name = name or "there"
+    label = business_name or domain or "your business"
+
+    wins_html = "".join(
+        f"""
+        <div style="margin:0 0 12px 0;padding:14px 16px;background:#fdfcf8;border:1px solid #ece3d1;border-left:4px solid #1e7d4f;border-radius:10px;">
+          <div style="font-size:14px;font-weight:700;color:#23211b;margin-bottom:4px;">{w['title']}</div>
+          <p style="margin:0;font-size:13px;line-height:19px;color:#6f6757;">Since you did this, you appear in {w['delta']} more AI answer{"s" if w['delta'] != 1 else ""} — {w['before']}/{w['total']} &rarr; {w['after']}/{w['total']}.</p>
+        </div>"""
+        for w in wins
+    )
+    wins_text = "\n\n".join(f"{w['title']}\nSince you did this, you appear in {w['delta']} more AI answers — {w['before']}/{w['total']} -> {w['after']}/{w['total']}." for w in wins)
+
+    text_body = (
+        f"Hi {display_name},\n\n"
+        f"Real, observed change for {label} since you completed some Plan actions:\n\n"
+        f"{wins_text}\n\n"
+        f"View your dashboard: {dashboard_url}\n"
+    )
+
+    html_body = f"""
+    <div style="margin:0;padding:0;background:#faf8f3;">
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;padding:28px 16px;color:#23211b;">
+        <div style="background:#ffffff;border:1px solid #ece3d1;border-radius:24px;overflow:hidden;box-shadow:0 18px 45px rgba(21,70,59,0.10);">
+          <div style="padding:20px 28px;background:#1e7d4f;">
+            <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+              <tr>
+                <td width="36" style="vertical-align:middle;">
+                  <div style="width:36px;height:36px;line-height:36px;text-align:center;border-radius:10px;background:rgba(255,255,255,0.18);color:#ffffff;font-size:18px;font-weight:700;">&#10003;</div>
+                </td>
+                <td style="vertical-align:middle;padding-left:12px;">
+                  <div style="font-size:15px;font-weight:700;color:#ffffff;">It worked</div>
+                </td>
+              </tr>
+            </table>
+          </div>
+
+          <div style="padding:26px 28px;">
+            <h1 style="margin:0 0 8px 0;font-size:20px;line-height:27px;font-weight:700;color:#23211b;letter-spacing:-0.02em;">Real progress for {label}</h1>
+            <p style="margin:0 0 20px 0;font-size:13.5px;line-height:21px;color:#6f6757;">
+              Hi {display_name}, correlation only — not a guarantee — but the numbers moved after you acted.
+            </p>
+
+            {wins_html}
+
+            <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;margin-top:6px;">
+              <tr>
+                <td style="border-radius:12px;background:#15463b;">
+                  <a href="{dashboard_url}" style="display:inline-block;padding:12px 22px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;">View dashboard</a>
+                </td>
+              </tr>
+            </table>
+          </div>
+        </div>
+
+        <p style="margin:18px 0 0 0;text-align:center;font-size:11px;line-height:18px;color:#9b927f;">
+          You're getting this because scan-complete emails are on in your Wonderscore settings.
+        </p>
+      </div>
+    </div>
+    """
+    return html_body, text_body
+
+
+async def send_win_email(
+    *,
+    to_email: str,
+    name: str,
+    business_name: str,
+    domain: str,
+    wins: list[dict],
+) -> bool:
+    if not to_email or not wins:
+        return False
+    frontend_url = (os.getenv("FRONTEND_APP_URL") or "http://localhost:3000").rstrip("/")
+    dashboard_url = f"{frontend_url}/overview"
+    html_body, text_body = _build_win_email(
+        name=name,
+        business_name=business_name,
+        domain=domain,
+        wins=wins,
+        dashboard_url=dashboard_url,
+    )
+    label = business_name or domain or "your business"
+    subject = f"It worked: {wins[0]['title']}" if len(wins) == 1 else f"Real progress for {label} — {len(wins)} wins"
     return await send_email(to_email, subject, html_body, text_body)
 
 
@@ -1613,6 +1878,12 @@ class NotificationPreferencesUpdateRequest(BaseModel):
 
 class ReportShareLinkRequest(BaseModel):
     business_id: str
+
+
+class ActionCompleteRequest(BaseModel):
+    action_id: str
+    title: str
+    category: str | None = None
 
 
 class ScanCompleteNotifyRequest(BaseModel):

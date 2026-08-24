@@ -520,6 +520,124 @@ async def api_user_business_lock_questions(
     return public
 
 
+@app.post("/api/user/businesses/{business_id}/actions/complete")
+async def api_business_action_complete(
+    business_id: str,
+    request: ActionCompleteRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Real server-side persistence for Plan's "Mark as done" — previously
+    100% localStorage, so the server had no idea what was actually done,
+    which is what blocked both the mid-week reminder ("only if tasks are
+    undone") and the win email ("since you did X, you appear in N more
+    answers") from ever being buildable honestly. Records a real baseline
+    (today's real mention count) so a later real diff can prove a win
+    instead of guessing one."""
+    if businesses_col is None:
+        raise HTTPException(status_code=503, detail="business storage unavailable")
+    try:
+        oid = ObjectId(business_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid business ID format")
+
+    biz_doc = await businesses_col.find_one({"_id": oid, "user_id": current_user["id"]})
+    if not biz_doc:
+        raise HTTPException(status_code=404, detail="Business not found")
+
+    existing_actions = biz_doc.get("completedActions") if isinstance(biz_doc.get("completedActions"), list) else []
+    if any(a.get("action_id") == request.action_id for a in existing_actions if isinstance(a, dict)):
+        return {"success": True, "alreadyMarked": True}
+
+    baseline_mentions = None
+    if phase5_jobs_col is not None:
+        latest_job = await phase5_jobs_col.find_one(
+            {"business_id": business_id, "job_type": "core", "model": "multi", "status": "completed"},
+            sort=[("created_at", -1)],
+        )
+        if latest_job:
+            baseline_mentions = _count_total_mentions(latest_job.get("results") or {})
+
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    entry = {
+        "action_id": request.action_id,
+        "title": request.title,
+        "category": request.category or "",
+        "completed_at": now_iso,
+        "week_id": _blog_week_id(datetime.now()),
+        "baseline_mentions": baseline_mentions,
+        "reported_win": False,
+    }
+    existing_actions.append(entry)
+    if len(existing_actions) > 100:
+        existing_actions = existing_actions[-100:]
+
+    await businesses_col.update_one({"_id": oid}, {"$set": {"completedActions": existing_actions}})
+    return {"success": True, "alreadyMarked": False}
+
+
+@app.post("/api/user/businesses/{business_id}/run-now")
+async def api_user_business_run_now(
+    business_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Part 5 of the flow spec: "No manual runs required (a 'run now'
+    exists for the impatient)." Runs the exact same pipeline the Sunday
+    scheduler runs for this one business (Phase 1 re-crawl, weekly blogs,
+    and — if locked — the full Search Tracker re-run across all 4 models),
+    then stamps it so this counts as the week's run (no separate Sunday
+    duplicate). Rate-limited to once per day since each run is real AI
+    spend, not a free refresh."""
+    if businesses_col is None:
+        raise HTTPException(status_code=503, detail="business storage unavailable")
+    try:
+        oid = ObjectId(business_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid business ID format")
+
+    biz_doc = await businesses_col.find_one({"_id": oid, "user_id": current_user["id"]})
+    if not biz_doc:
+        raise HTTPException(status_code=404, detail="Business not found")
+
+    last_run_now_at = biz_doc.get("last_run_now_at")
+    if last_run_now_at:
+        try:
+            last_dt = datetime.fromisoformat(str(last_run_now_at).rstrip("Z"))
+            elapsed = (datetime.utcnow() - last_dt).total_seconds()
+            if elapsed < 86400:
+                next_available = last_dt + timedelta(seconds=86400)
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "message": "You can run this once per day. Try again later.",
+                        "nextAvailableAt": next_available.isoformat() + "Z",
+                    },
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    await businesses_col.update_one({"_id": oid}, {"$set": {"last_run_now_at": now_iso}})
+
+    # Fire-and-forget: a real run takes a few minutes (live AI calls across
+    # up to 4 models), so this returns immediately rather than holding the
+    # request open. The frontend polls /api/phase5/latest-job the same way
+    # it already does after a live Search Tracker run.
+    # Same clock the scheduler itself uses for this computation
+    # (datetime.now(), not utcnow()) — using a different one here risked
+    # computing a different week_id than the scheduler would, which could
+    # make the two disagree about whether this week is "done".
+    week_id = _blog_week_id(datetime.now())
+    asyncio.create_task(_run_weekly_business_pipeline(biz_doc, week_id))
+
+    return {
+        "success": True,
+        "started": True,
+        "message": "Your update is running now — this can take a few minutes.",
+    }
+
+
 @app.delete("/api/user/businesses/{business_id}")
 async def api_user_business_delete(
     business_id: str,

@@ -66,6 +66,101 @@ def seconds_until_next_sunday_4am() -> float:
     return max(1.0, diff.total_seconds())
 
 
+def seconds_until_next_wednesday_10am() -> float:
+    now = datetime.now()
+    days_until_wed = (2 - now.weekday()) % 7  # Wednesday = weekday 2
+    if days_until_wed == 0 and now.hour >= 10:
+        days_until_wed = 7
+    target = datetime(now.year, now.month, now.day, 10, 0, 0, 0) + timedelta(days=days_until_wed)
+    diff = target - now
+    return max(1.0, diff.total_seconds())
+
+
+async def _run_midweek_reminder_pass():
+    """Part 5 of the flow spec: "a mid-week reminder only if tasks are
+    undone and they're inactive." Both conditions are checked against real
+    data: completedActions this week_id (server-tracked, not the old
+    localStorage-only state) and users_col.last_active_at (stamped on every
+    authenticated request). Never nags a business with real progress this
+    week or a user who's actively in the dashboard regardless."""
+    if businesses_col is None:
+        return
+    cursor = businesses_col.find({"questionsLocked": True})
+    businesses = await cursor.to_list(length=10000)
+    week_id = _blog_week_id(datetime.now())
+    for biz_doc in businesses:
+        try:
+            user_id = biz_doc.get("user_id")
+            if not user_id:
+                continue
+
+            completed_this_week = [
+                a for a in (biz_doc.get("completedActions") or [])
+                if isinstance(a, dict) and a.get("week_id") == week_id
+            ]
+            if completed_this_week:
+                continue
+
+            user_doc = await users_col.find_one({"_id": ObjectId(user_id)}) if users_col is not None else None
+            if not user_doc or not user_doc.get("notify_scan_complete", True):
+                continue
+
+            last_active_at = user_doc.get("last_active_at")
+            is_inactive = True
+            if last_active_at:
+                try:
+                    last_dt = datetime.fromisoformat(str(last_active_at).rstrip("Z"))
+                    is_inactive = (datetime.utcnow() - last_dt).total_seconds() >= 3 * 86400
+                except Exception:
+                    is_inactive = True
+            if not is_inactive:
+                continue
+
+            latest_job = None
+            if phase5_jobs_col is not None:
+                latest_job = await phase5_jobs_col.find_one(
+                    {"business_id": str(biz_doc.get("_id")), "job_type": "core", "model": "multi", "status": "completed"},
+                    sort=[("created_at", -1)],
+                )
+            if not latest_job:
+                continue
+            results = latest_job.get("results") or {}
+            total_questions = len(results)
+            if total_questions == 0:
+                continue
+            mentioned = _count_total_mentions(results)
+            not_mentioned = total_questions - mentioned
+            if not_mentioned <= 0:
+                continue
+
+            sent = await send_midweek_reminder_email(
+                to_email=user_doc.get("email", ""),
+                name=user_doc.get("name", ""),
+                business_name=biz_doc.get("businessName") or "",
+                domain=_normalize_site(biz_doc.get("url") or ""),
+                not_mentioned_count=not_mentioned,
+                total_questions=total_questions,
+            )
+            print(f"[Scheduler] Midweek reminder for {biz_doc.get('url')}: {'sent' if sent else 'not sent (SMTP unavailable)'}")
+        except Exception as e:
+            print(f"[Scheduler] Midweek reminder failed for business {biz_doc.get('_id')}: {e}")
+
+
+async def wednesday_reminder_scheduler():
+    print("[Scheduler] Midweek reminder task started")
+    await asyncio.sleep(20)
+    while True:
+        sleep_sec = seconds_until_next_wednesday_10am()
+        hours_val = round(sleep_sec / 3600.0, 2)
+        print(f"[Scheduler] Sleeping for {sleep_sec} seconds (approx {hours_val} hours) until next Wednesday 10:00 AM")
+        await asyncio.sleep(sleep_sec)
+        print("[Scheduler] It is Wednesday 10:00 AM. Running midweek reminder pass...")
+        try:
+            await _run_midweek_reminder_pass()
+        except Exception as e:
+            print(f"[Scheduler] Midweek reminder pass failed: {e}")
+
+
 async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str) -> None:
     """One business's full weekly pipeline: Phase 1 re-crawl, scan-complete
     email, weekly blogs, and (if it has a locked baseline) the Search
@@ -254,12 +349,35 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str) -> None:
                                 # (well under the spec's 2-3/week cap) rather
                                 # than firing every run.
                                 try:
+                                    ever_mentioned_ids = biz_doc.get("everMentionedQuestionIds") if isinstance(biz_doc.get("everMentionedQuestionIds"), list) else []
                                     alerts = _detect_alerts(
                                         current_score=float(current_score),
                                         previous_score=float(previous_score) if isinstance(previous_score, (int, float)) else None,
                                         current_competitors=deep_competitors,
                                         previous_competitors=(previous_tracker_job or {}).get("deep_competitors") or [],
+                                        current_results=current_results,
+                                        previous_results=previous_results,
+                                        question_text_by_id=question_text_by_id,
+                                        ever_mentioned_ids=ever_mentioned_ids,
                                     )
+
+                                    # Update the "ever mentioned" record with
+                                    # this run's real mentions — the only
+                                    # source "first appearance" can ever
+                                    # check against, so it has to stay
+                                    # current regardless of whether an alert
+                                    # actually fired this week.
+                                    newly_mentioned_ids = {
+                                        qid for qid in question_text_by_id
+                                        if _question_mention_summary(current_results.get(qid))[0]
+                                    }
+                                    updated_ever_ids = sorted(set(ever_mentioned_ids) | newly_mentioned_ids)
+                                    if updated_ever_ids != sorted(ever_mentioned_ids):
+                                        await businesses_col.update_one(
+                                            {"_id": biz_doc["_id"]},
+                                            {"$set": {"everMentionedQuestionIds": updated_ever_ids}},
+                                        )
+
                                     if alerts:
                                         alert_user_doc = await users_col.find_one({"_id": ObjectId(user_id)}) if users_col is not None else None
                                         if alert_user_doc and alert_user_doc.get("notify_scan_complete", True):
@@ -273,6 +391,53 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str) -> None:
                                             print(f"[Scheduler] Alert email for {url}: {'sent' if alert_sent else 'not sent (SMTP unavailable)'} ({len(alerts)} alert(s))")
                                 except Exception as alert_err:
                                     print(f"[Scheduler] Alert detection/send failed for {url}: {alert_err}")
+
+                                # Win email: real before/after diff against
+                                # each completed action's own baseline
+                                # (recorded the moment it was marked done),
+                                # never a guessed or predicted number —
+                                # "observed since you did X" per the spec's
+                                # honesty rules, correlation only.
+                                try:
+                                    completed_actions = biz_doc.get("completedActions") or []
+                                    current_mentions = _count_total_mentions(current_results)
+                                    win_items: list[dict] = []
+                                    actions_changed = False
+                                    for act in completed_actions:
+                                        if not isinstance(act, dict) or act.get("reported_win"):
+                                            continue
+                                        baseline = act.get("baseline_mentions")
+                                        if not isinstance(baseline, (int, float)):
+                                            continue
+                                        delta = current_mentions - int(baseline)
+                                        if delta > 0:
+                                            win_items.append({
+                                                "title": act.get("title") or "Your action",
+                                                "before": int(baseline),
+                                                "after": current_mentions,
+                                                "total": len(current_results),
+                                                "delta": delta,
+                                            })
+                                            act["reported_win"] = True
+                                            actions_changed = True
+                                    if actions_changed:
+                                        await businesses_col.update_one(
+                                            {"_id": biz_doc["_id"]},
+                                            {"$set": {"completedActions": completed_actions}},
+                                        )
+                                    if win_items:
+                                        win_user_doc = await users_col.find_one({"_id": ObjectId(user_id)}) if users_col is not None else None
+                                        if win_user_doc and win_user_doc.get("notify_scan_complete", True):
+                                            win_sent = await send_win_email(
+                                                to_email=win_user_doc.get("email", "") or biz_doc.get("user_email") or "",
+                                                name=win_user_doc.get("name", ""),
+                                                business_name=biz_doc.get("businessName") or "",
+                                                domain=target_domain,
+                                                wins=win_items,
+                                            )
+                                            print(f"[Scheduler] Win email for {url}: {'sent' if win_sent else 'not sent (SMTP unavailable)'} ({len(win_items)} win(s))")
+                                except Exception as win_err:
+                                    print(f"[Scheduler] Win detection/send failed for {url}: {win_err}")
                     except Exception as weekly_email_err:
                         print(f"[Scheduler] Weekly Search Tracker data build failed for {url}: {weekly_email_err}")
             except Exception as tracker_err:
@@ -378,6 +543,7 @@ async def sunday_analyzer_scheduler():
 @app.on_event("startup")
 async def _phase5_worker_startup():
     asyncio.create_task(sunday_analyzer_scheduler())
+    asyncio.create_task(wednesday_reminder_scheduler())
 
     if phase5_jobs_col is None:
         app.state.phase5_worker_tasks = []
