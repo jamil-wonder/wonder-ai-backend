@@ -12,6 +12,8 @@ RUN playwright install chromium
 
 # Copy application
 COPY . .
+RUN chmod +x entrypoint.sh
 
-# Run with gunicorn
-CMD ["gunicorn", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "main:app", "--bind", "0.0.0.0:10000", "--timeout", "120"]
+# ROLE=web (default) runs gunicorn; ROLE=worker runs the background job
+# process instead. See docker-compose.yml.
+CMD ["./entrypoint.sh"]

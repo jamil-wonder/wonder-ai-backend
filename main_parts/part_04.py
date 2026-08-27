@@ -620,16 +620,29 @@ async def api_user_business_run_now(
     now_iso = datetime.utcnow().isoformat() + "Z"
     await businesses_col.update_one({"_id": oid}, {"$set": {"last_run_now_at": now_iso}})
 
-    # Fire-and-forget: a real run takes a few minutes (live AI calls across
-    # up to 4 models), so this returns immediately rather than holding the
-    # request open. The frontend polls /api/phase5/latest-job the same way
-    # it already does after a live Search Tracker run.
+    # Enqueued for the separate worker process instead of run inline here —
+    # running this (a real AI job, up to ~1hr) in the web process is exactly
+    # the pattern docs/infra-diagnosis.html flagged: a web redeploy could
+    # kill it mid-run. `_manual_run_worker_loop` in part_10.py (worker
+    # process only) polls and claims this the same way the Phase5 queue
+    # does. The frontend polls /api/phase5/latest-job the same way it
+    # already does after a live Search Tracker run, so it doesn't need to
+    # know this now runs out-of-process.
     # Same clock the scheduler itself uses for this computation
     # (datetime.now(), not utcnow()) — using a different one here risked
     # computing a different week_id than the scheduler would, which could
     # make the two disagree about whether this week is "done".
     week_id = _blog_week_id(datetime.now())
-    asyncio.create_task(_run_weekly_business_pipeline(biz_doc, week_id))
+    if manual_run_requests_col is not None:
+        await manual_run_requests_col.insert_one({
+            "business_id": business_id,
+            "week_id": week_id,
+            "status": "queued",
+            "worker_id": None,
+            "error": None,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        })
 
     return {
         "success": True,

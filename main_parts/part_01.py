@@ -168,6 +168,13 @@ PHASE5_RESUME_QUEUED_ON_STARTUP = str(os.getenv("PHASE5_RESUME_QUEUED_ON_STARTUP
 PHASE5_WORKER_ID = f"{os.getenv('HOSTNAME', 'local')}-{uuid.uuid4().hex[:8]}"
 PHASE5_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
+# "web" (default) serves the FastAPI app only; "worker" runs the background
+# schedulers/job loops with no HTTP server. Same image, same env, split by
+# this one var — see backend/entrypoint.sh and backend/worker.py. Moving
+# background jobs off the web process is what stops a web-tier redeploy
+# from killing an in-flight job (docs/infra-diagnosis.html).
+ROLE = os.getenv("ROLE", "web").strip().lower()
+
 default_allowed_origins = [
     "https://wonderscore.ai",
     "https://www.wonderscore.ai",
@@ -205,6 +212,7 @@ google_integrations_col = None
 analytics_snapshots_col = None
 email_verifications_col = None
 public_scan_leads_col = None
+manual_run_requests_col = None
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
     db = mongo_client.get_database("wonderai")
@@ -224,6 +232,7 @@ try:
     public_rate_limits_col = db.get_collection("public_rate_limits")
     email_verifications_col = db.get_collection("email_verifications")
     public_scan_leads_col = db.get_collection("public_scan_leads")
+    manual_run_requests_col = db.get_collection("manual_run_requests")
 except Exception as e:
     print(f"[API] Error connecting to MongoDB: {type(e).__name__}")
 
@@ -307,7 +316,14 @@ async def get_current_user_optional(token: str = Depends(oauth2_scheme)):
             # and-forget so it never adds latency to the request that
             # triggered it. Cheap: one field, one write, only on actual
             # authenticated calls.
-            asyncio.create_task(
+            # ensure_future (not create_task) because under Gunicorn's
+            # UvicornWorker, Motor's update_one() here returns a Future
+            # rather than a plain coroutine — create_task rejects that with
+            # "a coroutine was expected", which this whole function's bare
+            # except then silently swallowed, making every valid token look
+            # invalid (every authenticated request 401'd). ensure_future
+            # accepts both coroutines and Future-likes.
+            asyncio.ensure_future(
                 users_col.update_one(
                     {"_id": user["_id"]},
                     {"$set": {"last_active_at": datetime.utcnow().isoformat() + "Z"}},

@@ -1,4 +1,64 @@
 # Generated from the former backend/main.py lines 3825-4190.
+import signal
+
+
+async def _manual_run_worker_loop():
+    """Same atomic-claim shape as `_phase5_worker_loop`, but for "Run now"
+    requests queued by the API (see part_04.py) instead of run inline in the
+    web process. Only started by `run_worker()` in the worker process."""
+    while True:
+        try:
+            if manual_run_requests_col is None:
+                await asyncio.sleep(PHASE5_WORKER_POLL_INTERVAL)
+                continue
+            claimed = await manual_run_requests_col.find_one_and_update(
+                {"status": "queued"},
+                {
+                    "$set": {
+                        "status": "running",
+                        "worker_id": PHASE5_WORKER_ID,
+                        "updated_at": datetime.utcnow().isoformat(),
+                    }
+                },
+                sort=[("created_at", 1)],
+                return_document=ReturnDocument.AFTER,
+            )
+
+            if not claimed:
+                await asyncio.sleep(PHASE5_WORKER_POLL_INTERVAL)
+                continue
+
+            business_id = claimed.get("business_id")
+            week_id = claimed.get("week_id")
+            result_status = "completed"
+            error = None
+            try:
+                biz_doc = await businesses_col.find_one({"_id": ObjectId(business_id)}) if businesses_col is not None else None
+                if not biz_doc:
+                    raise RuntimeError(f"business {business_id} not found")
+                await _run_weekly_business_pipeline(biz_doc, week_id)
+            except Exception as run_err:
+                result_status = "failed"
+                error = str(run_err)
+                print(f"[Worker] manual run failed for business={business_id}: {run_err}")
+
+            await manual_run_requests_col.update_one(
+                {"_id": claimed["_id"]},
+                {
+                    "$set": {
+                        "status": result_status,
+                        "error": error,
+                        "updated_at": datetime.utcnow().isoformat(),
+                    }
+                },
+            )
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            traceback.print_exc()
+            await asyncio.sleep(PHASE5_WORKER_POLL_INTERVAL)
+
+
 async def _phase5_worker_loop():
     while True:
         try:
@@ -25,30 +85,6 @@ async def _phase5_worker_loop():
         except Exception:
             traceback.print_exc()
             await asyncio.sleep(PHASE5_WORKER_POLL_INTERVAL)
-
-
-async def _phase5_try_start_immediately(job_id: str) -> None:
-    """Try to claim a newly queued job right away and process in background."""
-    if phase5_jobs_col is None:
-        return
-    try:
-        claimed = await phase5_jobs_col.find_one_and_update(
-            {"job_id": job_id, "status": "queued"},
-            {
-                "$set": {
-                    "status": "running",
-                    "worker_id": PHASE5_WORKER_ID,
-                    "updated_at": datetime.utcnow().isoformat(),
-                }
-            },
-            return_document=ReturnDocument.AFTER,
-        )
-        if not claimed:
-            return
-        print(f"[Phase5] immediate start job_id={job_id} provider={claimed.get('model')}")
-        asyncio.create_task(_process_phase5_job(claimed))
-    except Exception:
-        traceback.print_exc()
 
 
 def seconds_until_next_sunday_4am() -> float:
@@ -540,20 +576,12 @@ async def sunday_analyzer_scheduler():
             print(f"[Scheduler] Exception in weekly pass: {run_err}")
 
 
-@app.on_event("startup")
-async def _phase5_worker_startup():
-    asyncio.create_task(sunday_analyzer_scheduler())
-    asyncio.create_task(wednesday_reminder_scheduler())
-
+async def _ensure_phase5_indexes():
+    """Indexes tuned to current Phase 5 query/update patterns. Idempotent,
+    so it's safe to run from both the web process (on every startup) and
+    the worker process — whichever container comes up first creates them."""
     if phase5_jobs_col is None:
-        app.state.phase5_worker_tasks = []
         return
-
-    loop = asyncio.get_running_loop()
-    app.state.phase5_executor = ThreadPoolExecutor(max_workers=max(4, PHASE5_MODEL_MAX_THREADS))
-    loop.set_default_executor(app.state.phase5_executor)
-
-    # Indexes tuned to current Phase 5 query/update patterns.
     try:
         # Direct lookups
         await phase5_jobs_col.create_index("job_id", unique=True)
@@ -628,8 +656,26 @@ async def _phase5_worker_startup():
         print("[Phase5] warning: index creation failed; continuing without blocking startup")
         traceback.print_exc()
 
+
+@app.on_event("startup")
+async def _phase5_worker_startup():
+    """Runs in the web (`api`) process only. Background schedulers, the
+    Phase5/manual-run poll loops, and the startup recovery passes now live
+    in `run_worker()` (backend/worker.py) instead — see
+    docs/infra-diagnosis.html for why a web-process redeploy used to kill
+    in-flight jobs. This hook just ensures indexes exist, which is cheap
+    and safe to run from either process."""
+    await _ensure_phase5_indexes()
+
+
+async def _phase5_startup_recovery():
+    """The stale-job recovery passes that used to run on every web-process
+    startup. Now only run from `run_worker()`, since only the worker
+    process owns in-flight job state."""
     # Cost-safety default: do not auto-resume previously queued/in-progress jobs after restart
     # unless explicitly enabled via env.
+    if phase5_jobs_col is None:
+        return
     if not PHASE5_RESUME_QUEUED_ON_STARTUP:
         try:
             startup_failed = await phase5_jobs_col.update_many(
@@ -720,6 +766,25 @@ async def _phase5_worker_startup():
     except Exception:
         traceback.print_exc()
 
+async def run_worker():
+    """Entrypoint for the `worker` process (backend/worker.py, ROLE=worker).
+    Owns everything that used to run inside the web process's FastAPI
+    startup/shutdown hooks: the Sunday/Wednesday schedulers, the Phase5 and
+    manual-run poll loops, the shared thread pool executor (Playwright
+    scrapes run via asyncio.to_thread), and the startup recovery passes over
+    in-flight jobs. Splitting this out means a web-tier deploy
+    (`docker compose up -d --build api`) never touches this process, so an
+    in-flight job survives a hotfix deploy — the incident in
+    docs/infra-diagnosis.html."""
+    print("[Worker] starting background worker process")
+    await _ensure_phase5_indexes()
+
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=max(4, PHASE5_MODEL_MAX_THREADS))
+    loop.set_default_executor(executor)
+
+    await _phase5_startup_recovery()
+
     print(
         f"[Phase5] startup workers={max(1, PHASE5_WORKER_CONCURRENCY)} "
         f"parallelism={PHASE5_JOB_PARALLELISM} gemini_enabled={PHASE5_ENABLE_GEMINI} "
@@ -732,15 +797,39 @@ async def _phase5_worker_startup():
         f"perplexity_model={(os.getenv('PERPLEXITY_MODEL_PHASE5') or 'sonar-pro').strip() or 'sonar-pro'} "
         f"anthropic_model={(os.getenv('ANTHROPIC_MODEL_PHASE5') or 'claude-sonnet-4-5').strip() or 'claude-sonnet-4-5'}"
     )
-    app.state.phase5_worker_tasks = [
-        asyncio.create_task(_phase5_worker_loop())
-        for _ in range(max(1, PHASE5_WORKER_CONCURRENCY))
+
+    tasks = [
+        asyncio.create_task(sunday_analyzer_scheduler()),
+        asyncio.create_task(wednesday_reminder_scheduler()),
+        asyncio.create_task(_manual_run_worker_loop()),
     ]
+    if phase5_jobs_col is not None:
+        tasks.extend(
+            asyncio.create_task(_phase5_worker_loop())
+            for _ in range(max(1, PHASE5_WORKER_CONCURRENCY))
+        )
 
+    stop_event = asyncio.Event()
 
-@app.on_event("shutdown")
-async def _phase5_worker_shutdown():
-    tasks = getattr(app.state, "phase5_worker_tasks", [])
+    def _handle_stop_signal(*_args):
+        print("[Worker] shutdown signal received")
+        stop_event.set()
+
+    for sig_name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, _handle_stop_signal)
+        except NotImplementedError:
+            # Windows dev environments don't support add_signal_handler;
+            # Ctrl+C still raises KeyboardInterrupt there, which is fine
+            # since this worker only runs in Docker/Linux in production.
+            pass
+
+    await stop_event.wait()
+
+    print("[Worker] shutting down: cancelling background tasks")
     for t in tasks:
         t.cancel()
     for t in tasks:
@@ -751,9 +840,9 @@ async def _phase5_worker_shutdown():
         except Exception:
             pass
 
-    executor = getattr(app.state, "phase5_executor", None)
-    if executor is not None:
-        try:
-            executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+    print("[Worker] shutdown complete")

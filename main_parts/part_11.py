@@ -45,13 +45,11 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
             f"[Phase5] queued job_id={job_id} provider={model_provider} "
             f"type=core questions={len(questions_dicts)}"
         )
-        # Atomically claim-and-start so this can't race the background
-        # worker loop, which also polls for "queued" jobs — a plain
-        # insert + separate update-to-running here was not atomic, so the
-        # worker loop could claim and start processing the same job in the
-        # gap between those two calls, causing duplicate AI calls and
-        # duplicate per-question writes.
-        asyncio.create_task(_phase5_try_start_immediately(job_id))
+        # No inline fast-start here: running the AI job in this (web)
+        # process is exactly what docs/infra-diagnosis.html flagged — a web
+        # redeploy could kill it mid-run. The separate worker process's
+        # `_phase5_worker_loop` polls every PHASE5_WORKER_POLL_INTERVAL
+        # (default 0.5s) and claims this job almost immediately.
 
         await _log_ai_usage_event({
             "feature": "phase5_job_started",
@@ -132,9 +130,8 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
             f"[Phase5] queued job_id={job_id} provider={model_provider} "
             f"type=deep questions={len(questions_dicts)}"
         )
-        # See the /api/phase5/start-job handler above for why this must be
-        # the atomic claim helper rather than insert + separate update.
-        asyncio.create_task(_phase5_try_start_immediately(job_id))
+        # See the /api/phase5/start-job handler above — no inline fast-start,
+        # the worker process's poll loop claims this job.
 
         await _log_ai_usage_event({
             "feature": "phase5_deep_job_started",
