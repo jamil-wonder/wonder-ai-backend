@@ -198,6 +198,8 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "trackedPages": doc.get("trackedPages") if isinstance(doc.get("trackedPages"), list) else [],
         "latest_phase1_score": doc.get("latest_phase1_score"),
         "latest_phase5_score": doc.get("latest_phase5_score"),
+        "latest_phase1_at": doc.get("latest_phase1_at"),
+        "latest_phase5_at": doc.get("latest_phase5_at"),
         "latest_weekly_blog_at": doc.get("latest_weekly_blog_at"),
         "last_manually_refreshed_at": doc.get("last_manually_refreshed_at"),
         "created_at": doc.get("created_at"),

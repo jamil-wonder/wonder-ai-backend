@@ -216,6 +216,8 @@ class BusinessResponse(BaseModel):
     trackedPages: List[str] = Field(default_factory=list)
     latest_phase1_score: Optional[int] = None
     latest_phase5_score: Optional[float] = None
+    latest_phase1_at: Optional[str] = None
+    latest_phase5_at: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     latest_scrape_result: Optional[Dict[str, Any]] = None
