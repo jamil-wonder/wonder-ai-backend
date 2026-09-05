@@ -269,11 +269,12 @@ async def api_blogs_generate(request: BlogGenerateRequest, current_user: dict = 
         raise HTTPException(status_code=400, detail="Choose chatgpt, perplexity, or claude.")
 
     target_words = max(1200, min(int(request.target_words or 1500), 1600))
+    business_doc = await businesses_col.find_one({"user_id": current_user["id"]}) if businesses_col is not None else None
     try:
         generated = await generate_seo_blog(
             title=title,
             target_words=target_words,
-            business_name=business_doc.get("name") if isinstance(business_doc, dict) else None,
+            business_name=business_doc.get("businessName") if isinstance(business_doc, dict) else None,
             primary_keyword=_clean_optional_text(request.primary_keyword),
             audience=_clean_optional_text(request.audience),
             tone=_clean_optional_text(request.tone),
