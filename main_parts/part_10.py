@@ -553,12 +553,24 @@ async def sunday_analyzer_scheduler():
     # anything not yet stamped for the CURRENT week gets processed now.
     # `_run_weekly_pass` is idempotent (skips already-stamped businesses),
     # so this is safe even if last week's run actually did finish.
+    #
+    # This must only fire when today genuinely IS Sunday, on/after 4am — NOT
+    # "now is past the most recent Sunday 4am", which is trivially true on 6
+    # of 7 days (there's always some earlier Sunday). That version's bug:
+    # `_blog_week_id(now)` is the CURRENT ISO week (Mon-Sun) regardless of
+    # which weekday `now` falls on, so a restart on any Mon-Sat computed the
+    # week that hasn't reached its own Sunday yet and ran it days early —
+    # confirmed live 2026-09-02: a Tuesday restart fired the full weekly
+    # pass (scans + emails) for that week, so the real Sunday-4am trigger
+    # five days later found everything already stamped and silently
+    # no-opped. Restricting the catch-up to "it's actually Sunday, past
+    # 4am" makes it fire only for a restart that happens after the day's
+    # real window already opened (e.g. the process was down that morning),
+    # which is the one case this catch-up is meant to handle.
     try:
         now = datetime.now()
-        this_weeks_sunday_4am = now - timedelta(days=(now.weekday() - 6) % 7)
-        this_weeks_sunday_4am = this_weeks_sunday_4am.replace(hour=4, minute=0, second=0, microsecond=0)
-        if now >= this_weeks_sunday_4am:
-            print("[Scheduler] Startup catch-up: past this week's Sunday 4am, running catch-up pass now")
+        if now.weekday() == 6 and now.hour >= 4:
+            print("[Scheduler] Startup catch-up: it's Sunday past 4am, running catch-up pass now")
             await _run_weekly_pass(_blog_week_id(now))
     except Exception as catchup_err:
         print(f"[Scheduler] Startup catch-up failed: {catchup_err}")
