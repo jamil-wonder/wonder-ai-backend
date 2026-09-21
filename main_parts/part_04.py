@@ -728,7 +728,8 @@ async def api_public_report(token: str):
 
     visibility_score = business.get("latest_phase5_score")
     technical_score = business.get("latest_phase1_score")
-    headline_score = visibility_score if isinstance(visibility_score, (int, float)) else technical_score
+    has_visibility_score = isinstance(visibility_score, (int, float))
+    headline_score = visibility_score if has_visibility_score else technical_score
 
     visibility_history = business.get("visibility_weekly_scores") or []
     previous_score = None
@@ -807,6 +808,11 @@ async def api_public_report(token: str):
         "domain": _normalize_site(business.get("url") or ""),
         "score": _round_half_up(headline_score) if isinstance(headline_score, (int, float)) else None,
         "grade": get_grade(_round_half_up(headline_score)) if isinstance(headline_score, (int, float)) else None,
+        # False whenever the "score"/"grade" above are only ever the Phase 1
+        # technical crawl (no Search Tracker run has completed yet) — the
+        # frontend must not present that state as a tested AI-visibility
+        # result to whoever this link was shared with.
+        "visibilityVerified": has_visibility_score,
         "previousScore": _round_half_up(previous_score) if isinstance(previous_score, (int, float)) else None,
         "competitorAverage": _round_half_up(competitor_avg) if isinstance(competitor_avg, (int, float)) else None,
         "rank": rank,
