@@ -555,15 +555,25 @@ async def api_phase5_generate_questions(
         })
         return {"questions": questions, "questionGroups": question_groups}
     except ValueError as e:
+        # A real, fixable validation problem (e.g. missing saved category/
+        # location) — 422, not 503. 503 means "the service itself is down,"
+        # which this is not, and previously collapsed this into the exact
+        # same status code as an actual AI-provider outage below, making
+        # the two indistinguishable from the client side alone.
         print(f"[Phase5] generate-questions validation failed: {str(e)}")
         raise HTTPException(
-            status_code=503,
+            status_code=422,
             detail=str(e),
         )
     except Exception as e:
+        # An unexpected failure (AI provider timeout/rate-limit, a parsing
+        # bug, a DB hiccup, etc.) — genuinely 500, and logged with enough
+        # detail to diagnose from server logs alone without re-reading this
+        # source file after the fact.
+        print(f"[Phase5] generate-questions unexpected failure for url={req.url!r}: {type(e).__name__}: {e}")
         traceback.print_exc()
         raise HTTPException(
-            status_code=503,
+            status_code=500,
             detail="Questions cannot be generated at this moment. Please try again.",
         )
 
