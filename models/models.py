@@ -51,6 +51,7 @@ class ScrapeResult(BaseModel):
     canonicalUrl: Optional[str] = None
     sitemapFound: bool
     robotsTxtFound: bool
+    aiBotAccess: Dict[str, bool] = Field(default_factory=dict)
     hasSSL: bool
     hasMobileMeta: bool
     hasAnalytics: bool
@@ -116,6 +117,11 @@ class PublicScanUnlockRequest(BaseModel):
 class TrackUrlRequest(BaseModel):
     url: str
     phase: str
+
+class ContactFormRequest(BaseModel):
+    name: str = ""
+    email: str
+    message: str
 
 # Authentication Models
 class UserCreate(BaseModel):

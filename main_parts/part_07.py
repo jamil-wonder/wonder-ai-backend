@@ -439,6 +439,56 @@ async def api_public_scan_unlock(request: PublicScanUnlockRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/public/contact")
+async def api_public_contact(request: ContactFormRequest):
+    # The marketing site's chat-widget "contact us" form used to be fully
+    # fake on the frontend (a `// Simulate sending email` comment, no
+    # request ever sent) — it showed a real visitor a real "Message Sent!"
+    # confirmation for a message that went nowhere. This is the real
+    # endpoint: the submission is durably stored first (so it's never lost
+    # even if SMTP is unreachable or unconfigured, matching send_email()'s
+    # own non-fatal "log and skip" behavior elsewhere in this codebase),
+    # then a best-effort notification email is attempted.
+    email = str(request.email or "").strip().lower()
+    message = str(request.message or "").strip()
+    name = str(request.name or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid email is required")
+    if not message:
+        raise HTTPException(status_code=400, detail="A message is required")
+
+    if contact_submissions_col is None:
+        raise HTTPException(status_code=503, detail="Contact storage unavailable")
+
+    try:
+        await contact_submissions_col.insert_one({
+            "name": name,
+            "email": email,
+            "message": message,
+            "created_at": datetime.utcnow().isoformat(),
+        })
+    except Exception as e:
+        print(f"[API] ERROR saving contact submission from {email}: {e}")
+        raise HTTPException(status_code=500, detail="Could not save your message. Please try again.")
+
+    if CONTACT_NOTIFY_EMAIL:
+        text_body = f"New contact form submission\n\nName: {name or '(not given)'}\nEmail: {email}\n\n{message}"
+        html_body = (
+            f"<p><strong>New contact form submission</strong></p>"
+            f"<p>Name: {name or '(not given)'}<br>Email: {email}</p>"
+            f"<p>{message}</p>"
+        )
+        try:
+            await send_email(CONTACT_NOTIFY_EMAIL, f"Contact form: {name or email}", html_body, text_body)
+        except Exception as e:
+            # The submission is already durably saved above — a failed
+            # notification email is a follow-up-later problem, not a reason
+            # to tell the visitor their message failed to send.
+            print(f"[API] Contact notification email failed for {email}: {e}")
+
+    return {"success": True}
+
+
 @app.post("/api/track-url")
 async def api_track_url(request: TrackUrlRequest, current_user: dict = Depends(get_current_user_optional)):
     try:

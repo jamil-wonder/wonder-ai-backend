@@ -18,6 +18,7 @@ from models import (
     AiInsightsResult,
     WishlistRequest,
     PublicScanUnlockRequest,
+    ContactFormRequest,
     OnboardingSuggestionsRequest,
     OnboardingSuggestionsResult,
     TrackUrlRequest,
@@ -213,6 +214,7 @@ analytics_snapshots_col = None
 email_verifications_col = None
 public_scan_leads_col = None
 manual_run_requests_col = None
+contact_submissions_col = None
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
     db = mongo_client.get_database("wonderai")
@@ -233,6 +235,7 @@ try:
     email_verifications_col = db.get_collection("email_verifications")
     public_scan_leads_col = db.get_collection("public_scan_leads")
     manual_run_requests_col = db.get_collection("manual_run_requests")
+    contact_submissions_col = db.get_collection("contact_submissions")
 except Exception as e:
     print(f"[API] Error connecting to MongoDB: {type(e).__name__}")
 
@@ -451,6 +454,10 @@ SMTP_USER = (os.getenv("SMTP_USER") or "").strip() or None
 # whitespace here makes both the spaced and unspaced forms work.
 SMTP_PASSWORD = (os.getenv("SMTP_PASSWORD") or "").replace(" ", "").strip() or None
 SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "Wonder AI")
+# Where the marketing site's "contact us" chat widget notifies a human —
+# falls back to the SMTP account itself so this works without a separate
+# env var in the common case of one inbox handling both sending and support.
+CONTACT_NOTIFY_EMAIL = os.getenv("CONTACT_NOTIFY_EMAIL") or SMTP_USER
 EMAIL_OTP_LENGTH = 6
 EMAIL_OTP_TTL_MINUTES = 15
 EMAIL_OTP_MAX_ATTEMPTS = 5
