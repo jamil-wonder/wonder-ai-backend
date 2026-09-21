@@ -250,6 +250,84 @@ async def head_check(url: str, timeout: float = 5.0) -> bool:
     except Exception:
         return False
 
+# The three real AI-crawler user-agent tokens this product's own "Crawlers"
+# settings panel and the Analyzer's technical checklist talk about —
+# previously both places just hardcoded "allowed: true" with no robots.txt
+# ever actually fetched or parsed, so the claim was true by coincidence,
+# never by evidence.
+_AI_BOT_USER_AGENTS = {
+    "gptbot": "GPTBot",
+    "claudebot": "ClaudeBot",
+    "perplexitybot": "PerplexityBot",
+}
+
+
+def _parse_robots_txt_bot_access(robots_txt: str) -> Dict[str, bool]:
+    """Real, bounded parsing: group robots.txt lines by User-agent block,
+    then for each of our three bots use its own named block if one exists,
+    else fall back to the wildcard `*` block (standard robots.txt
+    precedence). A bot is marked blocked only when that block contains a
+    root-level `Disallow: /` (or exactly `Disallow:/`) with no more
+    specific `Allow: /` after it — the one unambiguous "blocked from
+    everything" case. This deliberately does not attempt full path-pattern
+    precedence (longest-match, wildcards mid-path) — that's real robots.txt
+    complexity a top-level "can this bot reach your site at all" checklist
+    item doesn't need in order to stop being a hardcoded guess.
+    """
+    groups: Dict[str, list[tuple[str, str]]] = {}
+    current_agents: list[str] = []
+    for raw_line in robots_txt.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "user-agent":
+            agent = value.lower()
+            current_agents = [agent]
+            groups.setdefault(agent, [])
+        elif key in ("disallow", "allow") and current_agents:
+            for agent in current_agents:
+                groups.setdefault(agent, []).append((key, value))
+
+    def is_blocked(rules: list[tuple[str, str]]) -> bool:
+        blocked = False
+        for directive, path in rules:
+            if directive == "disallow" and path in ("/", ""):
+                blocked = True
+            elif directive == "allow" and path in ("/", ""):
+                blocked = False
+        return blocked
+
+    result: Dict[str, bool] = {}
+    for key, agent_name in _AI_BOT_USER_AGENTS.items():
+        agent_lower = agent_name.lower()
+        if agent_lower in groups:
+            result[key] = not is_blocked(groups[agent_lower])
+        elif "*" in groups:
+            result[key] = not is_blocked(groups["*"])
+        else:
+            result[key] = True
+    return result
+
+
+async def fetch_ai_bot_access(origin: str, robots_txt_found: bool) -> Dict[str, bool]:
+    # No robots.txt at all means no restrictions exist for anyone — every
+    # bot defaults to allowed, same as a real crawler would treat it.
+    if not robots_txt_found:
+        return {key: True for key in _AI_BOT_USER_AGENTS}
+    try:
+        async with httpx.AsyncClient(verify=False) as client:
+            res = await client.get(f"{origin}/robots.txt", timeout=5.0, follow_redirects=True)
+            if res.status_code >= 400:
+                return {key: True for key in _AI_BOT_USER_AGENTS}
+            return _parse_robots_txt_bot_access(res.text)
+    except Exception:
+        # A real fetch failure is "we don't know," not "blocked" — default
+        # to allowed rather than showing a false red flag.
+        return {key: True for key in _AI_BOT_USER_AGENTS}
+
 async def fetch_with_httpx(url: str) -> Tuple[str, str]:
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -676,6 +754,7 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
         head_check(f"{origin}/sitemap.xml"),
         head_check(f"{origin}/robots.txt")
     )
+    ai_bot_access = await fetch_ai_bot_access(origin, robots_txt_found)
 
     ai_debug: Dict[str, Any] = {
         "ran": False,
@@ -1010,6 +1089,7 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
         "canonicalUrl": canonical_url,
         "sitemapFound": sitemap_found,
         "robotsTxtFound": robots_txt_found,
+        "aiBotAccess": ai_bot_access,
         "hasSSL": has_ssl,
         "hasMobileMeta": has_mobile_meta,
         "hasAnalytics": has_analytics,
