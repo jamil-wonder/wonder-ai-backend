@@ -73,6 +73,13 @@ class ScrapeRequest(BaseModel):
     category: Optional[str] = None
     location: Optional[str] = None
     business_id: Optional[str] = None
+    # False for a background/prefill crawl (e.g. onboarding autofilling
+    # name/description from a URL before the user has even saved a
+    # business) — the crawl still runs and its data is still returned to
+    # the caller, but it must not be recorded as a completed Analyzer scan.
+    # Defaults true so every existing caller (the real, user-triggered
+    # Analyzer run) keeps behaving exactly as before.
+    record_scan: bool = True
 
 class AiModelInsight(BaseModel):
     modelName: str

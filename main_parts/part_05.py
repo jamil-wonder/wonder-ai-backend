@@ -369,9 +369,12 @@ async def api_scrape(
                     location=request.location,
                     business_name=result.get("businessName"),
                     logo_url=result.get("logoUrl"),
-                    phase1_score=((result.get("scores") or {}).get("total") if isinstance(result.get("scores"), dict) else None),
+                    phase1_score=(
+                        ((result.get("scores") or {}).get("total") if isinstance(result.get("scores"), dict) else None)
+                        if request.record_scan else None
+                    ),
                     business_id=request.business_id,
-                    scrape_result=result,
+                    scrape_result=result if request.record_scan else None,
                 )
                 public_business = _public_business_doc(business)
                 if public_business:
