@@ -20,6 +20,7 @@ async def _upsert_user_business(
     phase5_score: float | None = None,
     business_id: str | None = None,
     scrape_result: dict | None = None,
+    analysis: dict | None = None,
 ) -> dict | None:
     if not current_user or businesses_col is None:
         return None
@@ -71,6 +72,11 @@ async def _upsert_user_business(
         set_fields["latest_phase5_at"] = now_iso
     if scrape_result is not None:
         set_fields["latest_scrape_result"] = scrape_result
+    if isinstance(analysis, dict) and analysis.get("scan"):
+        # The exact scorecard/audit/AI-insight set the Analyzer showed for a
+        # manual run, so reopening the page (any device, any time) shows what
+        # was already analysed instead of asking to run it again.
+        set_fields["latest_analysis"] = analysis
     for key, values in {
         "services": services,
         "competitors": competitors,

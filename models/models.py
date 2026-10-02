@@ -206,6 +206,7 @@ class BusinessUpsertRequest(BaseModel):
     systemCompetitors: Optional[List[Dict[str, Any]]] = None
     trackedPages: Optional[List[str]] = None
     latest_scrape_result: Optional[Dict[str, Any]] = None
+    latest_analysis: Optional[Dict[str, Any]] = None
 
 
 class BusinessResponse(BaseModel):
@@ -239,6 +240,7 @@ class BusinessResponse(BaseModel):
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     latest_scrape_result: Optional[Dict[str, Any]] = None
+    latest_analysis: Optional[Dict[str, Any]] = None
     scores_history: Optional[List[Dict[str, Any]]] = None
 
 

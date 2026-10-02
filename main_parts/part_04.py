@@ -470,6 +470,7 @@ async def api_user_business_upsert(
         tracked_pages=request.trackedPages,
         business_id=request.business_id,
         scrape_result=request.latest_scrape_result,
+        analysis=request.latest_analysis,
         phase1_score=phase1_score,
     )
     public = _public_business_doc(business)

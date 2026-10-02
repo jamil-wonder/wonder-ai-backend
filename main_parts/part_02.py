@@ -205,6 +205,7 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
         "latest_scrape_result": doc.get("latest_scrape_result"),
+        "latest_analysis": doc.get("latest_analysis"),
         "scores_history": doc.get("scores_history") or [],
     }
 
