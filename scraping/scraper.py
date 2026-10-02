@@ -17,6 +17,7 @@ except (ImportError, Exception):
 import httpx
 from models import ScrapeResult, Scores, ScoreBreakdown
 from agents import ai_agent
+from scraping.category import infer_category
 from scraping.locations import build_location_info
 from scraping.naming import clean_text as clean_display_text, prefer_brand_name
 
@@ -1094,6 +1095,10 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
             extra_addresses=raw_addresses,
             page_url=final_url or target_url,
             phones=list(phones),
+            headline_texts=[
+                title_text or "", description or "", raw_meta.get("og:title", ""),
+                raw_meta.get("og:site_name", ""), raw_meta.get("og:description", ""),
+            ],
         )
         ordered_addresses = location_info["orderedAddresses"] or sorted(raw_addresses)
     except Exception as location_error:
@@ -1101,6 +1106,14 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
         print(f"[Scraper] location extraction failed: {location_error}")
         location_info = {"locations": [], "isMultiLocation": False, "locationConfidence": "none", "orderedAddresses": []}
         ordered_addresses = sorted(raw_addresses)
+
+    try:
+        category, category_confidence = infer_category(
+            schemas=schemas, soups=all_soups, raw_meta=raw_meta, title=title_text or "", description=description or "",
+        )
+    except Exception as category_error:
+        category, category_confidence = "", "none"
+        debug_notes.append(f"Category inference failed: {str(category_error)[:120]}")
 
     try:
         business_name = prefer_brand_name(
@@ -1124,6 +1137,8 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
         "locations": location_info["locations"],
         "isMultiLocation": location_info["isMultiLocation"],
         "locationConfidence": location_info["locationConfidence"],
+        "category": category or None,
+        "categoryConfidence": category_confidence,
         "socialLinks": social_links,
         "openingHours": [str(x) for x in opening_hours],
         "logoUrl": logo_url,

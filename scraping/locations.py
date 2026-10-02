@@ -502,6 +502,51 @@ def _meta_candidates(raw_meta: Dict[str, str]) -> List[Dict[str, Any]]:
     }]
 
 
+_COVERAGE_LEAD = re.compile(
+    r"\b(?:in|across|throughout|serving|around|within|covering)\s+"
+    r"((?:[A-Z][\w'’.\-]*(?:\s+[A-Z][\w'’.\-]*){0,2})"
+    r"(?:\s*(?:,|&|and)\s*(?:[A-Z][\w'’.\-]*(?:\s+[A-Z][\w'’.\-]*){0,2}))*)"
+)
+_COVERAGE_NOT_PLACES = {
+    "stock", "seconds", "minutes", "bulk", "style", "touch", "one", "love", "action", "business", "town", "season",
+    "store", "stores", "person", "demand", "progress", "motion", "real", "time", "full", "total", "partnership",
+    "minute", "hours", "days", "weeks", "months", "years", "need", "case", "order", "advance", "general", "particular",
+    "private", "public", "house", "home", "line", "app", "cart", "bag", "front", "good", "great", "brief", "short",
+    "trust", "control", "charge", "place", "use", "reach", "sync", "week", "month", "year", "today", "tonight",
+}
+
+
+def _coverage_candidates(texts: Iterable[str], raw_meta: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Cities named in a page title/description ("Online Grocery in Dhaka, Chattogram & Sylhet").
+
+    A last-resort, low-confidence source for sites that publish no address at
+    all (JS-rendered store locators, marketplaces) but still say where they
+    operate in their headline. Only used when nothing better exists."""
+    country = _normalize_country(
+        raw_meta.get("og:country_name") or raw_meta.get("og:country-name") or raw_meta.get("place:location:country_name"),
+        structured=True,
+    )
+    found: List[str] = []
+    for text in texts:
+        for match in _COVERAGE_LEAD.finditer(_collapse(text)):
+            for part in re.split(r"\s*(?:,|&|\band\b)\s*", match.group(1)):
+                part = part.strip(" .,-")
+                if not part or part.lower() in _COVERAGE_NOT_PLACES:
+                    continue
+                if any(w.lower() in _COVERAGE_NOT_PLACES for w in part.split()):
+                    continue
+                city = _clean_city(part)
+                if city and city.lower() not in {c.lower() for c in found}:
+                    found.append(city)
+    if not found or len(found) > 8:
+        return []
+    return [
+        {"full": city, "city": city, "region": "", "postal": "", "country": country, "street": "",
+         "source": "meta", "confidence": "low", "name": ""}
+        for city in found
+    ]
+
+
 def _text_candidates(soups: Iterable[Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for soup in soups:
@@ -564,6 +609,7 @@ def build_location_info(
     extra_addresses: Iterable[str] = (),
     page_url: str = "",
     phones: Iterable[str] = (),
+    headline_texts: Iterable[str] = (),
 ) -> Dict[str, Any]:
     soups = list(soups)
     candidates: List[Dict[str, Any]] = []
@@ -586,6 +632,15 @@ def build_location_info(
         candidates.extend(_text_candidates(soups))
     if not _has_city(candidates):
         candidates.extend(_extra_candidates(extra_addresses))
+
+    if not _has_city(candidates):
+        heading_texts: List[str] = list(headline_texts)
+        for soup in soups[:1]:
+            try:
+                heading_texts.extend(t.get_text(" ", strip=True)[:160] for t in soup.find_all(["h1", "h2"], limit=4))
+            except Exception:
+                pass
+        candidates.extend(_coverage_candidates(heading_texts, raw_meta or {}))
 
     inferred = _infer_country([c for c in candidates if c.get("city")], page_url, phones)
     for candidate in candidates:
