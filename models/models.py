@@ -44,6 +44,9 @@ class ScrapeResult(BaseModel):
     emails: List[str]
     phones: List[str]
     addresses: List[str]
+    locations: List[Dict[str, Any]] = Field(default_factory=list)
+    isMultiLocation: bool = False
+    locationConfidence: str = "none"
     socialLinks: Dict[str, str]
     openingHours: List[str]
     logoUrl: Optional[str] = None

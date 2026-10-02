@@ -329,31 +329,37 @@ async def api_scrape(
     try:
         started_at = datetime.utcnow()
         print(f"[API] /api/scrape started: {request.url}")
-        try:
-            business = await _upsert_user_business(
-                current_user=current_user,
-                url=request.url,
-                category=request.category,
-                location=request.location,
-                business_id=request.business_id,
-            )
-            doc = {
-                "url": request.url, 
-                "phase": "phase1", 
-                "timestamp": datetime.utcnow().isoformat()
-            }
-            if current_user:
-                doc["user_id"] = current_user["id"]
-                doc["user_email"] = current_user["email"]
-            if request.category:
-                doc["category"] = request.category
-            if request.location:
-                doc["location"] = request.location
-            if business:
-                doc["business_id"] = str(business.get("_id"))
-            await urls_col.insert_one(doc)
-        except:
-            pass
+        # A prefill crawl (record_scan=False, e.g. onboarding autofill) is
+        # strictly read-only: it must not create a business record or a scan
+        # history row. Otherwise abandoning the wizard after the URL step
+        # leaves a nameless half-created business behind, which then counts
+        # toward the 3-business cap and makes the next login skip onboarding.
+        if request.record_scan:
+            try:
+                business = await _upsert_user_business(
+                    current_user=current_user,
+                    url=request.url,
+                    category=request.category,
+                    location=request.location,
+                    business_id=request.business_id,
+                )
+                doc = {
+                    "url": request.url,
+                    "phase": "phase1",
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+                if current_user:
+                    doc["user_id"] = current_user["id"]
+                    doc["user_email"] = current_user["email"]
+                if request.category:
+                    doc["category"] = request.category
+                if request.location:
+                    doc["location"] = request.location
+                if business:
+                    doc["business_id"] = str(business.get("_id"))
+                await urls_col.insert_one(doc)
+            except:
+                pass
         scrape_timeout_seconds = int(os.getenv("PHASE1_SCRAPE_TIMEOUT_SECONDS", "420"))
         print(f"[API] /api/scrape timeout budget: {scrape_timeout_seconds}s")
         result = await asyncio.wait_for(
@@ -361,7 +367,7 @@ async def api_scrape(
             timeout=scrape_timeout_seconds,
         )
         try:
-            if isinstance(result, dict):
+            if request.record_scan and isinstance(result, dict):
                 business = await _upsert_user_business(
                     current_user=current_user,
                     url=request.url,
@@ -369,12 +375,9 @@ async def api_scrape(
                     location=request.location,
                     business_name=result.get("businessName"),
                     logo_url=result.get("logoUrl"),
-                    phase1_score=(
-                        ((result.get("scores") or {}).get("total") if isinstance(result.get("scores"), dict) else None)
-                        if request.record_scan else None
-                    ),
+                    phase1_score=((result.get("scores") or {}).get("total") if isinstance(result.get("scores"), dict) else None),
                     business_id=request.business_id,
-                    scrape_result=result if request.record_scan else None,
+                    scrape_result=result,
                 )
                 public_business = _public_business_doc(business)
                 if public_business:
@@ -429,21 +432,22 @@ async def api_scrape(
                 warnings.append("Returned reduced analysis after full scrape timeout. AI enrichment was skipped.")
                 fallback["warnings"] = warnings
                 try:
-                    business = await _upsert_user_business(
-                        current_user=current_user,
-                        url=request.url,
-                        category=request.category,
-                        location=request.location,
-                        business_name=fallback.get("businessName"),
-                        logo_url=fallback.get("logoUrl"),
-                        phase1_score=((fallback.get("scores") or {}).get("total") if isinstance(fallback.get("scores"), dict) else None),
-                        business_id=request.business_id,
-                        scrape_result=fallback,
-                    )
-                    public_business = _public_business_doc(business)
-                    if public_business:
-                        fallback["businessId"] = public_business["id"]
-                        fallback["businessProfile"] = public_business
+                    if request.record_scan:
+                        business = await _upsert_user_business(
+                            current_user=current_user,
+                            url=request.url,
+                            category=request.category,
+                            location=request.location,
+                            business_name=fallback.get("businessName"),
+                            logo_url=fallback.get("logoUrl"),
+                            phase1_score=((fallback.get("scores") or {}).get("total") if isinstance(fallback.get("scores"), dict) else None),
+                            business_id=request.business_id,
+                            scrape_result=fallback,
+                        )
+                        public_business = _public_business_doc(business)
+                        if public_business:
+                            fallback["businessId"] = public_business["id"]
+                            fallback["businessProfile"] = public_business
                 except Exception as business_error:
                     print(f"[Business] phase1 fallback upsert failed: {business_error}")
             print(f"[API] /api/scrape reduced fallback returned: {request.url}")

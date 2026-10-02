@@ -17,6 +17,8 @@ except (ImportError, Exception):
 import httpx
 from models import ScrapeResult, Scores, ScoreBreakdown
 from agents import ai_agent
+from scraping.locations import build_location_info
+from scraping.naming import clean_text as clean_display_text, prefer_brand_name
 
 SOCIAL_PATTERNS = {
     'facebook':  re.compile(r'facebook\.com/(?!sharer|share|login|dialog)([\w.%-]+)', re.I),
@@ -500,6 +502,7 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
     )
     business_name = re.sub(r'\s*[|\-–—]\s*.+$', '', business_name)
     business_name = re.sub(r'\s+(home|welcome|official site|official website)$', '', business_name, flags=re.I).strip()
+    business_name = clean_display_text(business_name)
 
     # Clean up blocked/WAF titles or default page title errors (e.g. Access Denied, 403 Forbidden)
     lower_name = business_name.lower().strip()
@@ -528,6 +531,8 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
             break
     if not description:
         description = raw_meta.get('description') or raw_meta.get('og:description') or raw_meta.get('twitter:description') or ''
+
+    description = clean_display_text(description)
 
     # Clean up description if WAF blocked or empty
     lower_desc = description.lower().strip()
@@ -608,7 +613,9 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
 
     for s_doc in all_soups:
         for tag in s_doc.find_all('address'):
-            addresses.add(tag.get_text().strip())
+            # separator keeps <br>-separated lines apart ("5 Soho St, London,
+            # W1D 3AA") instead of gluing them ("5 Soho StLondonW1D 3AA")
+            addresses.add(tag.get_text(", ", strip=True))
 
         for a in s_doc.find_all(['a', 'iframe']):
             href = a.get('href') or a.get('src') or ''
@@ -1074,14 +1081,49 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
     if not canonical_url: warnings.append('No canonical URL — duplicate content risk.')
     if not sitemap_found: warnings.append('No sitemap.xml found at site root.')
 
+    # Scoring above is already final; this only decides which addresses are
+    # real, in what order, and what city/locations they imply. Isolated so a
+    # bug here can never take the Analyzer down — it falls back to a stable
+    # (sorted, not set-order) copy of the same addresses.
+    raw_addresses = [x for x in addresses if x]
+    try:
+        location_info = build_location_info(
+            schemas=schemas,
+            soups=all_soups,
+            raw_meta=raw_meta,
+            extra_addresses=raw_addresses,
+            page_url=final_url or target_url,
+            phones=list(phones),
+        )
+        ordered_addresses = location_info["orderedAddresses"] or sorted(raw_addresses)
+    except Exception as location_error:
+        debug_notes.append(f"Location extraction failed: {str(location_error)[:120]}")
+        print(f"[Scraper] location extraction failed: {location_error}")
+        location_info = {"locations": [], "isMultiLocation": False, "locationConfidence": "none", "orderedAddresses": []}
+        ordered_addresses = sorted(raw_addresses)
+
+    try:
+        business_name = prefer_brand_name(
+            business_name,
+            raw_meta.get("og:site_name"),
+            cities=[loc["city"] for loc in location_info["locations"]],
+            multi_location=location_info["isMultiLocation"],
+            domain_label=base_domain.replace("www.", "").split(".")[0],
+        ) or business_name
+    except Exception as naming_error:
+        debug_notes.append(f"Brand-name check failed: {str(naming_error)[:120]}")
+
     return {
         "url": target_url,
-        "title": title_text or "",
+        "title": clean_display_text(title_text),
         "businessName": business_name,
         "description": description,
         "emails": clean_set(emails),
         "phones": clean_set(phones),
-        "addresses": [x for x in addresses if x],
+        "addresses": ordered_addresses,
+        "locations": location_info["locations"],
+        "isMultiLocation": location_info["isMultiLocation"],
+        "locationConfidence": location_info["locationConfidence"],
         "socialLinks": social_links,
         "openingHours": [str(x) for x in opening_hours],
         "logoUrl": logo_url,
