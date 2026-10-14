@@ -17,6 +17,11 @@ class ScoreBreakdown(BaseModel):
     present: Optional[int] = None
     correctType: Optional[int] = None
     keyFields: Optional[int] = None
+    # C3: the Schema area reports why it may be capped at 50%
+    max: Optional[int] = None
+    hasLocalBusinessType: Optional[bool] = None
+    localBusinessTypes: Optional[List[str]] = None
+    capped: Optional[bool] = None
     ssl: Optional[int] = None
     mobile: Optional[int] = None
     canonical: Optional[int] = None
@@ -93,6 +98,8 @@ class AiModelInsight(BaseModel):
     sentiment: str
     platforms: List[str]
     evidence: List[str]
+    # "failed" = the model could not be reached (A4); older callers omit it
+    fetchStatus: str = "ok"
 
 class AiInsightsRequest(BaseModel):
     url: str
@@ -185,7 +192,12 @@ class BusinessUpsertRequest(BaseModel):
     url: str
     business_id: Optional[str] = None
     category: Optional[str] = None
+    # J4: the specific kind within the category (e.g. category "Restaurant",
+    # subType "Indian"). Competitors must match both. "" clears it.
+    subType: Optional[str] = None
     location: Optional[str] = None
+    # G3: postcode of the chosen detected location (the wizard's chip), kept with the structured location
+    locationPostcode: Optional[str] = None
     businessName: Optional[str] = None
     logoUrl: Optional[str] = None
     businessDescription: Optional[str] = None
@@ -216,7 +228,11 @@ class BusinessResponse(BaseModel):
     normalized_domain: str
     businessName: Optional[str] = None
     category: Optional[str] = None
+    subType: Optional[str] = None
     location: Optional[str] = None
+    # G3: {area, city, country, postcode} - None when the saved text is not a city/area
+    locationData: Optional[Dict[str, Any]] = None
+    locationProblem: Optional[str] = None
     logoUrl: Optional[str] = None
     businessDescription: Optional[str] = None
     aiDescription: Optional[str] = None
@@ -237,6 +253,12 @@ class BusinessResponse(BaseModel):
     latest_phase5_score: Optional[float] = None
     latest_phase1_at: Optional[str] = None
     latest_phase5_at: Optional[str] = None
+    # The Wonder Score: only ever written when a scan run COMPLETES (J6/A1)
+    latest_wonder_score: Optional[float] = None
+    latest_wonder_at: Optional[str] = None
+    latest_wonder_inputs: Optional[Dict[str, Any]] = None
+    # A scan run in progress right now (header shows "Calculating…")
+    scan_run_active: Optional[Dict[str, Any]] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     latest_scrape_result: Optional[Dict[str, Any]] = None

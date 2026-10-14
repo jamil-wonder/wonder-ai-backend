@@ -41,6 +41,10 @@ from models import (
     CompetitorTrackingStatusResponse,
 )
 from scraping.scraper import scrape_website, get_grade
+from report_selection import pick_previous_score, pick_previous_tracker_job_id
+from blog_claims import build_fact_pack
+from blog_language import normalize_locale, resolve_blog_language
+from scraping.locations import location_input_problem, parse_location_input
 from agents.ai_agent import (
     get_ai_insights_multi,
     get_ai_insights_openai,
@@ -69,6 +73,7 @@ from models.phase5_models import (
     Phase5JobStatusResponse,
 )
 from agents.phase5.config import PHASE5_ENABLE_GEMINI, PHASE5_QUESTION_GEN_TIMEOUT_SEC
+from agents.phase5.analysis import _safe_provider_result
 from agents.phase5_agent import (
     generate_brand_questions,
     generate_preview_questions,
@@ -76,6 +81,12 @@ from agents.phase5_agent import (
     analyze_single_question,
     analyze_single_question_multi,
     compute_provider_score,
+    compute_run_health,
+    compute_mention_rate,
+    compute_mention_rate_margin,
+    wonder_margin,
+    compute_wonder_score,
+    provider_result_state,
     _run_with_backoff,
     generate_brand_perception_summary,
     generate_deep_competitor_scores,
@@ -97,6 +108,7 @@ from dotenv import load_dotenv
 
 import traceback
 import uvicorn
+import copy
 import os
 import uuid
 import json
@@ -167,7 +179,7 @@ PHASE5_RECOVER_STALE_RUNNING = str(os.getenv("PHASE5_RECOVER_STALE_RUNNING", "fa
 PHASE5_STALE_QUEUED_SECONDS = int(os.getenv("PHASE5_STALE_QUEUED_SECONDS", "1800"))
 PHASE5_RESUME_QUEUED_ON_STARTUP = str(os.getenv("PHASE5_RESUME_QUEUED_ON_STARTUP", "false")).strip().lower() == "true"
 PHASE5_WORKER_ID = f"{os.getenv('HOSTNAME', 'local')}-{uuid.uuid4().hex[:8]}"
-PHASE5_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+PHASE5_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "incomplete"}
 
 # "web" (default) serves the FastAPI app only; "worker" runs the background
 # schedulers/job loops with no HTTP server. Same image, same env, split by
@@ -214,10 +226,14 @@ analytics_snapshots_col = None
 email_verifications_col = None
 public_scan_leads_col = None
 manual_run_requests_col = None
+scan_runs_col = None
 contact_submissions_col = None
 try:
     mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
-    db = mongo_client.get_database("wonderai")
+    # MONGODB_DB lets a developer machine use its own database so its jobs are
+    # never picked up by the production worker (they otherwise share one queue).
+    # Unset = "wonderai", exactly as before.
+    db = mongo_client.get_database((os.getenv("MONGODB_DB") or "wonderai").strip() or "wonderai")
     wishlist_col = db.get_collection("wishlist")
     urls_col = db.get_collection("urls")
     users_col = db.get_collection("users")
@@ -235,6 +251,7 @@ try:
     email_verifications_col = db.get_collection("email_verifications")
     public_scan_leads_col = db.get_collection("public_scan_leads")
     manual_run_requests_col = db.get_collection("manual_run_requests")
+    scan_runs_col = db.get_collection("scan_runs")
     contact_submissions_col = db.get_collection("contact_submissions")
 except Exception as e:
     print(f"[API] Error connecting to MongoDB: {type(e).__name__}")
@@ -1060,6 +1077,9 @@ def _question_mention_summary(result: dict | None) -> tuple[bool, int, list[str]
     other_domains: list[str] = []
     for provider_result in providers.values():
         if not isinstance(provider_result, dict):
+            continue
+        # A failed / not-run model is missing data, not "not mentioned" (A4).
+        if provider_result_state(provider_result) != "ok":
             continue
         if provider_result.get("mentioned"):
             mentioned_count += 1
@@ -1940,6 +1960,7 @@ class PublicCompetitorsRequest(BaseModel):
     url: str
     businessName: str | None = None
     category: str | None = None
+    subType: str | None = None
     location: str | None = None
     description: str | None = None
 

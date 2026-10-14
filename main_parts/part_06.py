@@ -186,6 +186,7 @@ async def api_public_competitors(
                 questions=questions,
                 business_name=request.businessName or "",
                 category=request.category or "",
+                sub_type=request.subType or "",
                 location=request.location or "",
                 description=request.description or "",
                 # Ask for more real candidates than we intend to show — the

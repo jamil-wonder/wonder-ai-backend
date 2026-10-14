@@ -1,5 +1,9 @@
 import os
 import json
+from blog_claims import CLAIM_RULES, facts_prompt_block, vet_blog
+from blog_language import DEFAULT_LOCALE, language_prompt_block, localize_spelling
+from blog_structure import fix_structure, structure_feedback, structure_problems, structure_prompt_block
+from blog_keywords import MAX_RETRIES as KEYWORD_RETRIES, clean_keyword_list, retry_feedback, topics_prompt_block, violations as keyword_violations
 import re
 import asyncio
 import base64
@@ -519,6 +523,9 @@ def _normalize_insight_payload(payload: dict, model_name: str) -> dict:
         "sentiment": str(payload.get("sentiment") or "Unknown"),
         "platforms": cleaned_platforms if (cleaned_platforms := platforms) else [],
         "evidence": cleaned_evidence,
+        # "failed" = the model could not be reached: missing data, not "doesn't
+        # know the business" (A4). The UI shows "Unavailable" for these.
+        "fetchStatus": "failed" if payload.get("fetch_failed") else "ok",
     }
 
 async def get_ai_insights(business_name: str, url: str) -> dict:
@@ -569,6 +576,7 @@ async def get_ai_insights(business_name: str, url: str) -> dict:
         return _normalize_insight_payload({
             "isKnown": False,
             "summary": "Failed to fetch AI insights.",
+            "fetch_failed": True,
             "sentiment": "Unknown",
             "platforms": [],
             "evidence": [],
@@ -612,6 +620,7 @@ async def get_ai_insights_openai(business_name: str, url: str) -> dict:
         return _normalize_insight_payload({
             "isKnown": False,
             "summary": "Failed to fetch AI insights.",
+            "fetch_failed": True,
             "sentiment": "Unknown",
             "platforms": [],
             "evidence": [],
@@ -748,6 +757,7 @@ async def get_ai_insights_claude(business_name: str, url: str) -> dict:
         return _normalize_insight_payload({
             "isKnown": False,
             "summary": "Failed to fetch AI insights.",
+            "fetch_failed": True,
             "sentiment": "Unknown",
             "platforms": [],
             "evidence": [],
@@ -798,6 +808,7 @@ async def get_ai_insights_gemini(business_name: str, url: str) -> dict:
         return _normalize_insight_payload({
             "isKnown": False,
             "summary": "Failed to fetch AI insights.",
+            "fetch_failed": True,
             "sentiment": "Unknown",
             "platforms": [],
             "evidence": [],
@@ -955,11 +966,15 @@ async def generate_seo_blog(
     selling_points: list[str] | None = None,
     internal_links: list[str] | None = None,
     selected_model: str = "chatgpt",
+    facts: list[dict] | None = None,
+    keywords: list[str] | None = None,
+    language: str | None = None,
 ) -> dict:
     brand = (business_name or "").strip()
-    safe_words = max(1200, min(int(target_words or 1500), 1600))
-    min_words = max(1100, safe_words - 150)
-    max_words = min(1600, safe_words + 100)
+    language = language or DEFAULT_LOCALE
+    facts = facts or []
+    # F2: keywords are topics to cover, never phrases to insert word for word
+    topic_keywords = clean_keyword_list([primary_keyword, *(keywords or [])])
     prompt = f"""
     You are an expert SEO blog strategist and conversion copywriter.
     Create a comprehensive, in-depth SEO blog article as structured JSON.
@@ -967,14 +982,12 @@ async def generate_seo_blog(
     Blog brief:
     - Title: {title}
     - Business / Brand Name: {brand or "the business"}
-    - Target word count: {safe_words} words (min: {min_words}, max: {max_words})
-    - Primary keyword: {primary_keyword or "infer from title"}
+    - Main topic (a theme to cover, not a phrase to repeat): {primary_keyword or "infer from title"}
     - Audience: {audience or "qualified readers searching this topic"}
     - Tone: {tone or "clear, authoritative, helpful"}
     - Key features: {json.dumps(key_features or [])}
     - Selling points: {json.dumps(selling_points or [])}
-    - Internal links to naturally mention: {json.dumps(internal_links or [])}
-
+{structure_prompt_block(internal_links)}{topics_prompt_block(topic_keywords)}{CLAIM_RULES.format(facts=facts_prompt_block(facts))}{language_prompt_block(language)}
     Return strict JSON only with this exact shape:
     {{
       "title": "optimized H1 title",
@@ -986,26 +999,68 @@ async def generate_seo_blog(
       "sections": [
         {{"id": "intro", "label": "Intro", "heading": "Introduction heading", "content": "section text"}},
         {{"id": "section-1", "label": "Section label", "heading": "H2 heading", "content": "section text"}}
+      ],
+      "claims": [
+        {{"text": "an exact sentence copied from the article", "source": "F3 or general"}}
       ]
     }}
 
     CRITICAL CONTENT RULES:
-    1. BRAND MENTIONS: You MUST naturally weave the brand name "{brand}" into the article AT LEAST 15 TIMES (and up to 30 times maximum across headings, intro, body paragraphs, case examples, recommendations, and closing call to action).
-    2. LENGTH: The total article body MUST be between {min_words} and {max_words} words (aiming for ~{safe_words} words). Write thorough, rich, detailed paragraphs instead of brief summaries.
-    3. INTEGRATION: Incorporate real business context, service offerings, customer benefits, and local/industry authority.
-    4. STRUCTURE: Use at least 5-6 H2 sections, bullet points, and an FAQ section at the end.
-    5. FORMAT: Do not include markdown code block fences. Return raw JSON only.
+    1. BRAND MENTIONS: Name the business "{brand}" naturally where it is relevant - roughly 4 to 8 times in the whole article. Never force it into a sentence.
+    2. INTEGRATION: Use the business facts above, its services and its location where they are listed. Do not add authority, awards or customer proof that is not in the facts.
+    3. FORMAT: Do not include markdown code block fences. Return raw JSON only.
     """
 
-    parsed, model, provider = await _blog_model_json(
-        provider=selected_model,
-        prompt=prompt,
-        timeout_seconds=120,
-        max_tokens=5200,
-    )
-    sections = _normalize_blog_sections(parsed.get("sections") if isinstance(parsed, dict) else [])
+    # F2: a draft that repeats a keyword phrase word for word is rejected and
+    # written again (with a note saying which phrases); if it still does after
+    # the retries, the best attempt is kept and the repeats are shown to the owner.
+    best = None
+    feedback = ""
+    attempts = 0
+    for _ in range(1 + KEYWORD_RETRIES):
+        attempts += 1
+        parsed, model, provider = await _blog_model_json(
+            provider=selected_model,
+            prompt=prompt + feedback,
+            timeout_seconds=120,
+            max_tokens=5200,
+        )
+        attempt_sections = _normalize_blog_sections(parsed.get("sections") if isinstance(parsed, dict) else [])
+        # F4: things that need no rewrite (long paragraphs, extra FAQs, extra links) are fixed here
+        attempt_sections, attempt_fixes = fix_structure(attempt_sections, internal_links)
+        bad = keyword_violations(attempt_sections, topic_keywords)
+        struct = structure_problems(attempt_sections, internal_links)
+        penalty = sum(bad.values()) + len(struct)
+        if best is None or penalty < best[5]:
+            best = (parsed, model, provider, bad, attempt_sections, penalty, struct, attempt_fixes)
+        if not bad and not struct:
+            break
+        feedback = (retry_feedback(bad) if bad else "") + (structure_feedback(struct) if struct else "")
+    parsed, model, provider, remaining_repeats, sections, _, remaining_structure, structure_fixes = best
+    # F1: every statement about the business must trace to the profile / website;
+    # specific unsourced claims are removed and the rest is listed for the owner.
+    vetted = vet_blog(sections, parsed.get("claims") if isinstance(parsed, dict) else [], facts)
+    sections = vetted["sections"]
+    # F3: whatever the writer slipped, the finished text uses the business's own English
+    protect = " ".join([brand] + [f["text"] for f in facts] + [str(title)])
+    sections, language_fixes = localize_spelling(sections, language, protect)
+    check_list = list(vetted["checkBeforePublishing"])
+    if remaining_repeats:
+        listed = "; ".join(f'"{k}" ({n} times)' for k, n in remaining_repeats.items())
+        check_list.insert(0, f"Reword the repeated keyword phrases - they still appear word for word more than once: {listed}.")
+    if remaining_structure:
+        check_list.insert(0, "This draft doesn't fully meet the length and structure rules: " + "; ".join(remaining_structure) + ".")
     body_text = "\n\n".join(f"{s['heading']}\n{s['content']}" for s in sections)
     return {
+        "claims": vetted["claims"],
+        "droppedClaims": vetted["droppedClaims"],
+        "checkBeforePublishing": check_list,
+        "language": language,
+        "languageFixes": language_fixes,
+        "structureFixes": structure_fixes,
+        "structureProblems": remaining_structure,
+        "keywordAttempts": attempts,
+        "keywordRepeats": remaining_repeats,
         "title": str(parsed.get("title") or title).strip(),
         "metaTitle": str(parsed.get("metaTitle") or title).strip()[:90],
         "metaDescription": str(parsed.get("metaDescription") or "").strip()[:220],

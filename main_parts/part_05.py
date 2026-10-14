@@ -187,6 +187,37 @@ async def api_user_history_site_trend(
     if not site_host:
         raise HTTPException(status_code=400, detail="A valid site is required")
 
+    # metric=wonder: the Wonder Score history, one point per COMPLETE scan run
+    # (J6/A1). Nothing mid-run, incomplete or failed can ever appear here.
+    if metric == "wonder":
+        biz = await businesses_col.find_one({"user_id": current_user["id"], "normalized_domain": site_host}) if businesses_col is not None else None
+        wonder_points = [
+            {
+                "job_id": h.get("run_id"),
+                "url": site_host,
+                "status": "completed",
+                "score": round(float(h["score"]), 1),
+                "created_at": h.get("created_at"),
+                "week_id": h.get("week_id"),
+                "inputs": h.get("inputs"),
+            }
+            for h in ((biz or {}).get("wonder_scores") or [])
+            if isinstance(h, dict) and isinstance(h.get("score"), (int, float))
+        ]
+        first_score = wonder_points[0]["score"] if wonder_points else None
+        last_score = wonder_points[-1]["score"] if wonder_points else None
+        delta = round(last_score - first_score, 1) if (first_score is not None and last_score is not None) else None
+        return {
+            "site": site_host,
+            "range": range,
+            "total_points": len(wonder_points),
+            "points": wonder_points,
+            "first_score": first_score,
+            "latest_score": last_score,
+            "delta": delta,
+            "direction": "up" if delta and delta > 0 else "down" if delta and delta < 0 else "flat",
+        }
+
     # 1. Check if business profile has weekly_scores saved in MongoDB
     if metric != "visibility" and businesses_col is not None:
         biz = await businesses_col.find_one({
@@ -226,6 +257,10 @@ async def api_user_history_site_trend(
         "user_id": current_user["id"],
         "url": {"$regex": site_host, "$options": "i"},
         "overall_score": {"$type": "number"},
+        # Only finished, complete runs are history. Running jobs write a
+        # partial overall_score after every question, and incomplete / failed
+        # / cancelled jobs must never become a point on the chart (J6/A4).
+        "status": "completed",
     }
 
     cutoff_iso = _iso_from_range(range)
@@ -383,6 +418,7 @@ async def api_scrape(
                 if public_business:
                     result["businessId"] = public_business["id"]
                     result["businessProfile"] = public_business
+                await _record_manual_crawl_run(current_user, business, result)
         except Exception as business_error:
             print(f"[Business] phase1 upsert failed: {business_error}")
 
@@ -448,6 +484,7 @@ async def api_scrape(
                         if public_business:
                             fallback["businessId"] = public_business["id"]
                             fallback["businessProfile"] = public_business
+                        await _record_manual_crawl_run(current_user, business, fallback)
                 except Exception as business_error:
                     print(f"[Business] phase1 fallback upsert failed: {business_error}")
             print(f"[API] /api/scrape reduced fallback returned: {request.url}")

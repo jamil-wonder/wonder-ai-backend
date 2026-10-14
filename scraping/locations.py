@@ -728,3 +728,158 @@ def build_location_info(
         "locationConfidence": overall,
         "orderedAddresses": ordered[:25],
     }
+
+
+# ============================================================================
+# G3: clean addresses[] and a structured {area, city, country, postcode} location
+# ============================================================================
+
+_STREET_WORDS = (
+    "street|st|road|rd|avenue|ave|lane|ln|drive|dr|way|square|sq|place|pl|gardens|gdns|court|ct|crescent|"
+    "terrace|row|mews|close|grove|yard|yards|walk|parade|hill|park|market|broadway|boulevard|blvd|highway|hwy|quay|wharf"
+)
+# "27c Eccleston Place, London SW1W 9NF" out of text that has other words glued in
+# front of it, or that has lost its commas (an address printed on three lines)
+_UK_ADDRESS_IN_TEXT = re.compile(
+    rf"(?P<street>\d+[A-Za-z]?(?:[-–/]\d+[A-Za-z]?)?\s+(?:[A-Za-z][A-Za-z'’.\-]*\s+){{0,4}}?(?:{_STREET_WORDS})\b)"
+    rf"[,\s]+(?:(?P<city>[A-Za-z][A-Za-z .'’\-]{{0,35}}?)[,\s]+)?(?P<pc>[A-Z]{{1,2}}\d[A-Z\d]?\s*\d[ABD-HJLNP-UW-Z]{{2}})",
+    re.IGNORECASE,
+)
+_US_ADDRESS_IN_TEXT = re.compile(
+    rf"(?P<street>\d+[A-Za-z]?\s+(?:[A-Za-z][A-Za-z'’.\-]*\s+){{0,4}}?(?:{_STREET_WORDS})\b\.?),?\s+(?P<city>[A-Za-z .'’\-]{{2,30}}),\s*(?P<pc>[A-Z]{{2}}\s+\d{{5}}(?:-\d{{4}})?)",
+)
+_UK_POSTCODE_ANYWHERE = re.compile(r"[A-Z]{1,2}\d[A-Z\d]?\s*\d[ABD-HJLNP-UW-Z]{2}", re.IGNORECASE)
+
+
+def _valid_address(text: str) -> bool:
+    text = _collapse(text)
+    if not (8 <= len(text) <= 140):
+        return False
+    parsed = _parse_free_text(text)
+    return bool(parsed and _has_evidence(parsed))
+
+
+def _join_address(m: re.Match) -> str:
+    parts = [m.group("street").strip(" ,"), (m.groupdict().get("city") or "").strip(" ,"), m.group("pc").strip()]
+    return _clean_address_string(", ".join(p for p in parts if p))
+
+
+def rescue_address(text: Any) -> str:
+    """The real address inside a longer string ("2024 All rights reserved ADDRESS
+    27c Eccleston Place London SW1W 9NF ..."), rebuilt as "street, city, postcode",
+    or "" if there is none."""
+    raw = _collapse(text)
+    if not raw:
+        return ""
+    for pattern in (_UK_ADDRESS_IN_TEXT, _US_ADDRESS_IN_TEXT):
+        for m in pattern.finditer(raw):
+            candidate = _join_address(m)
+            if _valid_address(candidate):
+                return candidate
+    return ""
+
+
+def clean_addresses(raw_addresses: Iterable[Any], limit: int = 12) -> List[str]:
+    """Keep only strings that really are addresses (a street and a city or
+    postcode). A string with an address buried in other text is cut down to the
+    address; everything else - sentences, slogans, "14 unique restaurants",
+    legal text - is dropped. Order is kept, duplicates removed."""
+    out: List[str] = []
+    seen = set()
+    for item in raw_addresses or []:
+        text = _collapse(item)
+        if not text:
+            continue
+        # prefer the tight address found inside the text; otherwise the text itself if it is one
+        rescued = rescue_address(text)
+        if _valid_address(text) and (not rescued or _norm_key(rescued) == _norm_key(text)):
+            candidate = _clean_address_string(text)          # already clean: leave it as written
+        else:
+            candidate = rescued or (_clean_address_string(text) if _valid_address(text) else "")
+        key = _norm_key(candidate) if candidate else ""
+        if candidate and key not in seen:
+            seen.add(key)
+            out.append(candidate)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def find_addresses_in_text(text: Any, limit: int = 6) -> List[str]:
+    """Last-resort search of page text for addresses ending in a UK postcode or
+    a US ZIP. Used only when the structured sources gave nothing valid."""
+    raw = _collapse(text)
+    found: List[str] = []
+    for pattern in (_UK_ADDRESS_IN_TEXT, _US_ADDRESS_IN_TEXT):
+        for m in pattern.finditer(raw):
+            candidate = _join_address(m)
+            if _valid_address(candidate):
+                found.append(candidate)
+            if len(found) >= limit * 2:
+                break
+    return clean_addresses(found, limit)
+
+
+# ----------------------------------------------------------------------------- structured location
+
+_ALL_COUNTRY_NAMES = {v for v in _COUNTRY_ALIASES.values()}
+
+
+def parse_location_input(value: Any, postcode: Any = "") -> Dict[str, str]:
+    """A typed or chosen location ("belgravia, london", "London, UK") as
+    {"area", "city", "country", "postcode", "label"}, Title Cased.
+
+      "Belgravia, London"      -> area Belgravia, city London
+      "london, uk"             -> city London, country UK
+      "Camber, Rye, UK"        -> area Camber, city Rye, country UK
+      "New York, NY, USA"      -> city New York, country US   (the state is dropped)
+
+    Never raises; an unusable value gives empty fields. A street address or a
+    postcode as the location is not accepted here - see location_input_problem()."""
+    text = _collapse(value)
+    parts = [p.strip() for p in re.split(r"\s*[,;|]\s*|\s+-\s+", text) if p.strip()]
+    country = ""
+    # trailing country
+    if parts:
+        # in a typed location the last part is the place for a country, so short
+        # forms like "USA" or "UAE" are trusted here (free page text is not)
+        c = _normalize_country(parts[-1], structured=parts[-1].strip(". ").lower() in {"uk", "gb", "us", "usa", "uae"})
+        if c:
+            country = c
+            parts = parts[:-1]
+    # a US state code between city and country
+    if country == "US" and len(parts) >= 2 and parts[-1].upper() in _US_STATES:
+        parts = parts[:-1]
+    parts = [_smart_title(p) for p in parts if p and not _UK_POSTCODE_ANYWHERE.fullmatch(p) and not re.fullmatch(r"\d{5}(?:-\d{4})?", p)]
+    area = city = ""
+    if parts:
+        city = parts[-1]
+        area = ", ".join(parts[:-1])
+    city = _CITY_ALIASES.get(city.lower(), city)
+    pc = _collapse(postcode).upper()
+    label_parts = [p for p in (area, city, country) if p]
+    return {"area": area, "city": city, "country": country, "postcode": pc, "label": ", ".join(label_parts)}
+
+
+def location_input_problem(value: Any) -> str:
+    """"" if `value` is a city/area, else why it isn't (same rules the wizard shows)."""
+    text = _collapse(value)
+    if not text:
+        return "Tell us where you're based so we can track the local searches your customers make."
+    if len(text) < 2:
+        return "That location looks too short."
+    if len(text) > 80:
+        return "Keep the location short - a city or area is enough."
+    if not re.search(r"[A-Za-zÀ-ɏ]{2}", text) or re.search(r"[@/]|https?:|www\.", text, re.I):
+        return "Enter a city or area, like “London, UK”."
+    if len(text.split()) > 6:
+        return "Enter a city or area, like “London, UK” - not a description."
+    if _UK_POSTCODE_ANYWHERE.search(text) or re.search(r"\b\d{5}(?:-\d{4})?\b", text) or (
+        re.search(r"\d", text) and re.search(rf"\b(?:{_STREET_WORDS})\b\.?", text, re.I)
+    ):
+        return "Enter a city or area (like “London, UK”), not a full street address or postcode."
+    if re.search(r"\d", text):
+        return "Enter a city or area, like “London, UK” - a place name has no numbers in it."
+    if not parse_location_input(text)["city"]:
+        return "Add a city or area as well as the country, like “London, UK”."
+    return ""

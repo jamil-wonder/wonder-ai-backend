@@ -197,6 +197,7 @@ async def _validate_same_niche_competitors_claude(
 
     compact_context = {
         "category": str(target_context.get("category") or "").strip(),
+        "sub_type": str(target_context.get("sub_type") or "").strip(),
         "location": str(target_context.get("location") or "").strip(),
         "services": [str(s).strip() for s in (target_context.get("services") or []) if str(s).strip()][:6],
         "description": str(target_context.get("description") or "").strip()[:180],
@@ -231,6 +232,7 @@ async def _validate_same_niche_competitors_claude(
 
     Rules:
         - Include only same-niche, same customer-intent competitors.
+        - If the target context has a sub_type (e.g. category "Restaurant", sub_type "Indian"), a competitor must match BOTH the category and the sub_type, and operate in the same area. A different cuisine/specialty in the same category is NOT a competitor.
         - A valid competitor must have both:
             1) niche_match >= 80
             2) business_model_match >= 80
@@ -421,9 +423,19 @@ async def generate_deep_competitor_scores(
     url: str,
     questions: list[dict],
     seed_results: dict,
+    target_profile: dict | None = None,
 ) -> list[dict]:
-    """Generate competitor scores in one aggregate pass using ideas collected during core analysis."""
+    """Generate competitor scores in one aggregate pass using ideas collected during core analysis.
+
+    `target_profile` (J4) is what the owner said the business is - category,
+    sub_type, location. When given it overrides what is guessed from the page."""
     domain = _normalize_domain(url)
+    profile = {k: str((target_profile or {}).get(k) or "").strip() for k in ("category", "sub_type", "location", "description")}
+    profile_lines = "\n    ".join(
+        f"{label}: {profile[key]}"
+        for key, label in (("category", "Category"), ("sub_type", "Specific type"), ("location", "Area"))
+        if profile[key]
+    )
 
     candidate_counts: dict[str, int] = {}
     # Iterate seed_results by value, not keyed off `questions`' own ids —
@@ -521,6 +533,7 @@ async def generate_deep_competitor_scores(
     Use live web search and these user-intent queries to identify direct competitors for the target.
 
     Target domain: '{domain}'
+    {profile_lines}
     Queries: {json.dumps(compact_questions)}
     Candidate domains from first-pass visibility analysis: {json.dumps(top_candidates)}
 
@@ -542,6 +555,8 @@ async def generate_deep_competitor_scores(
     Rules:
     - Max 5 competitors.
     - Direct competitors only (same intent/category overlap).
+    - If a "Specific type" is given, every competitor must be that same specific type in the same category (a different cuisine or specialty is not a competitor), and based in the same area.
+    - evidence must say in one short sentence why it matches (type, specific type, area).
     - Prefer independent business websites that users can choose instead of the target.
     - Use the official business homepage or best official business URL.
     - Do not return review/listing/profile/article URLs as competitor URLs.
@@ -612,7 +627,7 @@ async def generate_deep_competitor_scores(
 
     validated = await _validate_same_niche_competitors_claude(
         target_domain=domain,
-        target_context=await _fetch_page_context(url),
+        target_context={**(await _fetch_page_context(url)), **{k: v for k, v in profile.items() if v}},
         query_texts=compact_questions,
         candidates=combined_pool,
     )
@@ -716,6 +731,7 @@ async def generate_public_competitor_suggestions(
     description: str = "",
     desired_count: int = 4,
     openai_only: bool = False,
+    sub_type: str = "",
 ) -> list[dict]:
     """Fast competitor suggestions for public signup/onboarding.
 
@@ -734,6 +750,7 @@ async def generate_public_competitor_suggestions(
     - Domain: {domain}
     - Business name: {business_name or "unknown"}
     - Category: {category or "unknown"}
+    - Specific type: {sub_type or "not specified"}
     - Location: {location or "unknown"}
     - Description: {description[:240] or "unknown"}
 
@@ -757,6 +774,7 @@ async def generate_public_competitor_suggestions(
     - Return exactly {desired_count} competitors if direct competitors can be verified.
     - Return fewer only when fewer verified direct competitors are found.
     - Direct competitors must match the category and customer intent.
+    {"- The target's specific type is " + sub_type + " - every competitor MUST be that same specific type, not just the same broad category." if sub_type else ""}
     {"- The target's location is " + location + " — every competitor MUST be based in the same country (same city/region where possible). Never return a competitor from a different country than the target, even if the business name or category matches closely." if location else "- Location is unknown for the target — do not assume any specific country; do not return competitors just because they share a category with no location signal to confirm."}
     - Use the official homepage or official business website.
     - Do not include review sites, directories, booking platforms, articles, social media, or the target domain.

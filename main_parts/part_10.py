@@ -36,7 +36,7 @@ async def _manual_run_worker_loop():
                 biz_doc = await businesses_col.find_one({"_id": ObjectId(business_id)}) if businesses_col is not None else None
                 if not biz_doc:
                     raise RuntimeError(f"business {business_id} not found")
-                await _run_weekly_business_pipeline(biz_doc, week_id)
+                await _run_weekly_business_pipeline(biz_doc, week_id, trigger="run_now")
             except Exception as run_err:
                 result_status = "failed"
                 error = str(run_err)
@@ -197,7 +197,7 @@ async def wednesday_reminder_scheduler():
             print(f"[Scheduler] Midweek reminder pass failed: {e}")
 
 
-async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str) -> None:
+async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str, trigger: str = "weekly") -> None:
     """One business's full weekly pipeline: Phase 1 re-crawl, scan-complete
     email, weekly blogs, and (if it has a locked baseline) the Search
     Tracker re-run + weekly report email. Extracted from the scheduler loop
@@ -216,6 +216,17 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str) -> None:
         "email": biz_doc.get("user_email") or ""
     }
 
+    # J6: everything below is ONE scan run. The Wonder Score is written only
+    # if the run completes (crawl + tracker both finished OK).
+    pre_tracked = biz_doc.get("trackedQuestions")
+    has_tracker_leg = bool(biz_doc.get("questionsLocked") and isinstance(pre_tracked, list) and pre_tracked)
+    scan_run_id = await _scan_run_create(
+        business_id=business_id, user_id=user_id, url=url, trigger=trigger, legs=["crawl", "tracker", "plan"],
+    )
+    await _scan_run_set_leg(scan_run_id, "crawl", "running")
+    if not has_tracker_leg:
+        await _scan_run_set_leg(scan_run_id, "tracker", "skipped")
+
     print(f"[Scheduler] Running auto scrape for {url} (user: {user_id}, business: {business_id})...")
     try:
         result = await asyncio.wait_for(
@@ -223,7 +234,11 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str) -> None:
             timeout=420
         )
         if not isinstance(result, dict):
+            await _scan_run_set_leg(scan_run_id, "crawl", "failed", error="crawl returned no result")
+            await _scan_run_finalize(scan_run_id)
             return
+        crawl_scores = result.get("scores") if isinstance(result.get("scores"), dict) else {}
+        await _scan_run_set_leg(scan_run_id, "crawl", "ok", score=crawl_scores.get("total"))
 
         await _upsert_user_business(
             current_user=user_mock,
@@ -258,6 +273,10 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str) -> None:
             print(f"[Scheduler] AI insights unavailable for {url}: {insight_err}")
 
         tracker_email_data: dict | None = None
+        # Set False when the tracker leg ran but did not finish "completed"
+        # (incomplete / failed / timed out). The week is then NOT stamped, so
+        # the next catch-up pass retries it instead of treating it as done.
+        tracker_ok = True
 
         try:
             await _build_weekly_blogs_for_business(
@@ -266,8 +285,10 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str) -> None:
                 force=False,
             )
             print(f"[Scheduler] Weekly blogs ready for {url}")
+            await _scan_run_set_leg(scan_run_id, "plan", "ok")
         except Exception as blog_err:
             print(f"[Scheduler] Weekly blog generation failed for {url}: {blog_err}")
+            await _scan_run_set_leg(scan_run_id, "plan", "failed", error=str(blog_err)[:300])
 
         # Weekly Search Tracker re-run (Part 5 of the flow
         # spec): "the analyser runs every Sunday night —
@@ -286,7 +307,7 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str) -> None:
         if biz_doc.get("questionsLocked") and isinstance(tracked_questions, list) and tracked_questions:
             try:
                 questions_dicts = [
-                    {"id": str(q.get("id")), "text": str(q.get("query") or "").strip()}
+                    {"id": str(q.get("id")), "text": str(q.get("query") or "").strip(), "category": q.get("type")}
                     for q in tracked_questions
                     if isinstance(q, dict) and str(q.get("query") or "").strip()
                 ]
@@ -315,6 +336,8 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str) -> None:
                         "user_id": user_id,
                         "user_email": biz_doc.get("user_email") or user_mock["email"],
                         "business_id": business_id,
+                        "scan_run_id": scan_run_id,
+                        "scan_run_finalize": False,
                         "questions": questions_dicts,
                         "seed_results": {},
                         "status": "running",
@@ -328,8 +351,11 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str) -> None:
                         "error": None,
                         "created_at": tracker_now_iso,
                         "updated_at": tracker_now_iso,
+                        # the weekly run is what takes the new snapshot of the four models
+                        "fresh": True,
                     }
                     await phase5_jobs_col.insert_one(tracker_job_doc)
+                    await _scan_run_set_leg(scan_run_id, "tracker", "running", job_id=tracker_job_id)
                     print(
                         f"[Scheduler] Running weekly Search Tracker re-run for {url} "
                         f"({len(questions_dicts)} questions, all 4 models)..."
@@ -338,8 +364,22 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str) -> None:
                     # a real locked-20 run is 10x the question volume, so
                     # this leaves real headroom rather than cutting off a
                     # slow-but-working run overnight.
-                    await asyncio.wait_for(_process_phase5_job(tracker_job_doc), timeout=3600)
-                    print(f"[Scheduler] Weekly Search Tracker re-run completed for {url}")
+                    try:
+                        await asyncio.wait_for(_process_phase5_job(tracker_job_doc), timeout=3600)
+                    except asyncio.TimeoutError:
+                        # Don't leave a "running" job behind forever.
+                        await phase5_jobs_col.update_one(
+                            {"job_id": tracker_job_id, "status": "running"},
+                            {"$set": {"status": "failed", "error": "Weekly run timed out after 3600s",
+                                      "updated_at": datetime.utcnow().isoformat()}},
+                        )
+                        raise
+                    final_status_doc = await phase5_jobs_col.find_one({"job_id": tracker_job_id}, {"status": 1, "_id": 0})
+                    tracker_ok = bool(final_status_doc and final_status_doc.get("status") == "completed")
+                    print(
+                        f"[Scheduler] Weekly Search Tracker re-run "
+                        f"{'completed' if tracker_ok else 'did NOT complete (' + str((final_status_doc or {}).get('status')) + ')'} for {url}"
+                    )
 
                     try:
                         finished_job = await phase5_jobs_col.find_one({"job_id": tracker_job_id})
@@ -477,6 +517,8 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str) -> None:
                     except Exception as weekly_email_err:
                         print(f"[Scheduler] Weekly Search Tracker data build failed for {url}: {weekly_email_err}")
             except Exception as tracker_err:
+                tracker_ok = False
+                await _scan_run_set_leg(scan_run_id, "tracker", "failed", error=str(tracker_err)[:300] or "tracker run failed")
                 print(f"[Scheduler] Weekly Search Tracker re-run failed for {url}: {tracker_err}")
 
         try:
@@ -502,7 +544,10 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str) -> None:
         # for this week instead of redoing it or, worse, silently never
         # getting to it because the old code just slept until next Sunday
         # regardless of whether this run actually finished.
-        if businesses_col is not None:
+        await _scan_run_finalize(scan_run_id)
+        if not tracker_ok:
+            print(f"[Scheduler] {url}: tracker run incomplete — week {week_id} not stamped, will retry")
+        elif businesses_col is not None:
             try:
                 await businesses_col.update_one(
                     {"_id": biz_doc["_id"]},
@@ -512,6 +557,16 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str) -> None:
                 print(f"[Scheduler] Failed to stamp weekly_run_week_id for {url}: {stamp_err}")
     except Exception as scrape_err:
         print(f"[Scheduler] Auto scrape failed for {url}: {scrape_err}")
+        # Any leg still "running" never finished, so the run can never be complete.
+        if scan_run_id and scan_runs_col is not None:
+            try:
+                run_doc = await scan_runs_col.find_one({"run_id": scan_run_id}, {"legs": 1})
+                for leg_name, leg in ((run_doc or {}).get("legs") or {}).items():
+                    if (leg or {}).get("status") == "running":
+                        await _scan_run_set_leg(scan_run_id, leg_name, "failed", error=str(scrape_err)[:300])
+                await _scan_run_finalize(scan_run_id)
+            except Exception as close_err:
+                print(f"[ScanRun] could not close run after a failure: {close_err}")
 
 
 async def _run_weekly_pass(week_id: str) -> None:

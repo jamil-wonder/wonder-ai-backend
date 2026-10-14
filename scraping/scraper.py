@@ -1,4 +1,5 @@
 import json
+
 import re
 import asyncio
 import sys
@@ -18,8 +19,9 @@ import httpx
 from models import ScrapeResult, Scores, ScoreBreakdown
 from agents import ai_agent
 from scraping.category import infer_category
-from scraping.locations import build_location_info
+from scraping.locations import build_location_info, clean_addresses, find_addresses_in_text
 from scraping.naming import clean_text as clean_display_text, prefer_brand_name
+from scraping.schema_type import local_business_types, compute_schema_score, SCHEMA_MAX_SCORE
 
 SOCIAL_PATTERNS = {
     'facebook':  re.compile(r'facebook\.com/(?!sharer|share|login|dialog)([\w.%-]+)', re.I),
@@ -630,27 +632,17 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
                         addresses.add(unquote(addr).replace('+', ' '))
                 except: pass
 
-    # Deep Text Regex Fallback for Addresses (especially for UK/US formats)
+    # G3: only real addresses (a street and a city or postcode) count. Strings the
+    # structured sources produced that are really slogans, legal text or an address
+    # glued to other words are dropped or cut down to the address itself.
+    addresses = set(clean_addresses(addresses))
+
+    # Text fallback, only when nothing valid was found above: addresses ending in
+    # a UK postcode or a US ZIP, cut out of the page text.
     if not addresses:
-        ADDRESS_SNIP_REGEX = re.compile(r'(\d+\s+[A-Za-z0-9\s,]{5,50}(?:Street|St|Road|Rd|Avenue|Ave|Lane|Ln|Drive|Dr|Way|Square|Sq|Plaza|Pl|Gardens|Gdns|London|Manchester|Birmingham|W1|EC1|SW1|E1|N1|NW1|SE1|WC1|[\s,]{1,2}[A-Z]{1,2}\d{1,2}\s+\d[A-Z]{2}))', re.I)
         for s_doc in all_soups:
-            text = s_doc.get_text()
-            # Look for common UK Postcode patterns at the end of snippets
-            postcode_matches = re.finditer(r'([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})', text, re.I)
-            for pm in postcode_matches:
-                start = max(0, pm.start() - 100)
-                snip = text[start:pm.end()]
-                # Extract the last few lines/parts ending in this postcode
-                parts = re.split(r'[\r\n]{1,2}', snip)
-                potential = parts[-1].strip()
-                if len(potential) > 10:
-                    addresses.add(potential)
-            
-            # Explicit search for Broadwick St style addresses
-            matches = ADDRESS_SNIP_REGEX.findall(text)
-            for m in matches:
-                if len(m.strip()) > 10:
-                    addresses.add(m.strip())
+            for found in find_addresses_in_text(s_doc.get_text(" ")):
+                addresses.add(found)
 
     opening_hours = []
     for s in schemas:
@@ -1022,6 +1014,9 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
         print(f"Phase1 enrichment error: {enrich_error.__class__.__name__}: {str(enrich_error)}")
         ai_debug["reason"] = str(enrich_error)[:220]
 
+    # addresses that arrived later (AI enrichment) get the same check before they earn points
+    addresses = set(clean_addresses(addresses))
+
     b_name_score = 8 if business_name else 0
     desc_score = 9 if description else 0
     logo_score = 4 if logo_url else 0
@@ -1051,14 +1046,19 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
     # universal signal than booking.
     has_contact_path = bool(soup.find_all('a', href=re.compile(r'contact|get-?in-?touch|enquir|reach-?us', re.I)))
 
-    schema_present = 4 if len(schemas) > 0 else 0
-    has_business_type = any(
-        isinstance(s.get('@type'), str) and re.search(r'business|organization|localbusiness|store|restaurant|service', s['@type'], re.I) 
-        for s in schemas if isinstance(s, dict)
+    # C3: only a LocalBusiness-family @type counts. `Organization`, `WebSite`
+    # or `Service` alone say nothing about where the business is or what kind
+    # it is, so they no longer earn the type points - and without one the
+    # whole Schema score is capped at 50%.
+    local_types = local_business_types(schemas)
+    has_business_type = bool(local_types)
+    schema_calc = compute_schema_score(
+        has_schema=len(schemas) > 0,
+        local_types=local_types,
+        has_key_fields=bool(len(addresses) > 0 and len(phones) > 0 and business_name),
     )
-    schema_type_score = 3 if has_business_type else 0
-    schema_key_fields = 3 if (len(addresses) > 0 and len(phones) > 0 and business_name) else 0
-    schema_score = schema_present + schema_type_score + schema_key_fields
+    schema_present, schema_type_score, schema_key_fields = schema_calc["present"], schema_calc["correctType"], schema_calc["keyFields"]
+    schema_score, schema_capped = schema_calc["total"], schema_calc["capped"]
 
     ssl_score = 3 if has_ssl else 0
     mobile_score = 2 if has_mobile_meta else 0
@@ -1078,6 +1078,7 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
     if not social_links: warnings.append('No social media links found — fewer trust signals for AI and search.')
     if not has_contact_path: warnings.append('No contact page found — makes it harder for customers and AI to reach you.')
     if not schemas: warnings.append('No JSON-LD / Schema.org markup found.')
+    if not has_business_type: warnings.append('No LocalBusiness-type schema (e.g. Restaurant, Store, Hotel) found — the Schema score is capped at 50%.')
     if not has_mobile_meta: warnings.append('Missing viewport meta tag.')
     if not canonical_url: warnings.append('No canonical URL — duplicate content risk.')
     if not sitemap_found: warnings.append('No sitemap.xml found at site root.')
@@ -1160,7 +1161,8 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
             "contact": {"total": contact_score, "phone": phone_score, "email": email_score, "address": address_score},
             "operating": {"total": operating_score, "hoursVisible": hours_visible, "hoursStructured": hours_structured},
             "trust": {"total": trust_score, "socialLinks": social_score, "booking": booking_score},
-            "schema": {"total": schema_score, "present": schema_present, "correctType": schema_type_score, "keyFields": schema_key_fields},
+            "schema": {"total": schema_score, "present": schema_present, "correctType": schema_type_score, "keyFields": schema_key_fields,
+                       "max": SCHEMA_MAX_SCORE, "hasLocalBusinessType": has_business_type, "localBusinessTypes": local_types, "capped": schema_capped},
             "technical": {"total": technical_score, "ssl": ssl_score, "mobile": mobile_score, "canonical": canonical_score, "sitemap": sitemap_score, "robots": robots_score}
         },
         "rawMeta": raw_meta,

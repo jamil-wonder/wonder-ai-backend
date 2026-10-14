@@ -28,6 +28,7 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
             "business_id": public_business["id"] if public_business else None,
             "questions": questions_dicts,
             "seed_results": {},
+            "fresh": bool(getattr(req, "fresh", False)),
             "status": "queued",
             "total": len(questions_dicts),
             "processed": 0,
@@ -39,7 +40,17 @@ async def api_phase5_start_job(req: Phase5StartJobRequest, current_user: dict = 
             "created_at": now_iso,
             "updated_at": now_iso,
         }
+        # J6: this run is one scan run; its Wonder Score is only written when it completes.
+        scan_run_id = await _scan_run_create(
+            business_id=job_doc["business_id"], user_id=job_doc["user_id"], url=req.url,
+            trigger="manual_tracker", legs=["tracker"],
+        )
+        if scan_run_id:
+            job_doc["scan_run_id"] = scan_run_id
+            job_doc["scan_run_finalize"] = True
         await phase5_jobs_col.insert_one(job_doc)
+        if scan_run_id:
+            await _scan_run_set_leg(scan_run_id, "tracker", "running", job_id=job_id)
 
         print(
             f"[Phase5] queued job_id={job_id} provider={model_provider} "
@@ -161,6 +172,42 @@ async def api_phase5_start_deep_job(req: Phase5StartJobRequest, current_user: di
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/phase5/retry-failed/{job_id}")
+async def api_phase5_retry_failed(job_id: str, current_user: dict = Depends(get_current_user)):
+    """A4: re-run only the model answers that failed in a finished run. Queued
+    for the worker like any other job; the page polls the same job id."""
+    if phase5_jobs_col is None:
+        raise HTTPException(status_code=503, detail="phase5 job storage unavailable")
+    job = await phase5_jobs_col.find_one({"job_id": job_id})
+    # Someone else's job looks exactly like a missing one.
+    if not job or job.get("user_id") != current_user.get("id"):
+        raise HTTPException(status_code=404, detail="job not found")
+    if job.get("job_type") != "core" or job.get("model") != "multi":
+        raise HTTPException(status_code=400, detail="only full multi-model runs can be retried")
+    if job.get("status") not in {"completed", "incomplete"}:
+        raise HTTPException(status_code=409, detail="this run is still in progress")
+    failed = int(compute_run_health(job.get("results") or {}).get("failed") or 0)
+    if failed == 0:
+        raise HTTPException(status_code=409, detail="nothing to retry — every model answered")
+
+    claimed = await phase5_jobs_col.find_one_and_update(
+        {"job_id": job_id, "status": {"$in": ["completed", "incomplete"]}},
+        {"$set": {
+            "status": "queued",
+            "retry_failed_only": True,
+            "queue_priority": 0,
+            "processed": 0,
+            "total": failed,
+            "updated_at": datetime.utcnow().isoformat(),
+        }},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not claimed:
+        raise HTTPException(status_code=409, detail="this run is already being retried")
+    print(f"[Phase5] retry-failed queued job_id={job_id} failed_answers={failed}")
+    return {"job_id": job_id, "status": "queued", "total": failed}
+
+
 @app.get("/api/phase5/job-status/{job_id}", response_model=Phase5JobStatusResponse)
 async def api_phase5_job_status(job_id: str):
     if phase5_jobs_col is None:
@@ -179,6 +226,8 @@ async def api_phase5_job_status(job_id: str):
         "deep_competitors": job.get("deep_competitors", []),
         "brand_summary": job.get("brand_summary"),
         "error": job.get("error"),
+        "answers_collected_at": job.get("answers_collected_at") or job.get("created_at"),
+        "run_health": job.get("run_health"),
     }
 
 
@@ -203,9 +252,12 @@ async def api_phase5_latest_job(business_id: str, current_user: dict = Depends(g
         raise HTTPException(status_code=404, detail="business not found")
 
     job = await phase5_jobs_col.find_one(
-        {"business_id": business_id, "job_type": "core", "status": "completed", "results": {"$ne": {}}},
+        # "incomplete" runs are included on purpose: their results still hold the
+        # answers that DID work, and the page needs the failed ones to show
+        # "Unavailable — retry" instead of silently starting from an empty table.
+        {"business_id": business_id, "job_type": "core", "status": {"$in": ["completed", "incomplete"]}, "results": {"$ne": {}}},
         sort=[("created_at", -1)],
-        projection={"_id": 0, "job_id": 1, "results": 1, "deep_competitors": 1, "overall_score": 1, "created_at": 1},
+        projection={"_id": 0, "job_id": 1, "status": 1, "run_health": 1, "results": 1, "deep_competitors": 1, "overall_score": 1, "created_at": 1, "answers_collected_at": 1, "questions": 1, "scan_run_id": 1},
     )
     if not job:
         return {"found": False}
@@ -213,10 +265,16 @@ async def api_phase5_latest_job(business_id: str, current_user: dict = Depends(g
     return {
         "found": True,
         "job_id": job.get("job_id"),
+        "status": job.get("status"),
+        "run_health": job.get("run_health"),
         "results": job.get("results") or {},
         "deep_competitors": job.get("deep_competitors") or [],
         "overall_score": job.get("overall_score"),
         "created_at": job.get("created_at"),
+        "answers_collected_at": job.get("answers_collected_at") or job.get("created_at"),
+        # D1: the Overview reads this same run, so it needs the question texts too
+        "questions": job.get("questions") or [],
+        "scan_run_id": job.get("scan_run_id"),
     }
 
 
@@ -253,6 +311,7 @@ async def api_phase5_job_stream(job_id: str, request: Request):
                     "provider_scores": 1,
                     "overall_score": 1,
                     "error": 1,
+                    "run_health": 1,
                 },
             )
 
@@ -281,6 +340,7 @@ async def api_phase5_job_stream(job_id: str, request: Request):
                     "brand_summary": job.get("brand_summary"),
                     "deep_competitors": job.get("deep_competitors", []),
                     "error": job.get("error"),
+                    "run_health": job.get("run_health"),
                 }
                 yield f"data: {json.dumps(payload, default=str)}\n\n"
                 last_processed = processed

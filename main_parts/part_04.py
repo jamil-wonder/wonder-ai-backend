@@ -415,7 +415,15 @@ async def api_user_businesses(current_user: dict = Depends(get_current_user)):
 
     cursor = businesses_col.find({"user_id": current_user["id"]}).sort("updated_at", -1).limit(100)
     docs = await cursor.to_list(length=100)
-    return [_public_business_doc(doc) for doc in docs if _public_business_doc(doc)]
+    await _ensure_wonder_scores(docs)
+    active_runs = await _scan_run_active_for([str(d.get("_id")) for d in docs])
+    out = []
+    for doc in docs:
+        public = _public_business_doc(doc)
+        if public:
+            public["scan_run_active"] = active_runs.get(str(doc.get("_id")))
+            out.append(public)
+    return out
 
 
 @app.post("/api/user/businesses", response_model=BusinessResponse)
@@ -439,6 +447,13 @@ async def api_user_business_upsert(
         if current_count >= 3:
             raise HTTPException(status_code=400, detail="You can save up to 3 business profiles for now")
 
+    # G3: a NEW location must be a city/area. A location that is merely being
+    # re-sent unchanged (the Analyzer saves the whole profile) is not re-judged here:
+    # saving must not fail over an old value; _upsert_user_business keeps the last good one.
+    new_location_problem = location_input_problem(request.location) if _clean_optional_text(request.location) else ""
+    if new_location_problem and _clean_optional_text(request.location) != _clean_optional_text((existing or {}).get("location")):
+        raise HTTPException(status_code=422, detail=new_location_problem)
+
     # A manual scan (Analyser page) saves its result here via
     # latest_scrape_result, but this endpoint never used to forward its
     # score into latest_phase1_score/weekly_scores — only the Sunday
@@ -456,7 +471,9 @@ async def api_user_business_upsert(
         current_user=current_user,
         url=request.url,
         category=request.category,
+        sub_type=request.subType,
         location=request.location,
+        location_postcode=request.locationPostcode,
         business_name=request.businessName,
         logo_url=request.logoUrl,
         business_description=request.businessDescription,
@@ -727,17 +744,20 @@ async def api_public_report(token: str):
     if not business:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    visibility_score = business.get("latest_phase5_score")
-    technical_score = business.get("latest_phase1_score")
-    has_visibility_score = isinstance(visibility_score, (int, float))
-    headline_score = visibility_score if has_visibility_score else technical_score
+    # J6/A1: the headline is the Wonder Score of the latest COMPLETE scan run -
+    # the same stored number the dashboard shows - never a technical or
+    # visibility fallback, so the report can't disagree with the app.
+    wonder_score = business.get("latest_wonder_score")
+    has_visibility_score = isinstance(wonder_score, (int, float))
+    headline_score = wonder_score if has_visibility_score else None
 
-    visibility_history = business.get("visibility_weekly_scores") or []
-    previous_score = None
-    if isinstance(visibility_history, list) and len(visibility_history) >= 2:
-        prev_entry = visibility_history[-2]
-        if isinstance(prev_entry.get("score"), (int, float)):
-            previous_score = prev_entry["score"]
+    # E1: "vs last week" only against a COMPLETE run at least 6 days older than
+    # the latest one - never just "the run before", which may be minutes ago.
+    visibility_history = business.get("wonder_scores") or []
+    latest_run_id = business.get("latest_wonder_run_id")
+    latest_run_at = business.get("latest_wonder_at")
+    previous_pick = pick_previous_score(visibility_history, latest_run_id, latest_run_at) if has_visibility_score else None
+    previous_score = previous_pick["score"] if previous_pick else None
 
     system_competitors = business.get("systemCompetitors") or []
     competitor_scores = [
@@ -760,46 +780,64 @@ async def api_public_report(token: str):
     if isinstance(headline_score, (int, float)) and named_competitors:
         rank = 1 + sum(1 for c in named_competitors if c["score"] > _round_half_up(headline_score))
 
-    # Real Search Tracker data: per-model appearance and what-moved, from
-    # the business's most recent completed multi-model run (and the one
-    # before it, for a real diff — never a guessed number).
+    # Real Search Tracker data: per-model appearance and what-moved, from the
+    # Search Tracker run THIS score was built from (E1) - the same stored run
+    # the app shows - and, for "what moved", the tracker run of the previous
+    # complete scan run. Never a guessed number, never a diff against a run
+    # that was not complete.
     per_model: list[dict] = []
     what_moved: list[str] = []
+    what_moved_available = False
     business_id = str(business.get("_id"))
     if phase5_jobs_col is not None:
-        latest_job = await phase5_jobs_col.find_one(
-            {"business_id": business_id, "job_type": "core", "model": "multi", "status": "completed"},
-            sort=[("created_at", -1)],
-        )
+        current_entry = next(
+            (h for h in reversed(visibility_history) if isinstance(h, dict) and h.get("run_id") == latest_run_id),
+            None,
+        ) if isinstance(visibility_history, list) else None
+        run_job_id = (current_entry or {}).get("tracker_job_id")
+        latest_job = None
+        if run_job_id:
+            latest_job = await phase5_jobs_col.find_one({"job_id": run_job_id, "job_type": "core", "model": "multi", "status": "completed"})
+        if latest_job is None:
+            # older scores (before runs recorded their tracker run): the latest completed one
+            latest_job = await phase5_jobs_col.find_one(
+                {"business_id": business_id, "job_type": "core", "model": "multi", "status": "completed"},
+                sort=[("created_at", -1)],
+            )
         if latest_job:
             provider_scores = latest_job.get("provider_scores") or {}
             model_labels = {"chatgpt": "ChatGPT", "perplexity": "Perplexity", "claude": "Claude", "gemini": "Gemini"}
             for key, label in model_labels.items():
                 stats = provider_scores.get(key)
-                if isinstance(stats, dict) and isinstance(stats.get("total"), (int, float)):
+                # A model that failed outright has no usable answers (A4):
+                # leave it off the report rather than printing "0 of 0".
+                if isinstance(stats, dict) and isinstance(stats.get("total"), (int, float)) and stats["total"] > 0:
                     per_model.append({"model": label, "mentioned": int(stats.get("mentioned") or 0), "total": int(stats["total"])})
 
-            previous_job = await phase5_jobs_col.find_one(
-                {
-                    "business_id": business_id,
-                    "job_type": "core",
-                    "model": "multi",
-                    "status": "completed",
-                    "job_id": {"$ne": latest_job.get("job_id")},
-                },
-                sort=[("created_at", -1)],
+            # "What moved" needs a SECOND complete run with its own tracker data
+            previous_job_id = pick_previous_tracker_job_id(
+                list(reversed(visibility_history)) if isinstance(visibility_history, list) else [],
+                latest_run_id,
+                latest_job.get("job_id"),
             )
-            question_text_by_id = {str(q.get("id")): str(q.get("text") or "") for q in (latest_job.get("questions") or [])}
-            what_moved, _ = _compute_weekly_diff(
-                current_results=latest_job.get("results") or {},
-                previous_results=(previous_job or {}).get("results") or {},
-                question_text_by_id=question_text_by_id,
-                target_domain=_normalize_domain(business.get("url") or ""),
-            )
-            # Strip the HTML entities/markup _compute_weekly_diff uses for
-            # the email template — this is a plain-JSON API, the frontend
-            # renders its own styling.
-            what_moved = [re.sub(r"&#\d+;|&\w+;", "", m).strip() for m in what_moved[:3]]
+            previous_job = None
+            if previous_job_id:
+                previous_job = await phase5_jobs_col.find_one(
+                    {"job_id": previous_job_id, "job_type": "core", "model": "multi", "status": "completed"}
+                )
+            if previous_job:
+                what_moved_available = True
+                question_text_by_id = {str(q.get("id")): str(q.get("text") or "") for q in (latest_job.get("questions") or [])}
+                what_moved, _ = _compute_weekly_diff(
+                    current_results=latest_job.get("results") or {},
+                    previous_results=previous_job.get("results") or {},
+                    question_text_by_id=question_text_by_id,
+                    target_domain=_normalize_domain(business.get("url") or ""),
+                )
+                # Strip the HTML entities/markup _compute_weekly_diff uses for
+                # the email template — this is a plain-JSON API, the frontend
+                # renders its own styling.
+                what_moved = [re.sub(r"&#\d+;|&\w+;", "", m).strip() for m in what_moved[:3]]
 
     scrape = business.get("latest_scrape_result") or {}
     audit_areas = _compute_audit_areas(scrape) if scrape else []
@@ -814,14 +852,21 @@ async def api_public_report(token: str):
         # frontend must not present that state as a tested AI-visibility
         # result to whoever this link was shared with.
         "visibilityVerified": has_visibility_score,
+        # The three inputs behind the score, named exactly as in the app (A1)
+        "scoreBreakdown": (business.get("latest_wonder_inputs") if has_visibility_score else None),
+        "scoreExact": (wonder_score if has_visibility_score else None),
         "previousScore": _round_half_up(previous_score) if isinstance(previous_score, (int, float)) else None,
+        # which complete run "vs last week" compares against (None = no run that old yet)
+        "previousScoreAt": previous_pick["at"] if previous_pick else None,
+        "whatMovedAvailable": what_moved_available,
         "competitorAverage": _round_half_up(competitor_avg) if isinstance(competitor_avg, (int, float)) else None,
         "rank": rank,
         "competitors": named_competitors,
         "perModel": per_model,
         "whatMoved": what_moved,
         "auditAreas": audit_areas,
-        "updatedAt": business.get("latest_phase5_at") or business.get("latest_phase1_at") or business.get("updated_at"),
+        # when the run behind these numbers completed
+        "updatedAt": (latest_run_at if has_visibility_score else None) or business.get("latest_phase5_at") or business.get("latest_phase1_at") or business.get("updated_at"),
     }
 
 

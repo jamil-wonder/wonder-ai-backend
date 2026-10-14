@@ -180,6 +180,11 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "normalized_domain": doc.get("normalized_domain") or "",
         "businessName": doc.get("businessName"),
         "category": doc.get("category"),
+        "subType": doc.get("sub_type") or "",
+        # G3: structured location; for older records it is derived from the saved text,
+        # and None (with the reason) when that text is not a city/area
+        "locationData": _location_data_for(doc),
+        "locationProblem": (location_input_problem(doc.get("location")) or None) if doc.get("location") else None,
         "location": doc.get("location"),
         "logoUrl": doc.get("logoUrl"),
         "businessDescription": doc.get("businessDescription"),
@@ -187,6 +192,9 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "services": doc.get("services") if isinstance(doc.get("services"), list) else [],
         "targetAudience": doc.get("targetAudience"),
         "blogVoice": doc.get("blogVoice"),
+        # F3: the English blogs are written in - the owner's choice ("" = detect) and what detection gives
+        "blogLanguage": doc.get("blogLanguage") or "",
+        "blogLanguageDetected": resolve_blog_language(doc),
         "blogKeywords": doc.get("blogKeywords") if isinstance(doc.get("blogKeywords"), list) else [],
         "questionGeneration": _normalize_question_generation_settings(doc.get("questionGeneration")),
         "questionsLocked": bool(doc.get("questionsLocked")),
@@ -200,6 +208,9 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "latest_phase5_score": doc.get("latest_phase5_score"),
         "latest_phase1_at": doc.get("latest_phase1_at"),
         "latest_phase5_at": doc.get("latest_phase5_at"),
+        "latest_wonder_score": doc.get("latest_wonder_score"),
+        "latest_wonder_at": doc.get("latest_wonder_at"),
+        "latest_wonder_inputs": doc.get("latest_wonder_inputs"),
         "latest_weekly_blog_at": doc.get("latest_weekly_blog_at"),
         "last_manually_refreshed_at": doc.get("last_manually_refreshed_at"),
         "created_at": doc.get("created_at"),
@@ -208,6 +219,17 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "latest_analysis": doc.get("latest_analysis"),
         "scores_history": doc.get("scores_history") or [],
     }
+
+
+def _location_data_for(doc: dict) -> dict | None:
+    stored = doc.get("location_data")
+    if isinstance(stored, dict) and stored.get("city"):
+        return stored
+    text = doc.get("location")
+    if not text or location_input_problem(text):
+        return None
+    parsed = parse_location_input(text)
+    return {k: parsed[k] for k in ("area", "city", "country", "postcode")} if parsed["city"] else None
 
 
 def _public_tracking_run_doc(doc: dict | None) -> dict | None:
@@ -266,6 +288,7 @@ async def _run_competitor_tracking_for_business(
     business_context = {
         "name": business_doc.get("businessName") or business_doc.get("normalized_domain") or target_domain,
         "category": business_doc.get("category") or "",
+        "sub_type": business_doc.get("sub_type") or "",
         "location": business_doc.get("location") or "",
         "description": business_doc.get("aiDescription") or business_doc.get("businessDescription") or "",
         "services": business_doc.get("services") if isinstance(business_doc.get("services"), list) else [],
@@ -324,6 +347,7 @@ async def _run_competitor_tracking_for_business(
             url=url,
             questions=questions,
             seed_results=seed_results,
+            target_profile=await _competitor_target_profile(business_id),
         )
 
         previous = await competitor_tracking_runs_col.find_one(

@@ -15,6 +15,7 @@ from .config import (
     PHASE5_ENABLE_GEMINI,
     PHASE5_FAST_MODE,
     PHASE5_MODEL_CALL_TIMEOUT_SEC,
+    PHASE5_VOTE_SAMPLING,
     PHASE5_VALIDATE_COMPETITORS,
     NON_COMPETITOR_DOMAINS,
 )
@@ -235,6 +236,35 @@ async def _validate_direct_competitors(
         return []
 
 
+_NEGATION = re.compile(
+    r"\b(no|not|never|without|isn't|is not|aren't|doesn't|does not|didn't|unable|cannot|can't|absent|missing|lack|lacks)\b"
+)
+
+
+def _named_in_answer(answer_text: str, domain: str, business_name: str | None = None) -> tuple:
+    """B1: is the business NAMED in the answer text? Returns (named, evidence).
+
+    Matches the business name, the domain, or the domain's brand word as whole
+    words, and ignores sentences that say it is absent ("no mention of X").
+    `evidence` is the sentence that names it, for the Query modal."""
+    text = str(answer_text or "")
+    if not text.strip():
+        return False, None
+    names = []
+    for raw in (business_name, _normalize_domain(domain), (_normalize_domain(domain).split(".")[0] if domain else "")):
+        t = re.sub(r"\s+", " ", str(raw or "").strip().lower())
+        if len(t) >= 4 and t not in names:
+            names.append(t)
+    if not names:
+        return False, None
+    pattern = re.compile(r"(?<![a-z0-9])(" + "|".join(re.escape(n) for n in names) + r")(?![a-z0-9])")
+    for sentence in re.split(r"(?<=[.!?\n])\s+", text):
+        low = sentence.lower()
+        if pattern.search(low) and not _NEGATION.search(low):
+            return True, sentence.strip()[:240]
+    return False, None
+
+
 async def _analyze_single_question_openai(
     url: str,
     question: dict,
@@ -413,9 +443,14 @@ async def _analyze_single_question_openai(
     text_negative = _is_negative_text_mention(response_text, token_domain) or _is_negative_text_mention(response_text, brand_token)
     text_positive = _is_positive_text_mention(response_text, token_domain)
 
+    # only the answer itself: the raw reply also holds JSON fields (domain,
+    # reasoning, ...) that echo the target and would always "name" it
+    named_in_answer, named_evidence = _named_in_answer(concise_answer or "", domain, (target_context or {}).get("name"))
+    cited_as_source = bool(target_seen_in_sources or target_seen_in_references)
+    # B1: a mention is being named in the answer text OR cited as a source
     target_evidence = bool(
-        target_seen_in_sources
-        or target_seen_in_references
+        cited_as_source
+        or named_in_answer
         or (text_has_domain and text_positive and not text_negative)
     )
 
@@ -468,6 +503,9 @@ async def _analyze_single_question_openai(
         "reasoning": reasoning or None,
         "llm_response": answer_text,
         "target_site": target_site,
+        "named_in_answer": named_in_answer,
+        "cited_as_source": cited_as_source,
+        "named_evidence": named_evidence,
     }
 
 
@@ -648,9 +686,14 @@ async def _analyze_single_question_perplexity(
     text_negative = _is_negative_text_mention(response_text, token_domain) or _is_negative_text_mention(response_text, brand_token)
     text_positive = _is_positive_text_mention(response_text, token_domain)
 
+    # only the answer itself: the raw reply also holds JSON fields (domain,
+    # reasoning, ...) that echo the target and would always "name" it
+    named_in_answer, named_evidence = _named_in_answer(concise_answer or "", domain, (target_context or {}).get("name"))
+    cited_as_source = bool(target_seen_in_sources or target_seen_in_references)
+    # B1: a mention is being named in the answer text OR cited as a source
     target_evidence = bool(
-        target_seen_in_sources
-        or target_seen_in_references
+        cited_as_source
+        or named_in_answer
         or (text_has_domain and text_positive and not text_negative)
     )
 
@@ -703,6 +746,9 @@ async def _analyze_single_question_perplexity(
         "reasoning": reasoning or None,
         "llm_response": answer_text,
         "target_site": target_site,
+        "named_in_answer": named_in_answer,
+        "cited_as_source": cited_as_source,
+        "named_evidence": named_evidence,
     }
 
 
@@ -944,7 +990,13 @@ async def analyze_single_question(
                 position = grounded_pos
 
         response_text = ((response.text or "") if response is not None else "").lower()
-        if not target_mentioned and (domain in response_text or brand_token in response_text):
+        gemini_answer = str(data.get("concise_answer", "") if isinstance(data, dict) else "").strip()
+        named_in_answer, named_evidence = _named_in_answer(gemini_answer, domain, (target_context or {}).get("name"))
+        cited_as_source = bool(grounded_mentioned or any(_is_target_domain_match(str(x), domain) for x in raw_sources + raw_references))
+        # B1: counts only when the ANSWER names the business. (This used to
+        # test the whole raw reply, whose JSON fields echo the target's own
+        # domain - so Gemini "mentioned" the business on nearly every question.)
+        if not target_mentioned and named_in_answer:
             target_mentioned = True
             if position is None:
                 position = 8
@@ -1123,6 +1175,9 @@ async def analyze_single_question(
             "reasoning": reasoning or None,
             "llm_response": answer_text,
             "target_site": target_site,
+            "named_in_answer": named_in_answer,
+            "cited_as_source": cited_as_source,
+            "named_evidence": named_evidence,
         }
         return result_payload
 
@@ -1132,6 +1187,8 @@ async def analyze_single_question(
         print(f"Error parsing single question {question['id']}: {e}")
         return {
             "id": question["id"],
+            "fetch_status": "failed",
+            "error": f"Could not read the model's answer: {e}",
             "status": "Not Mentioned",
             "position": None,
             "sources": [],
@@ -1163,6 +1220,7 @@ async def _run_with_backoff(
     if provider == "gemini" and not PHASE5_ENABLE_GEMINI:
         return {
             "id": question["id"],
+            "fetch_status": "not_run",
             "status": "Not Mentioned",
             "position": None,
             "sources": [],
@@ -1207,7 +1265,7 @@ async def _run_with_backoff(
             await asyncio.sleep(wait)
 
 
-def _empty_provider_result(error: str | None = None) -> dict:
+def _empty_provider_result(error: str | None = None, detail: str | None = None) -> dict:
     payload = {
         "mentioned": False,
         "position": None,
@@ -1222,15 +1280,19 @@ def _empty_provider_result(error: str | None = None) -> dict:
         "target_site": None,
         "cited": False,
         "status": "Not Mentioned",
+        # Both callers are failure paths (exception or non-dict result): this
+        # is missing data, not a real "not mentioned" (A4).
+        "fetch_status": "failed",
+        "error": str(error) if error else "No usable response from model",
     }
-    if error:
-        payload["error"] = str(error)
+    if detail:
+        payload["error_detail"] = str(detail)[:300]      # what the provider really said
     return payload
 
 
 def _safe_provider_result(raw: dict | Exception | None) -> dict:
     if isinstance(raw, Exception):
-        return _empty_provider_result(str(raw))
+        return _empty_provider_result(str(raw), getattr(raw, "detail", None))
     if not isinstance(raw, dict):
         return _empty_provider_result()
 
@@ -1247,8 +1309,11 @@ def _safe_provider_result(raw: dict | Exception | None) -> dict:
     target_site = raw.get("target_site") if isinstance(raw.get("target_site"), dict) else None
     mentioned = status == "Mentioned" or position is not None
     cited = bool(sources or references or source_urls)
+    raw_fetch_status = str(raw.get("fetch_status") or "ok").strip().lower()
+    fetch_status = raw_fetch_status if raw_fetch_status in ("ok", "failed", "not_run") else "ok"
 
-    return {
+    result = {
+        "fetch_status": fetch_status,
         "mentioned": bool(mentioned),
         "position": position,
         "sources": sources,
@@ -1263,43 +1328,130 @@ def _safe_provider_result(raw: dict | Exception | None) -> dict:
         "cited": cited,
         "status": "Mentioned" if mentioned else "Not Mentioned",
     }
+    if fetch_status != "ok" and raw.get("error"):
+        result["error"] = str(raw.get("error"))
+    if fetch_status != "ok" and raw.get("error_detail"):
+        result["error_detail"] = str(raw.get("error_detail"))[:300]
+    # B2: the model answered but we captured no sources at all - a citation
+    # capture failure (the search/grounding step returned nothing we could
+    # read). Flagged so it is visible instead of silently scoring as "not cited".
+    if fetch_status == "ok" and not (sources or references or source_urls):
+        result["citations_missing"] = True
+        excerpt = (result.get("llm_response") or "")[:600]
+        result["raw_response_excerpt"] = excerpt
+        print(f"[Phase5][CitationsMissing] answer had no sources/references. raw={excerpt!r}")
+    # B1: why it counts as a mention - named in the answer, cited as a source, or both
+    result["named_in_answer"] = bool(raw.get("named_in_answer"))
+    result["cited_as_source"] = bool(raw.get("cited_as_source"))
+    if raw.get("named_evidence"):
+        result["named_evidence"] = str(raw.get("named_evidence"))[:240]
+    # A5: how many of the repeated answers mentioned us - scoring and the
+    # score margin both need it, so it must survive this normalisation.
+    vote = raw.get("vote")
+    if isinstance(vote, dict) and isinstance(vote.get("of"), int) and vote["of"] > 0:
+        result["vote"] = {"mentioned": int(vote.get("mentioned") or 0), "of": vote["of"]}
+    return result
+
+
+def _sample_mentioned(result) -> bool:
+    """Did this one answer name the business? Raw model answers carry
+    `status` / `position`; `mentioned` is only derived later, in
+    _safe_provider_result - so read whichever is there."""
+    if not isinstance(result, dict):
+        return False
+    if "mentioned" in result:
+        return bool(result["mentioned"])
+    # same rule compute_mention_rate applies to a single answer (B1): named
+    # in the answer, ranked, or cited as a source - all of which set status
+    # "Mentioned". "Matched the site's facts" is relevance, not a mention.
+    return str(result.get("status") or "") == "Mentioned" or isinstance(result.get("position"), int)
+
+
+def _sample_ok(result) -> bool:
+    return isinstance(result, dict) and str(result.get("fetch_status") or "ok") == "ok"
+
+
+def pick_majority_sample(samples: list) -> dict | None:
+    """A5: several answers to the same question from the same model -> the one
+    to keep. The models search the live web, so the same question can be
+    answered differently from one call to the next even at temperature 0;
+    the majority view is what we score. Failed samples never vote. A tie
+    (only possible with two voters) keeps the first answer."""
+    ok = [r for r in samples if _sample_ok(r)]
+    if not ok:
+        return samples[0] if samples else None
+    yes = [r for r in ok if _sample_mentioned(r)]
+    no = [r for r in ok if not _sample_mentioned(r)]
+    winners = yes if len(yes) > len(no) else no if len(no) > len(yes) else ok[:1]
+    chosen = dict(winners[0])
+    chosen["vote"] = {"mentioned": len(yes), "of": len(ok)}
+    return chosen
 
 
 async def analyze_single_question_multi(
     url: str,
     question: dict,
     include_competitors: bool = False,
+    only_providers: set | None = None,
 ) -> dict:
+    """Ask all four models (or just `only_providers`, named perplexity /
+    chatgpt / claude / gemini - the rest come from a stored snapshot)."""
     target_context = await _fetch_page_context(url)
 
     async def _call_provider(provider: str):
-        return await _run_with_backoff(
-            url=url,
-            question=question,
-            model_provider=provider,
-            include_competitors=include_competitors,
-            target_context=target_context,
-        )
+        async def _once():
+            return await _run_with_backoff(
+                url=url,
+                question=question,
+                model_provider=provider,
+                include_competitors=include_competitors,
+                target_context=target_context,
+            )
 
-    perplexity_call = _call_provider("perplexity")
-    openai_call = _call_provider("openai")
-    claude_call = _call_provider("claude")
-    gemini_call = _call_provider("gemini")
+        # Retry each model once before it is recorded as failed (A4).
+        try:
+            result = await _once()
+        except Exception:
+            await asyncio.sleep(3)
+            result = await _once()
+        # A "swallowed" failure comes back as a dict marked failed rather
+        # than an exception; give it the same single retry.
+        if isinstance(result, dict) and str(result.get("fetch_status") or "") == "failed":
+            await asyncio.sleep(3)
+            result = await _once()
+        if not PHASE5_VOTE_SAMPLING or not _sample_ok(result):
+            return result
 
-    perplexity_raw, openai_raw, claude_raw, gemini_raw = await asyncio.gather(
-        perplexity_call,
-        openai_call,
-        claude_call,
-        gemini_call,
-        return_exceptions=True,
-    )
+        # A5: ask again. Two answers that agree settle it; if they disagree a
+        # third decides (majority of 3). Extra samples are best-effort - if
+        # one fails, the answers we have still count.
+        async def _extra():
+            try:
+                r = await _once()
+                return r if _sample_ok(r) else None
+            except Exception:
+                return None
 
-    providers = {
-        "perplexity": _safe_provider_result(perplexity_raw),
-        "chatgpt": _safe_provider_result(openai_raw),
-        "claude": _safe_provider_result(claude_raw),
-        "gemini": _safe_provider_result(gemini_raw),
-    }
+        # Branded questions ("What is <you>?") are the unstable ones - the
+        # models flip on them from call to call - so they get up to 5 votes:
+        # 3 up front, 2 more if those 3 are not unanimous. Everything else
+        # gets 2, plus a tiebreaker if they disagree.
+        branded = str(question.get("category") or question.get("type") or "").strip().lower() == "branded"
+        samples = [result]
+        for r in await asyncio.gather(*[_extra() for _ in range(2 if branded else 1)]):
+            if r is not None:
+                samples.append(r)
+        if len({_sample_mentioned(r) for r in samples}) > 1:
+            for r in await asyncio.gather(*[_extra() for _ in range(2 if branded else 1)]):
+                if r is not None:
+                    samples.append(r)
+        return pick_majority_sample(samples)
+
+    # result key -> name _run_with_backoff understands
+    wanted = [(key, call) for key, call in (("perplexity", "perplexity"), ("chatgpt", "openai"), ("claude", "claude"), ("gemini", "gemini"))
+              if only_providers is None or key in only_providers]
+    raws = await asyncio.gather(*[_call_provider(call) for _, call in wanted], return_exceptions=True)
+    providers = {key: _safe_provider_result(raw) for (key, _), raw in zip(wanted, raws)}
 
     return {
         "id": question.get("id"),

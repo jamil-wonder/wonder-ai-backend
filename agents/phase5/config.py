@@ -22,6 +22,9 @@ NON_COMPETITOR_DOMAINS = {
 PHASE5_VALIDATE_COMPETITORS = False
 PHASE5_FAST_MODE = False
 PHASE5_ENABLE_GEMINI = True
+# A5: ask each model twice per question (a third time only if the two disagree)
+# and score the majority. ~2x the AI calls per Search Tracker run; set to "false" to disable.
+PHASE5_VOTE_SAMPLING = os.getenv("PHASE5_VOTE_SAMPLING", "true").strip().lower() not in ("0", "false", "no", "off")
 PHASE5_MODEL_CALL_TIMEOUT_SEC = int(os.getenv("PHASE5_MODEL_CALL_TIMEOUT_SEC", "90"))
 MAX_RETRIES = int(os.getenv("PHASE5_RATE_LIMIT_MAX_RETRIES", "3"))
 OPENAI_PHASE5_TIMEOUT_SEC = int(os.getenv("OPENAI_PHASE5_TIMEOUT_SEC", "18"))

@@ -19,6 +19,8 @@ class Phase5QuestionsResponse(BaseModel):
 class QuestionItem(BaseModel):
     id: str
     text: str
+    # branded | non-branded | local-seo | broad-seo - used for the A1 question weights
+    category: Optional[str] = None
 
 class Phase5AnalyzeRequest(BaseModel):
     url: str
@@ -56,6 +58,8 @@ class Phase5StartJobRequest(BaseModel):
     seed_results: Optional[dict] = None
     model: Optional[str] = "perplexity"
     business_id: Optional[str] = None
+    # Ask all four models again instead of re-using this week's stored answers
+    fresh: Optional[bool] = False
 
 
 class Phase5StartJobResponse(BaseModel):
@@ -74,3 +78,6 @@ class Phase5JobStatusResponse(BaseModel):
     deep_competitors: List[dict] = []
     brand_summary: Optional[str] = None
     error: Optional[str] = None
+    # When the four models were actually asked (a re-run inside the week re-uses those answers)
+    answers_collected_at: Optional[str] = None
+    run_health: Optional[dict] = None

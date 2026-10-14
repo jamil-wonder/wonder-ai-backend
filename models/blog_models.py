@@ -64,6 +64,9 @@ class BlogGenerateResult(BaseModel):
     sections: List[BlogSection]
     wordCount: int
     modelUsed: str
+    # F1: what to confirm before publishing, and where each claim came from
+    checkBeforePublishing: List[str] = []
+    claims: List[dict] = []
 
 
 class BlogGenerateResponse(BaseModel):
@@ -101,6 +104,8 @@ class BlogWeeklySetupRequest(BaseModel):
     business_id: str
     voice: Optional[str] = None
     keywords: List[str] = []
+    # e.g. "en-GB"; empty = detect from the website / address
+    language: Optional[str] = None
 
 
 class BlogWeeklyEnsureRequest(BaseModel):

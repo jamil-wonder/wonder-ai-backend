@@ -3,7 +3,7 @@ import os
 import httpx
 from google import genai
 from google.genai import types
-from utils.gemini_utils import generate_with_fallback
+from utils.gemini_utils import generate_with_fallback, describe_gemini_error
 
 from .config import (
     ANTHROPIC_PHASE5_TIMEOUT_SEC,
@@ -19,7 +19,12 @@ _PROVIDER_HEALTHY_ONCE: set[str] = set()
 
 
 class Phase5RateLimitError(RuntimeError):
-    pass
+    """A provider refused the call as rate-limited / over quota. `detail` keeps what
+    the provider really said (the friendly message hides it)."""
+
+    def __init__(self, message: str = "", detail: str | None = None):
+        super().__init__(message)
+        self.detail = detail
 
 
 def _log_provider_started_once(provider: str, model: str) -> None:
@@ -136,7 +141,9 @@ async def _call_gemini_with_timeout(
         return None
     except Exception as e:
         if _is_rate_limited_error(e):
-            raise Phase5RateLimitError("Gemini rate limit reached. Please retry shortly.") from e
+            detail = describe_gemini_error(e)
+            print(f"[Phase5][Gemini] rate-limit style failure: {detail}")
+            raise Phase5RateLimitError("Gemini rate limit reached. Please retry shortly.", detail=detail) from e
         print(f"[Phase5][Gemini] call failed: {type(e).__name__}: {e}")
         return None
 
@@ -170,7 +177,9 @@ async def _call_gemini_with_retry(
         return None
     except Exception as e:
         if _is_rate_limited_error(e):
-            raise Phase5RateLimitError("Gemini rate limit reached. Please retry shortly.") from e
+            detail = describe_gemini_error(e)
+            print(f"[Phase5][Gemini] rate-limit style failure: {detail}")
+            raise Phase5RateLimitError("Gemini rate limit reached. Please retry shortly.", detail=detail) from e
         print(f"[Phase5][Gemini] retry failed: {type(e).__name__}: {e}")
         return None
 

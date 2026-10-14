@@ -1,10 +1,103 @@
+# OFF by default (0): every tracker run asks all four models afresh - that is
+# what the Search Tracker is for. Set PHASE5_SNAPSHOT_DAYS=7 only if the owner
+# explicitly wants a re-run inside that many days to re-use the stored answers
+# (identical score, no AI calls, but it hides what the models say right now).
+PHASE5_SNAPSHOT_DAYS = int(os.getenv("PHASE5_SNAPSHOT_DAYS", "0"))
+_SNAPSHOT_PROVIDERS = ("perplexity", "chatgpt", "claude", "gemini")
+
+
+def _parse_iso_utc(value):
+    try:
+        text = str(value or "").replace("Z", "")
+        dt = datetime.fromisoformat(text)
+        return dt.replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+async def _load_answer_snapshot(business_id, questions: list, *, fresh: bool = False):
+    """(snapshot, meta): `snapshot` maps question text -> the stored per-model
+    answers of the business's latest COMPLETE tracker run that is still inside
+    the snapshot window; `meta` = {"collected_at", "job_id"}. ({}, None) when
+    there is none, the questions changed, or a fresh run was requested."""
+    if fresh or not business_id or phase5_jobs_col is None or PHASE5_SNAPSHOT_DAYS <= 0:
+        return {}, None
+    job = await phase5_jobs_col.find_one(
+        {"business_id": str(business_id), "job_type": "core", "model": "multi", "status": "completed"},
+        sort=[("created_at", -1)],
+        projection={"results": 1, "questions": 1, "created_at": 1, "answers_collected_at": 1, "job_id": 1},
+    )
+    if not job:
+        return {}, None
+    collected = job.get("answers_collected_at") or job.get("created_at")
+    when = _parse_iso_utc(collected)
+    if when is None or (datetime.utcnow() - when).total_seconds() > PHASE5_SNAPSHOT_DAYS * 86400:
+        return {}, None
+    results = job.get("results") or {}
+    by_text = {}
+    for q in (job.get("questions") or []):
+        text = str(q.get("text") or "").strip()
+        row = results.get(str(q.get("id")))
+        if text and isinstance(row, dict) and isinstance(row.get("providers"), dict):
+            by_text[text] = row
+    wanted = {str(q.get("text") or "").strip() for q in questions}
+    if not wanted or not (wanted & set(by_text)):
+        return {}, None
+    return by_text, {"collected_at": collected, "job_id": job.get("job_id")}
+
+
+def _merge_snapshot_row(question: dict, cached_row, fresh_row):
+    """Combine stored per-model answers with freshly asked ones. Returns
+    (row, reused_count). A stored answer is only used if it was a good one."""
+    providers = {}
+    reused = 0
+    cached = (cached_row or {}).get("providers") or {}
+    for key in _SNAPSHOT_PROVIDERS:
+        cell = cached.get(key)
+        if isinstance(cell, dict) and provider_result_state(cell) == "ok":
+            providers[key] = copy.deepcopy(cell)
+            reused += 1
+        elif fresh_row and key in (fresh_row.get("providers") or {}):
+            providers[key] = fresh_row["providers"][key]
+    for key, cell in ((fresh_row or {}).get("providers") or {}).items():
+        providers.setdefault(key, cell)
+    return {"id": question.get("id"), "providers": providers}, reused
+
+
+def _snapshot_missing_providers(cached_row) -> set:
+    cached = (cached_row or {}).get("providers") or {}
+    return {k for k in _SNAPSHOT_PROVIDERS if not (isinstance(cached.get(k), dict) and provider_result_state(cached[k]) == "ok")}
+
+
+async def _competitor_target_profile(business_id) -> dict:
+    """J4: what the business says it is (category + sub-type + area). Competitor
+    discovery and validation must match all three, not guess from the page."""
+    if not business_id or businesses_col is None:
+        return {}
+    try:
+        doc = await businesses_col.find_one({"_id": ObjectId(str(business_id))})
+    except Exception:
+        return {}
+    if not doc:
+        return {}
+    return {
+        "name": doc.get("businessName") or "",
+        "category": doc.get("category") or "",
+        "sub_type": doc.get("sub_type") or "",
+        "location": doc.get("location") or "",
+        "description": doc.get("aiDescription") or doc.get("businessDescription") or "",
+    }
+
+
 # Generated from the former backend/main.py lines 860-1269.
 async def _upsert_user_business(
     *,
     current_user: dict | None,
     url: str,
     category: str | None = None,
+    sub_type: str | None = None,
     location: str | None = None,
+    location_postcode: str | None = None,
     business_name: str | None = None,
     logo_url: str | None = None,
     business_description: str | None = None,
@@ -64,6 +157,24 @@ async def _upsert_user_business(
     for key, value in optional_pairs.items():
         if value:
             set_fields[key] = value
+    # G3: the location is stored as text AND as structured data. Only a city/area is
+    # accepted (not a street address, postcode or URL) and it is Title Cased; a value
+    # that fails the check is left out so the previous good location stays.
+    if _clean_optional_text(location):
+        if not location_input_problem(location):
+            parsed_location = parse_location_input(location, location_postcode or "")
+            if parsed_location["city"]:
+                set_fields["location"] = parsed_location["label"]
+                set_fields["location_data"] = {k: parsed_location[k] for k in ("area", "city", "country", "postcode")}
+            else:
+                set_fields.pop("location", None)
+        else:
+            set_fields.pop("location", None)     # the generic field code above already queued the raw text
+            print(f"[Business] ignored invalid location {location!r}: {location_input_problem(location)}")
+    if sub_type is not None:
+        # unlike the other optional fields, "" is meaningful here: it clears
+        # the sub-type (a business that isn't a niche within its category)
+        set_fields["sub_type"] = _clean_optional_text(sub_type) or ""
     if phase1_score is not None:
         set_fields["latest_phase1_score"] = int(phase1_score)
         set_fields["latest_phase1_at"] = now_iso
@@ -562,3 +673,264 @@ async def api_google_login(request: GoogleAuthRequest):
         print(f"[API] ERROR during google auth: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ---------------------------------------------------------------------------
+# J6: scan runs. A scan run groups the legs of one measurement of a business
+# (website crawl, AI tracker, competitors, plan) under ONE status. A Wonder
+# Score is written to the business ONLY when the run is complete, so the
+# number never changes mid-run and a half-measured score can never be saved
+# (A1 formula: agents/phase5/scoring.py).
+# ---------------------------------------------------------------------------
+SCAN_RUN_STALE_AFTER_SECONDS = 3 * 3600
+WONDER_HISTORY_CAP = 200
+
+
+def _scan_run_now() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+async def _scan_run_create(*, business_id, user_id, url, trigger: str, legs: list[str]) -> str | None:
+    """Start a run. Returns None (no run, no score) for anonymous / no-business
+    callers such as the free public check."""
+    if scan_runs_col is None or not business_id or not user_id:
+        return None
+    run_id = uuid.uuid4().hex
+    now = _scan_run_now()
+    try:
+        await scan_runs_col.insert_one({
+            "run_id": run_id,
+            "business_id": str(business_id),
+            "user_id": str(user_id),
+            "url": url,
+            "trigger": trigger,
+            "status": "running",
+            "legs": {name: {"status": "pending"} for name in legs},
+            "inputs": None,
+            "wonder_score": None,
+            "created_at": now,
+            "updated_at": now,
+            "completed_at": None,
+        })
+    except Exception as e:
+        print(f"[ScanRun] create failed: {e}")
+        return None
+    return run_id
+
+
+async def _scan_run_set_leg(run_id, leg: str, status: str, **fields) -> None:
+    """status: pending | running | ok | failed | incomplete | skipped"""
+    if scan_runs_col is None or not run_id:
+        return
+    set_doc = {f"legs.{leg}.status": status, "updated_at": _scan_run_now()}
+    for key, value in fields.items():
+        set_doc[f"legs.{leg}.{key}"] = value
+    try:
+        await scan_runs_col.update_one({"run_id": run_id}, {"$set": set_doc})
+    except Exception as e:
+        print(f"[ScanRun] leg update failed run={run_id} leg={leg}: {e}")
+
+
+async def _scan_run_restart(run_id) -> None:
+    """A retry re-opens a finished run: it is running again until re-finalized."""
+    if scan_runs_col is None or not run_id:
+        return
+    try:
+        await scan_runs_col.update_one(
+            {"run_id": run_id},
+            {"$set": {"status": "running", "updated_at": _scan_run_now(), "completed_at": None}},
+        )
+    except Exception as e:
+        print(f"[ScanRun] restart failed run={run_id}: {e}")
+
+
+async def _latest_completed_tracker_mention(business_id: str) -> tuple:
+    """(mention rate, its run-to-run margin, job id) of the business's latest
+    COMPLETE multi-model tracker job - the tracker input for a run that did not
+    re-run the tracker itself. (None, None, None) when there is none."""
+    if phase5_jobs_col is None:
+        return None, None, None
+    job = await phase5_jobs_col.find_one(
+        {"business_id": str(business_id), "job_type": "core", "model": "multi", "status": "completed"},
+        sort=[("created_at", -1)],
+        projection={"results": 1, "questions": 1, "job_id": 1},
+    )
+    if not job:
+        return None, None, None
+    results, questions = job.get("results") or {}, job.get("questions") or []
+    return compute_mention_rate(results, questions), compute_mention_rate_margin(results, questions), job.get("job_id")
+
+
+async def _latest_completed_tracker_mention_rate(business_id: str) -> float | None:
+    return (await _latest_completed_tracker_mention(business_id))[0]
+
+
+async def _scan_run_finalize(run_id) -> dict | None:
+    """Decide the run's final status and, only if it is COMPLETE and every input
+    exists, compute + store the Wonder Score. Safe to call again after a retry:
+    the history entry for a run is replaced, never duplicated."""
+    if scan_runs_col is None or not run_id:
+        return None
+    run = await scan_runs_col.find_one({"run_id": run_id})
+    if not run:
+        return None
+
+    legs = run.get("legs") or {}
+    # Only the measuring legs decide the run's status. The plan (blogs) is
+    # recorded but a failed draft must never block the score.
+    attempted = {
+        n: l for n, l in legs.items()
+        if n in ("crawl", "tracker", "competitors") and (l or {}).get("status") not in ("pending", "skipped")
+    }
+    states = [str((l or {}).get("status")) for l in attempted.values()]
+    bad = [s for s in states if s in ("failed", "incomplete")]
+    if any(s == "running" for s in states):
+        return run  # a leg is still in flight; its owner finalizes later
+    if not attempted or (bad and len(bad) == len(states)):
+        status = "failed"
+    elif bad:
+        status = "incomplete"
+    else:
+        status = "complete"
+
+    business_id = str(run.get("business_id") or "")
+    inputs = None
+    score = None
+    tracker_job_id = None
+    if status == "complete":
+        crawl = legs.get("crawl") or {}
+        tracker = legs.get("tracker") or {}
+        competitors = legs.get("competitors") or {}
+        technical = crawl.get("score") if crawl.get("status") == "ok" else None
+        if technical is None and "crawl" not in attempted and businesses_col is not None:
+            try:
+                biz = await businesses_col.find_one({"_id": ObjectId(business_id)}, {"latest_phase1_score": 1})
+                technical = (biz or {}).get("latest_phase1_score")
+            except Exception:
+                technical = None
+        mention_rate = tracker.get("mention_rate") if tracker.get("status") == "ok" else None
+        mention_margin = tracker.get("mention_rate_margin") if tracker.get("status") == "ok" else None
+        # E1: remember WHICH Search Tracker run this score was built from, so a
+        # shared report can show that run's per-model data and diff it properly
+        tracker_job_id = tracker.get("job_id") if tracker.get("status") == "ok" else None
+        if mention_rate is None and "tracker" not in attempted:
+            mention_rate, mention_margin, tracker_job_id = await _latest_completed_tracker_mention(business_id)
+        market = competitors.get("market_position") if competitors.get("status") == "ok" else None
+        inputs = {
+            "mention_rate": mention_rate,
+            "technical_score": technical,
+            # A2 has not shipped: 0, shown as "not yet measured", until it does
+            "market_position": market if isinstance(market, (int, float)) else 0,
+            "market_measured": isinstance(market, (int, float)),
+            # A5: how far the score can move between two runs just because the
+            # AI models answer differently each time (+/- Wonder Score points)
+            "score_margin": wonder_margin(mention_margin),
+        }
+        score = compute_wonder_score(mention_rate, technical, inputs["market_position"])
+
+    now = _scan_run_now()
+    await scan_runs_col.update_one(
+        {"run_id": run_id},
+        {"$set": {"status": status, "inputs": inputs, "wonder_score": score, "tracker_job_id": tracker_job_id,
+                  "updated_at": now, "completed_at": now}},
+    )
+
+    if score is not None and businesses_col is not None:
+        try:
+            biz = await businesses_col.find_one({"_id": ObjectId(business_id)}, {"wonder_scores": 1})
+            history = [h for h in ((biz or {}).get("wonder_scores") or []) if h.get("run_id") != run_id]
+            history.append({
+                "run_id": run_id,
+                "score": score,
+                "inputs": inputs,
+                "tracker_job_id": tracker_job_id,
+                "trigger": run.get("trigger"),
+                "week_id": _blog_week_id(datetime.now()),
+                "created_at": now,
+            })
+            await businesses_col.update_one(
+                {"_id": ObjectId(business_id)},
+                {"$set": {
+                    "latest_wonder_score": score,
+                    "latest_wonder_at": now,
+                    "latest_wonder_run_id": run_id,
+                    "latest_wonder_inputs": inputs,
+                    "wonder_scores": history[-WONDER_HISTORY_CAP:],
+                }},
+            )
+        except Exception as e:
+            print(f"[ScanRun] storing wonder score failed run={run_id}: {e}")
+
+    print(f"[ScanRun] run={run_id} trigger={run.get('trigger')} -> {status}, wonder_score={score}")
+    return await scan_runs_col.find_one({"run_id": run_id})
+
+
+async def _scan_run_active_for(business_ids: list) -> dict:
+    """business_id -> its in-flight run (if any), ignoring stale ones, so the UI
+    can show "Calculating…" while keeping the last complete score visible."""
+    if scan_runs_col is None or not business_ids:
+        return {}
+    cutoff = (datetime.utcnow() - timedelta(seconds=SCAN_RUN_STALE_AFTER_SECONDS)).isoformat() + "Z"
+    out: dict = {}
+    cursor = scan_runs_col.find(
+        {"business_id": {"$in": [str(b) for b in business_ids]}, "status": "running", "updated_at": {"$gte": cutoff}},
+        {"_id": 0, "run_id": 1, "business_id": 1, "trigger": 1, "created_at": 1},
+    ).sort("created_at", -1)
+    async for run in cursor:
+        out.setdefault(run["business_id"], {"run_id": run["run_id"], "trigger": run.get("trigger"), "started_at": run.get("created_at")})
+    return out
+
+
+async def _record_manual_crawl_run(current_user, business, scrape_result) -> None:
+    """A manual Analyzer crawl is a one-leg scan run. When it completes, the
+    Wonder Score is recomputed from this fresh website health plus the latest
+    complete tracker run - so re-crawling the Analyzer finally moves the main
+    score (it used to be saved where the headline never looked)."""
+    try:
+        if not business or not current_user or not isinstance(scrape_result, dict):
+            return
+        scores = scrape_result.get("scores") if isinstance(scrape_result.get("scores"), dict) else {}
+        run_id = await _scan_run_create(
+            business_id=str(business.get("_id")), user_id=current_user.get("id"),
+            url=business.get("url") or "", trigger="manual_analyzer", legs=["crawl"],
+        )
+        await _scan_run_set_leg(run_id, "crawl", "ok", score=scores.get("total"))
+        await _scan_run_finalize(run_id)
+    except Exception as e:
+        print(f"[ScanRun] manual crawl run failed: {e}")
+
+
+async def _ensure_wonder_scores(docs: list) -> None:
+    """Businesses measured before the scan-run system have no Wonder Score
+    until their next complete run. Compute one from what is already stored
+    (latest website-health score + latest COMPLETE tracker run), once, so
+    existing accounts don't go blank at launch. A business missing either
+    input stays without a score - never a guessed one."""
+    if businesses_col is None:
+        return
+    for doc in docs:
+        if not isinstance(doc, dict) or isinstance(doc.get("latest_wonder_score"), (int, float)):
+            continue
+        technical = doc.get("latest_phase1_score")
+        if not isinstance(technical, (int, float)):
+            continue
+        mention_rate, mention_margin, _backfill_job_id = await _latest_completed_tracker_mention(str(doc.get("_id")))
+        score = compute_wonder_score(mention_rate, technical, 0)
+        if score is None:
+            continue
+        stamp = max(str(doc.get("latest_phase1_at") or ""), str(doc.get("latest_phase5_at") or "")) or _scan_run_now()
+        inputs = {"mention_rate": mention_rate, "technical_score": technical, "market_position": 0, "market_measured": False,
+                  "score_margin": wonder_margin(mention_margin)}
+        point = {"run_id": "backfill", "score": score, "inputs": inputs, "trigger": "backfill", "tracker_job_id": _backfill_job_id,
+                 "week_id": None, "created_at": stamp}
+        try:
+            await businesses_col.update_one(
+                {"_id": doc["_id"], "latest_wonder_score": {"$exists": False}},
+                {"$set": {"latest_wonder_score": score, "latest_wonder_at": stamp, "latest_wonder_run_id": "backfill",
+                          "latest_wonder_inputs": inputs, "wonder_scores": [point]}},
+            )
+        except Exception as e:
+            print(f"[WonderScore] backfill failed for {doc.get('_id')}: {e}")
+            continue
+        doc["latest_wonder_score"], doc["latest_wonder_at"], doc["latest_wonder_inputs"] = score, stamp, inputs
+

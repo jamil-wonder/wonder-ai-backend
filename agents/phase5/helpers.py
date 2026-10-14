@@ -1,3 +1,4 @@
+from .scoring import provider_result_state
 import json
 import re
 
@@ -259,9 +260,18 @@ def _estimate_target_visibility_score(seed_results: dict) -> int:
 
     points = 0.0
     seen = 0
+    answered = 0
     for raw_r in rows:
         if not isinstance(raw_r, dict):
             continue
+        # A question where every model failed to answer is missing data, not
+        # a miss: keep it out of the coverage denominator (A4).
+        raw_providers = raw_r.get("providers")
+        if isinstance(raw_providers, dict) and raw_providers and all(
+            provider_result_state(p) != "ok" for p in raw_providers.values()
+        ):
+            continue
+        answered += 1
         r = _flatten_multi_result(raw_r)
         status = str(r.get("status", ""))
         pos = r.get("position")
@@ -276,7 +286,7 @@ def _estimate_target_visibility_score(seed_results: dict) -> int:
         return 35
 
     avg = points / seen
-    coverage = seen / max(1, len(rows))
+    coverage = seen / max(1, answered)
     score = int(round(avg * 0.7 + (coverage * 100) * 0.3))
     return max(20, min(95, score))
 

@@ -60,7 +60,7 @@ async def _build_weekly_blogs_for_business(
     for idx, idea in enumerate(ideas[:2]):
         generated = await generate_seo_blog(
             title=str(idea.get("title") or f"Weekly blog idea {idx + 1}"),
-            target_words=1500,
+            target_words=1000,
             business_name=business_name,
             primary_keyword=str(idea.get("primaryKeyword") or (suggested_keywords[0] if suggested_keywords else "")),
             audience=str(idea.get("audience") or "Potential customers"),
@@ -73,6 +73,9 @@ async def _build_weekly_blogs_for_business(
             ],
             internal_links=business_doc.get("trackedPages") if isinstance(business_doc.get("trackedPages"), list) else [],
             selected_model="claude",
+            facts=build_fact_pack(business_doc),
+            keywords=suggested_keywords,
+            language=resolve_blog_language(business_doc)["code"],
         )
         drafts.append({
             **generated,
@@ -80,6 +83,10 @@ async def _build_weekly_blogs_for_business(
             "idea": idea,
             "humanizedScore": _humanized_blog_score(generated, blog_voice),
             "humanizeNote": "Edit a few details, add a real customer example, and adjust wording to match the business voice before publishing.",
+            "language": generated.get("language"),
+            # F1: what to confirm before this goes live (statements sourced to the
+            # profile / website, anything removed, and what only the owner can add)
+            "checkBeforePublishing": generated.get("checkBeforePublishing") or [],
         })
         try:
             await _log_ai_usage_event({
@@ -181,6 +188,8 @@ async def api_blogs_weekly(
         "needsSetup": not bool(business.get("blogVoice")),
         "voice": business.get("blogVoice") or "",
         "keywords": business.get("blogKeywords") if isinstance(business.get("blogKeywords"), list) else [],
+        "language": resolve_blog_language(business),
+        "languageChoice": business.get("blogLanguage") or "",
     }
 
 
@@ -208,6 +217,8 @@ async def api_blogs_weekly_setup(
             "$set": {
                 "blogVoice": _clean_optional_text(request.voice) or "",
                 "blogKeywords": keywords,
+                # F3: "" / unsupported = detect it (website language, address, domain)
+                "blogLanguage": normalize_locale(request.language) or "",
                 "updated_at": now_iso,
             }
         },
@@ -268,7 +279,7 @@ async def api_blogs_generate(request: BlogGenerateRequest, current_user: dict = 
     if selected_model not in {"chatgpt", "perplexity", "claude"}:
         raise HTTPException(status_code=400, detail="Choose chatgpt, perplexity, or claude.")
 
-    target_words = max(1200, min(int(request.target_words or 1500), 1600))
+    target_words = max(800, min(int(request.target_words or 1000), 1200))
     business_doc = await businesses_col.find_one({"user_id": current_user["id"]}) if businesses_col is not None else None
     try:
         generated = await generate_seo_blog(
@@ -282,6 +293,8 @@ async def api_blogs_generate(request: BlogGenerateRequest, current_user: dict = 
             selling_points=_clean_blog_list(request.selling_points, 10),
             internal_links=_clean_blog_list(request.internal_links, 8),
             selected_model=selected_model,
+            facts=build_fact_pack(business_doc),
+            language=resolve_blog_language(business_doc)["code"],
         )
     except Exception as e:
         print(f"[API] blog generation error: {e}")
@@ -310,6 +323,8 @@ async def api_blogs_generate(request: BlogGenerateRequest, current_user: dict = 
         sections=sections,
         wordCount=int(generated.get("wordCount") or 0),
         modelUsed=str(generated.get("modelUsed") or selected_model),
+        checkBeforePublishing=[str(x) for x in (generated.get("checkBeforePublishing") or [])],
+        claims=generated.get("claims") or [],
     )
 
     try:
