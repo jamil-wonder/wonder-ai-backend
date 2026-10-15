@@ -498,6 +498,9 @@ async def api_phase5_generate_questions(
                 or []
             ),
             "avoidQuestions": req.avoidQuestions or [],
+            # L2: the kind of business and who it serves shape the questions
+            "sub_type": _first_text(business_doc.get("sub_type") if business_doc else ""),
+            "target_audience": _first_text(business_doc.get("target_audience") if business_doc else ""),
         }
         question_generation = _normalize_question_generation_settings(
             req.questionGeneration

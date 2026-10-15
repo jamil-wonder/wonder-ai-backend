@@ -40,6 +40,8 @@ from models import (
     CompetitorTrackingRunResponse,
     CompetitorTrackingStatusResponse,
 )
+from agents.phase5.question_profile import question_profile, uses_location
+from agents.phase5.market import build_ladder as build_market_ladder, evidence_text as market_evidence_text
 from scraping.scraper import scrape_website, get_grade
 from report_selection import pick_previous_score, pick_previous_tracker_job_id
 from blog_claims import build_fact_pack
@@ -96,10 +98,14 @@ from agents.phase5_agent import (
     _normalize_domain,
 )
 from models import UserCreate, UserResponse, Token, LoginRequest
+from models import ForgotPasswordRequest, ResetCheckRequest, ResetPasswordRequest
+import password_reset as pwreset
+import notifications as notif
+from blog_readability import readability_of_sections
 from models import BusinessResponse, BusinessUpsertRequest
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import secrets
 import bcrypt
 from jose import JWTError, jwt
@@ -224,6 +230,8 @@ auth_handoffs_col = None
 google_integrations_col = None
 analytics_snapshots_col = None
 email_verifications_col = None
+password_resets_col = None
+notifications_col = None
 public_scan_leads_col = None
 manual_run_requests_col = None
 scan_runs_col = None
@@ -249,6 +257,8 @@ try:
     user_history_meta_col = db.get_collection("user_history_meta")
     public_rate_limits_col = db.get_collection("public_rate_limits")
     email_verifications_col = db.get_collection("email_verifications")
+    password_resets_col = db.get_collection("password_resets")
+    notifications_col = db.get_collection("notifications")
     public_scan_leads_col = db.get_collection("public_scan_leads")
     manual_run_requests_col = db.get_collection("manual_run_requests")
     scan_runs_col = db.get_collection("scan_runs")

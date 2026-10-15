@@ -12,6 +12,10 @@ async def api_signup(user: UserCreate):
         # Reject disposable/throwaway providers and addresses whose domain
         # can't actually receive mail, on top of EmailStr's format-only check.
         normalized_email = validate_signup_email(user.email)
+        # H4: same password rules as the reset flow (8+ characters, not only spaces, bcrypt's 72-byte limit)
+        password_issue = pwreset.password_problem(user.password)
+        if password_issue:
+            raise HTTPException(status_code=422, detail=password_issue)
 
         existing_user = await users_col.find_one({"email": normalized_email})
         if existing_user:
@@ -395,6 +399,9 @@ async def api_user_change_password(request: UserPasswordChangeRequest, current_u
 
     if not verify_password(request.current_password, user.get("hashed_password", "")):
         raise HTTPException(status_code=401, detail="Current password is incorrect")
+    new_password_issue = pwreset.password_problem(request.new_password)
+    if new_password_issue:
+        raise HTTPException(status_code=422, detail=new_password_issue)
 
     await users_col.update_one(
         {"_id": ObjectId(current_user["id"])},
@@ -464,7 +471,7 @@ async def api_user_business_upsert(
     # same persisted score history.
     phase1_score = None
     scrape_scores = (request.latest_scrape_result or {}).get("scores")
-    if isinstance(scrape_scores, dict) and isinstance(scrape_scores.get("total"), (int, float)):
+    if isinstance(scrape_scores, dict) and isinstance(scrape_scores.get("total"), (int, float)) and not _fetch_failure(request.latest_scrape_result):
         phase1_score = int(scrape_scores["total"])
 
     business = await _upsert_user_business(
@@ -493,14 +500,7 @@ async def api_user_business_upsert(
     public = _public_business_doc(business)
     if not public:
         raise HTTPException(status_code=400, detail="Could not save business")
-    try:
-        asyncio.create_task(_build_weekly_blogs_for_business(
-            business_doc=business,
-            current_user=current_user,
-            force=False,
-        ))
-    except Exception as e:
-        print(f"[Blogs] failed to queue initial weekly blogs: {e}")
+    # L3: blogs are never generated on their own - only when the owner presses Generate
     return public
 
 
@@ -693,6 +693,72 @@ async def api_user_business_delete(
     return {"message": "Business profile deleted successfully"}
 
 
+# E3: a shared report link works for 30 days, and its owner can turn it off at any time.
+REPORT_LINK_DAYS = 30
+
+
+def _report_link_expiry(business: dict):
+    """(expires_at datetime | None, expired bool). A link made before expiry existed has no
+    start date: it is treated as valid and its 30 days start the first time it is used."""
+    started = pick_report_start(business.get("report_share_token_created_at"))
+    if started is None:
+        return None, False
+    expires = started + timedelta(days=REPORT_LINK_DAYS)
+    return expires, datetime.utcnow() >= expires
+
+
+def pick_report_start(value):
+    try:
+        return datetime.fromisoformat(str(value or "").replace("Z", "")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _report_link_payload(token: str, expires) -> dict:
+    frontend_url = (os.getenv("FRONTEND_APP_URL") or "http://localhost:3000").rstrip("/")
+    return {
+        "token": token, "url": f"{frontend_url}/report/{token}",
+        "expires_at": (expires.isoformat() + "Z") if expires else None,
+    }
+
+
+@app.get("/api/reports/share-link/{business_id}")
+async def api_reports_share_link_status(business_id: str, current_user: dict = Depends(get_current_user)):
+    """Is there a working share link for this business? (the Reports page shows it with its expiry)"""
+    if businesses_col is None:
+        raise HTTPException(status_code=503, detail="business storage unavailable")
+    try:
+        oid = ObjectId(business_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid business ID format")
+    business = await businesses_col.find_one({"_id": oid, "user_id": current_user["id"]})
+    if not business:
+        raise HTTPException(status_code=404, detail="Business profile not found")
+    token = business.get("report_share_token")
+    expires, expired = _report_link_expiry(business)
+    if not token or expired:
+        return {"active": False}
+    return {"active": True, **_report_link_payload(token, expires)}
+
+
+@app.post("/api/reports/revoke-link")
+async def api_reports_revoke_link(request: ReportShareLinkRequest, current_user: dict = Depends(get_current_user)):
+    """Turn the share link off: the old address stops working at once."""
+    if businesses_col is None:
+        raise HTTPException(status_code=503, detail="business storage unavailable")
+    try:
+        oid = ObjectId(request.business_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid business ID format")
+    result = await businesses_col.update_one(
+        {"_id": oid, "user_id": current_user["id"]},
+        {"$unset": {"report_share_token": "", "report_share_token_created_at": ""}},
+    )
+    if not getattr(result, "matched_count", 1):
+        raise HTTPException(status_code=404, detail="Business profile not found")
+    return {"active": False}
+
+
 @app.post("/api/reports/share-link")
 async def api_reports_share_link(
     request: ReportShareLinkRequest,
@@ -717,12 +783,21 @@ async def api_reports_share_link(
         raise HTTPException(status_code=404, detail="Business profile not found")
 
     token = business.get("report_share_token")
-    if not token:
+    expires, expired = _report_link_expiry(business)
+    if not token or expired:
+        # no link yet, or the old one ran out: a fresh one with a fresh 30 days
         token = secrets.token_urlsafe(24)
-        await businesses_col.update_one({"_id": oid}, {"$set": {"report_share_token": token}})
-
-    frontend_url = (os.getenv("FRONTEND_APP_URL") or "http://localhost:3000").rstrip("/")
-    return {"token": token, "url": f"{frontend_url}/report/{token}"}
+        started = datetime.utcnow()
+        await businesses_col.update_one(
+            {"_id": oid},
+            {"$set": {"report_share_token": token, "report_share_token_created_at": started.isoformat() + "Z"}},
+        )
+        expires = started + timedelta(days=REPORT_LINK_DAYS)
+    elif expires is None:
+        started = datetime.utcnow()
+        await businesses_col.update_one({"_id": oid}, {"$set": {"report_share_token_created_at": started.isoformat() + "Z"}})
+        expires = started + timedelta(days=REPORT_LINK_DAYS)
+    return _report_link_payload(token, expires)
 
 
 @app.get("/api/public/reports/{token}")
@@ -740,9 +815,15 @@ async def api_public_report(token: str):
     if businesses_col is None:
         raise HTTPException(status_code=503, detail="report storage unavailable")
 
-    business = await businesses_col.find_one({"report_share_token": token})
+    business = await businesses_col.find_one({"report_share_token": token}) if token else None
     if not business:
-        raise HTTPException(status_code=404, detail="Report not found")
+        raise HTTPException(status_code=404, detail="This report link isn't available. It may have been turned off - ask the sender for a new one.")
+    expires, expired = _report_link_expiry(business)
+    if expired:
+        raise HTTPException(status_code=410, detail="This report link has expired. Ask the sender for a new one.")
+    if expires is None:
+        # a link made before expiry existed: its 30 days start now
+        await businesses_col.update_one({"_id": business["_id"]}, {"$set": {"report_share_token_created_at": datetime.utcnow().isoformat() + "Z"}})
 
     # J6/A1: the headline is the Wonder Score of the latest COMPLETE scan run -
     # the same stored number the dashboard shows - never a technical or
@@ -945,4 +1026,280 @@ async def api_competitor_tracking_run(
         "success": True,
         "run": run,
         "business": _public_business_doc(fresh_business),
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# H3: forgot / reset password. A link with a one-hour, one-time token is emailed;
+# asking for it always gets the same answer, whether or not the email has an
+# account. See password_reset.py for the rules.
+# ---------------------------------------------------------------------------
+async def _issue_password_reset(user: dict) -> bool:
+    """Create a reset token for `user` and email the link. Never raises; True if an email went out."""
+    try:
+        if password_resets_col is None:
+            return False
+        user_id = str(user["_id"])
+        now = datetime.utcnow()
+        recent = await password_resets_col.count_documents(
+            {"user_id": user_id, "created_at": {"$gte": now - timedelta(hours=1)}}
+        )
+        if recent >= pwreset.MAX_REQUESTS_PER_HOUR:
+            print(f"[Auth] password reset rate limit hit for user {user_id}")
+            return False
+        token, token_hash = pwreset.new_token()
+        # only the newest link works
+        await password_resets_col.update_many({"user_id": user_id, "used_at": None}, {"$set": {"used_at": now}})
+        await password_resets_col.insert_one({
+            "user_id": user_id,
+            "token_hash": token_hash,
+            "created_at": now,
+            "expires_at": now + timedelta(minutes=pwreset.RESET_TTL_MINUTES),
+            "used_at": None,
+        })
+        frontend_url = (os.getenv("FRONTEND_APP_URL") or "http://localhost:3000").rstrip("/")
+        html_body, text_body = pwreset.build_reset_email(user.get("name", ""), f"{frontend_url}/auth/reset?token={token}")
+        return await send_email(user.get("email", ""), "Reset your Wonderscore password", html_body, text_body)
+    except Exception as e:
+        print(f"[Auth] could not issue password reset: {type(e).__name__}: {e}")
+        return False
+
+
+@app.post("/api/auth/forgot")
+async def api_forgot_password(request: ForgotPasswordRequest):
+    email = (request.email or "").strip().lower()
+    if users_col is not None and "@" in email and len(email) <= 254:
+        user = await users_col.find_one({"email": email})
+        if user and user.get("status") != "banned" and user.get("hashed_password"):
+            # in the background, so the answer takes the same time for every email
+            asyncio.ensure_future(_issue_password_reset(user))
+    return {"message": pwreset.GENERIC_MESSAGE}
+
+
+@app.post("/api/auth/reset/check")
+async def api_reset_check(request: ResetCheckRequest):
+    if password_resets_col is None:
+        raise HTTPException(status_code=503, detail="Password reset is unavailable right now. Please try again shortly.")
+    doc = await password_resets_col.find_one({"token_hash": pwreset.hash_token(request.token)})
+    return {"valid": pwreset.token_state(doc, datetime.utcnow()) == "ok"}
+
+
+@app.post("/api/auth/reset")
+async def api_reset_password(request: ResetPasswordRequest):
+    if password_resets_col is None or users_col is None:
+        raise HTTPException(status_code=503, detail="Password reset is unavailable right now. Please try again shortly.")
+    problem = pwreset.password_problem(request.password)
+    if problem:
+        raise HTTPException(status_code=422, detail=problem)
+    now = datetime.utcnow()
+    doc = await password_resets_col.find_one({"token_hash": pwreset.hash_token(request.token)})
+    if pwreset.token_state(doc, now) != "ok":
+        raise HTTPException(status_code=400, detail=pwreset.INVALID_LINK_MESSAGE)
+    # claim the token first: a second use of the same link (or a double click) must fail
+    claimed = await password_resets_col.find_one_and_update(
+        {"_id": doc["_id"], "used_at": None}, {"$set": {"used_at": now}}
+    )
+    if not claimed:
+        raise HTTPException(status_code=400, detail=pwreset.INVALID_LINK_MESSAGE)
+    user_id = doc["user_id"]
+    try:
+        oid = ObjectId(user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail=pwreset.INVALID_LINK_MESSAGE)
+    result = await users_col.update_one(
+        {"_id": oid}, {"$set": {"hashed_password": get_password_hash(request.password), "password_changed_at": now.isoformat()}}
+    )
+    if not getattr(result, "matched_count", 1):
+        raise HTTPException(status_code=400, detail=pwreset.INVALID_LINK_MESSAGE)
+    # any other link still outstanding for this account is now useless
+    await password_resets_col.update_many({"user_id": user_id, "used_at": None}, {"$set": {"used_at": now}})
+    return {"message": pwreset.DONE_MESSAGE}
+
+
+
+# ---------------------------------------------------------------------------
+# J10: notifications - the last 10, unread count for the bell badge, mark as read.
+# ---------------------------------------------------------------------------
+def _public_notification(doc: dict) -> dict:
+    created = doc.get("created_at")
+    return {
+        "id": str(doc.get("_id")),
+        "type": doc.get("type"),
+        "title": doc.get("title") or "",
+        "body": doc.get("body") or "",
+        "link": doc.get("link") or "",
+        "business_id": doc.get("business_id") or "",
+        "created_at": (created.isoformat() + "Z") if isinstance(created, datetime) else created,
+        "read": doc.get("read_at") is not None,
+    }
+
+
+@app.get("/api/notifications")
+async def api_notifications(current_user: dict = Depends(get_current_user)):
+    if notifications_col is None:
+        return {"items": [], "unread": 0}
+    user_id = str(current_user["id"])
+    cursor = notifications_col.find({"user_id": user_id}).sort("created_at", -1).limit(notif.LIST_LIMIT)
+    items = [_public_notification(d) async for d in cursor]
+    unread = await notifications_col.count_documents({"user_id": user_id, "read_at": None})
+    return {"items": items, "unread": unread}
+
+
+class NotificationsReadRequest(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+    all: bool = False
+
+
+@app.post("/api/notifications/read")
+async def api_notifications_read(request: NotificationsReadRequest, current_user: dict = Depends(get_current_user)):
+    if notifications_col is None:
+        return {"ok": True}
+    user_id = str(current_user["id"])
+    now = datetime.utcnow()
+    if request.all:
+        await notifications_col.update_many({"user_id": user_id, "read_at": None}, {"$set": {"read_at": now}})
+    else:
+        oids = []
+        for i in request.ids[:50]:
+            try:
+                oids.append(ObjectId(i))
+            except Exception:
+                continue
+        if oids:
+            await notifications_col.update_many({"user_id": user_id, "_id": {"$in": oids}, "read_at": None}, {"$set": {"read_at": now}})
+    return {"ok": True, "unread": await notifications_col.count_documents({"user_id": user_id, "read_at": None})}
+
+
+
+# ---------------------------------------------------------------------------
+# J5: the first run. ONE scan run (website scan + the AI questions) for a brand-new
+# business, started from the "set up" flow, with a status endpoint the progress
+# screen polls. The 20 questions are saved and locked here: the owner has just
+# reviewed them on the screen before this is called.
+# ---------------------------------------------------------------------------
+class FirstRunQuestion(BaseModel):
+    id: int
+    type: str = "non-branded"
+    label: str = ""
+    query: str
+
+
+class FirstRunRequest(BaseModel):
+    questions: list[FirstRunQuestion] = Field(default_factory=list)
+
+
+async def _first_run_background(run_id: str, business_doc: dict, user_mock: dict, questions: list[dict]) -> None:
+    """Website scan, then queue the Search Tracker job on the same run. Never raises."""
+    business_id = str(business_doc["_id"])
+    url = business_doc.get("url") or ""
+    try:
+        await _scan_run_set_leg(run_id, "crawl", "running")
+        try:
+            result = await asyncio.wait_for(asyncio.to_thread(_run_scrape_worker, url), timeout=180)
+        except Exception as e:
+            await _scan_run_set_leg(run_id, "crawl", "failed", error=f"We couldn't scan the website ({type(e).__name__}).")
+            await _scan_run_set_leg(run_id, "tracker", "skipped")
+            await _scan_run_finalize(run_id)
+            return
+        failure = _fetch_failure(result) if isinstance(result, dict) else {"reason": "The website scan returned nothing.", "http_status": None}
+        if isinstance(result, dict):
+            await _record_last_crawl(business_id, result)
+        if failure:
+            await _scan_run_set_leg(run_id, "crawl", "failed", error=failure.get("reason"), http_status=failure.get("http_status"))
+            await _scan_run_set_leg(run_id, "tracker", "skipped")
+            await _scan_run_finalize(run_id)
+            return
+        scores = result.get("scores") if isinstance(result.get("scores"), dict) else {}
+        await _upsert_user_business(
+            current_user=user_mock, url=url, category=business_doc.get("category"), location=business_doc.get("location"),
+            business_name=business_doc.get("businessName") or result.get("businessName"), logo_url=result.get("logoUrl"),
+            phase1_score=_phase1_score_of(result), business_id=business_id, scrape_result=result,
+        )
+        await _scan_run_set_leg(run_id, "crawl", "ok", score=scores.get("total"))
+
+        job_id = uuid.uuid4().hex
+        now_iso = datetime.utcnow().isoformat() + "Z"
+        await phase5_jobs_col.insert_one({
+            "job_id": job_id, "job_type": "core", "model": "multi", "queue_priority": 0, "url": url,
+            "user_id": user_mock["id"], "user_email": user_mock.get("email"), "business_id": business_id,
+            "questions": questions, "seed_results": {}, "fresh": False, "status": "queued",
+            "total": len(questions), "processed": 0, "current_question_id": None, "results": {},
+            "deep_competitors": [], "brand_summary": None, "error": None,
+            "scan_run_id": run_id, "scan_run_finalize": True,
+            "created_at": now_iso, "updated_at": now_iso,
+        })
+        await _scan_run_set_leg(run_id, "tracker", "running", job_id=job_id)
+    except Exception as e:
+        print(f"[FirstRun] run={run_id} failed: {type(e).__name__}: {e}")
+        await _scan_run_set_leg(run_id, "crawl", "failed", error="Something went wrong while starting the scan.")
+        await _scan_run_set_leg(run_id, "tracker", "skipped")
+        await _scan_run_finalize(run_id)
+
+
+@app.post("/api/user/businesses/{business_id}/first-run")
+async def api_user_business_first_run(business_id: str, request: FirstRunRequest, current_user: dict = Depends(get_current_user)):
+    if businesses_col is None or phase5_jobs_col is None:
+        raise HTTPException(status_code=503, detail="storage unavailable")
+    try:
+        oid = ObjectId(business_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid business ID format")
+    business = await businesses_col.find_one({"_id": oid, "user_id": current_user["id"]})
+    if not business:
+        raise HTTPException(status_code=404, detail="Business not found")
+    items = [q for q in request.questions if q.query.strip()]
+    if not items:
+        raise HTTPException(status_code=422, detail="Your questions are needed before the first scan.")
+    active = (await _scan_run_active_for([business_id])).get(business_id)
+    if active:
+        return {"run_id": active["run_id"], "already_running": True}
+
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    await businesses_col.update_one(
+        {"_id": oid},
+        {"$set": {
+            "trackedQuestions": [{"id": q.id, "type": q.type, "label": q.label, "query": q.query.strip()} for q in items],
+            "questionsLocked": True, "questionsLockedAt": now_iso, "updated_at": now_iso,
+        }},
+    )
+    run_id = await _scan_run_create(
+        business_id=business_id, user_id=current_user["id"], url=business.get("url") or "",
+        trigger="first_run", legs=["crawl", "tracker"],
+    )
+    if not run_id:
+        raise HTTPException(status_code=503, detail="Could not start the scan. Please try again.")
+    job_questions = [{"id": f"q{q.id}", "text": q.query.strip(), "category": q.type or "non-branded"} for q in items]
+    user_mock = {"id": current_user["id"], "email": current_user.get("email") or ""}
+    asyncio.ensure_future(_first_run_background(run_id, business, user_mock, job_questions))
+    return {"run_id": run_id, "already_running": False}
+
+
+_LEG_LABELS = ("crawl", "tracker")
+
+
+@app.get("/api/scan-runs/{run_id}")
+async def api_scan_run_status(run_id: str, current_user: dict = Depends(get_current_user)):
+    """What the progress screen shows: each leg's state, the tracker's question count, the score."""
+    if scan_runs_col is None:
+        raise HTTPException(status_code=503, detail="storage unavailable")
+    run = await scan_runs_col.find_one({"run_id": run_id, "user_id": str(current_user["id"])})
+    if not run:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    legs = run.get("legs") or {}
+    tracker = legs.get("tracker") or {}
+    progress = None
+    if tracker.get("job_id") and phase5_jobs_col is not None:
+        job = await phase5_jobs_col.find_one({"job_id": tracker["job_id"]}, projection={"processed": 1, "total": 1, "status": 1, "error": 1})
+        if job:
+            progress = {"processed": job.get("processed") or 0, "total": job.get("total") or 0, "status": job.get("status"), "error": job.get("error")}
+    return {
+        "run_id": run_id,
+        "status": run.get("status"),
+        "created_at": run.get("created_at"),
+        "completed_at": run.get("completed_at"),
+        "legs": {n: {k: v for k, v in (legs.get(n) or {}).items() if k in ("status", "error", "http_status", "score")} for n in _LEG_LABELS if n in legs},
+        "tracker_progress": progress,
+        "wonder_score": run.get("wonder_score"),
+        "inputs": run.get("inputs"),
     }

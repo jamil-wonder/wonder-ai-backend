@@ -211,6 +211,8 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "latest_wonder_score": doc.get("latest_wonder_score"),
         "latest_wonder_at": doc.get("latest_wonder_at"),
         "latest_wonder_inputs": doc.get("latest_wonder_inputs"),
+        # L1: how the latest website scan went ({ok, http_status, reason, at}) - drives "Score not available"
+        "last_crawl": doc.get("last_crawl") if isinstance(doc.get("last_crawl"), dict) else None,
         "latest_weekly_blog_at": doc.get("latest_weekly_blog_at"),
         "last_manually_refreshed_at": doc.get("last_manually_refreshed_at"),
         "created_at": doc.get("created_at"),
@@ -247,16 +249,18 @@ def _public_tracking_run_doc(doc: dict | None) -> dict | None:
 def _build_tracking_fallback_questions(business_doc: dict) -> list[dict]:
     name = str(business_doc.get("businessName") or business_doc.get("normalized_domain") or "this business").strip()
     category = str(business_doc.get("category") or "business").strip()
-    location = str(business_doc.get("location") or "local area").strip()
+    location = str(business_doc.get("location") or "").strip()
     services = business_doc.get("services") if isinstance(business_doc.get("services"), list) else []
     service_text = ", ".join([str(s).strip() for s in services if str(s).strip()][:3]) or category
+    # L2: a place name only where the kind of business has one
+    in_place = f" in {location}" if uses_location(question_profile(category, business_doc.get("sub_type")), location) else ""
     raw_questions = [
-        f"What are the best {category} options in {location}?",
-        f"Which {category} in {location} is most recommended?",
-        f"Who offers {service_text} in {location}?",
-        f"Is {name} recommended for {category} in {location}?",
+        f"What are the best {category} options{in_place}?",
+        f"Which {category}{in_place} is most recommended?",
+        f"Who offers {service_text}{in_place}?",
+        f"Is {name} recommended for {category}{in_place}?",
         f"What do reviews say about {name}?",
-        f"Which businesses compete with {name} for {category} customers in {location}?",
+        f"Which businesses compete with {name} for {category} customers{in_place}?",
     ]
     return [{"id": f"track-{idx + 1}", "text": text} for idx, text in enumerate(raw_questions)]
 
@@ -292,6 +296,7 @@ async def _run_competitor_tracking_for_business(
         "location": business_doc.get("location") or "",
         "description": business_doc.get("aiDescription") or business_doc.get("businessDescription") or "",
         "services": business_doc.get("services") if isinstance(business_doc.get("services"), list) else [],
+        "target_audience": business_doc.get("target_audience") or "",
     }
 
     questions: list[dict]

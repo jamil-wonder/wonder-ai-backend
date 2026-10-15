@@ -410,9 +410,9 @@ async def api_scrape(
                     location=request.location,
                     business_name=result.get("businessName"),
                     logo_url=result.get("logoUrl"),
-                    phase1_score=((result.get("scores") or {}).get("total") if isinstance(result.get("scores"), dict) else None),
+                    phase1_score=_phase1_score_of(result),
                     business_id=request.business_id,
-                    scrape_result=result,
+                    scrape_result=None if _fetch_failure(result) else result,
                 )
                 public_business = _public_business_doc(business)
                 if public_business:
@@ -476,9 +476,9 @@ async def api_scrape(
                             location=request.location,
                             business_name=fallback.get("businessName"),
                             logo_url=fallback.get("logoUrl"),
-                            phase1_score=((fallback.get("scores") or {}).get("total") if isinstance(fallback.get("scores"), dict) else None),
+                            phase1_score=_phase1_score_of(fallback),
                             business_id=request.business_id,
-                            scrape_result=fallback,
+                            scrape_result=None if _fetch_failure(fallback) else fallback,
                         )
                         public_business = _public_business_doc(business)
                         if public_business:

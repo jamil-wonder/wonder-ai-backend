@@ -71,6 +71,7 @@ class ScrapeResult(BaseModel):
     scores: Dict[str, Any]
     rawMeta: Dict[str, str]
     warnings: List[str]
+    fetch: Optional[Dict[str, Any]] = None
     seoInfo: Optional[Dict[str, Any]] = None
     technologies: List[str] = Field(default_factory=list)
     aiSuggestions: Dict[str, str] = Field(default_factory=dict)
@@ -185,6 +186,20 @@ class Token(BaseModel):
 
 class LoginRequest(BaseModel):
     email: str
+    password: str
+
+
+# H3: forgot / reset password
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class ResetCheckRequest(BaseModel):
+    token: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
     password: str
 
 

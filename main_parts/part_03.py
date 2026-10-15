@@ -765,6 +765,50 @@ async def _latest_completed_tracker_mention_rate(business_id: str) -> float | No
     return (await _latest_completed_tracker_mention(business_id))[0]
 
 
+async def _notify(user_id, business_id, item: dict | None, dedupe_key: str) -> None:
+    """J10: store one in-app notification. Best effort - never breaks the caller - and the
+    same event (dedupe_key) is only ever stored once, so a re-finalized run does not repeat itself."""
+    if notifications_col is None or not item or not user_id:
+        return
+    try:
+        if await notifications_col.find_one({"user_id": str(user_id), "dedupe_key": dedupe_key}):
+            return
+        await notifications_col.insert_one({
+            **item,
+            "user_id": str(user_id),
+            "business_id": str(business_id or ""),
+            "dedupe_key": dedupe_key,
+            "created_at": datetime.utcnow(),
+            "read_at": None,
+        })
+    except Exception as e:
+        print(f"[Notify] could not store {dedupe_key}: {e}")
+
+
+async def _competitors_of_job(job_id) -> list:
+    if phase5_jobs_col is None or not job_id:
+        return []
+    job = await phase5_jobs_col.find_one({"job_id": job_id}, projection={"deep_competitors": 1})
+    return (job or {}).get("deep_competitors") or []
+
+
+async def _emit_run_notifications(run: dict, business_name: str, score, previous_score, tracker_job_id) -> None:
+    run_id, user_id, business_id = run.get("run_id"), run.get("user_id"), run.get("business_id")
+    await _notify(user_id, business_id, notif.scan_complete(business_name, score), f"scan_complete:{run_id}")
+    await _notify(user_id, business_id, notif.score_moved(business_name, previous_score, score), f"score_moved:{run_id}")
+    if tracker_job_id and phase5_jobs_col is not None:
+        try:
+            prev_job = await phase5_jobs_col.find_one(
+                {"business_id": str(business_id), "job_type": "core", "model": "multi", "status": "completed",
+                 "job_id": {"$ne": tracker_job_id}},
+                sort=[("created_at", -1)], projection={"deep_competitors": 1},
+            )
+            names = notif.overtakers((prev_job or {}).get("deep_competitors"), await _competitors_of_job(tracker_job_id))
+            await _notify(user_id, business_id, notif.competitor_overtook(business_name, names), f"overtook:{run_id}")
+        except Exception as e:
+            print(f"[Notify] competitor check failed run={run_id}: {e}")
+
+
 async def _scan_run_finalize(run_id) -> dict | None:
     """Decide the run's final status and, only if it is COMPLETE and every input
     exists, compute + store the Wonder Score. Safe to call again after a retry:
@@ -797,6 +841,8 @@ async def _scan_run_finalize(run_id) -> dict | None:
     inputs = None
     score = None
     tracker_job_id = None
+    previous_score = None
+    business_name = ""
     if status == "complete":
         crawl = legs.get("crawl") or {}
         tracker = legs.get("tracker") or {}
@@ -816,6 +862,11 @@ async def _scan_run_finalize(run_id) -> dict | None:
         if mention_rate is None and "tracker" not in attempted:
             mention_rate, mention_margin, tracker_job_id = await _latest_completed_tracker_mention(business_id)
         market = competitors.get("market_position") if competitors.get("status") == "ok" else None
+        if market is None and "tracker" not in attempted and tracker_job_id and phase5_jobs_col is not None:
+            stored_job = await phase5_jobs_col.find_one({"job_id": tracker_job_id}, projection={"market_ladder": 1})
+            ladder_doc = (stored_job or {}).get("market_ladder") or {}
+            if ladder_doc.get("measured"):
+                market = ladder_doc.get("position")
         inputs = {
             "mention_rate": mention_rate,
             "technical_score": technical,
@@ -839,6 +890,7 @@ async def _scan_run_finalize(run_id) -> dict | None:
         try:
             biz = await businesses_col.find_one({"_id": ObjectId(business_id)}, {"wonder_scores": 1})
             history = [h for h in ((biz or {}).get("wonder_scores") or []) if h.get("run_id") != run_id]
+            previous_score = history[-1].get("score") if history else None
             history.append({
                 "run_id": run_id,
                 "score": score,
@@ -861,6 +913,15 @@ async def _scan_run_finalize(run_id) -> dict | None:
         except Exception as e:
             print(f"[ScanRun] storing wonder score failed run={run_id}: {e}")
 
+    if status == "complete":
+        try:
+            if businesses_col is not None:
+                b = await businesses_col.find_one({"_id": ObjectId(business_id)}, {"businessName": 1})
+                business_name = (b or {}).get("businessName") or ""
+        except Exception:
+            business_name = ""
+        await _emit_run_notifications(run, business_name, score, previous_score, tracker_job_id)
+
     print(f"[ScanRun] run={run_id} trigger={run.get('trigger')} -> {status}, wonder_score={score}")
     return await scan_runs_col.find_one({"run_id": run_id})
 
@@ -881,6 +942,41 @@ async def _scan_run_active_for(business_ids: list) -> dict:
     return out
 
 
+def _fetch_failure(scrape_result) -> dict | None:
+    """L1: the scraper's verdict when it could NOT get the website ({ok: False,
+    http_status, reason}), else None. A result without the verdict (older
+    cached results) is trusted as before."""
+    info = scrape_result.get("fetch") if isinstance(scrape_result, dict) else None
+    if isinstance(info, dict) and info.get("ok") is False:
+        return info
+    return None
+
+
+def _phase1_score_of(scrape_result):
+    """The website-health score to store - None when the scan did not really
+    reach the website, so an error page never becomes a score."""
+    if not isinstance(scrape_result, dict) or _fetch_failure(scrape_result):
+        return None
+    scores = scrape_result.get("scores")
+    return scores.get("total") if isinstance(scores, dict) else None
+
+
+async def _record_last_crawl(business_id, scrape_result) -> None:
+    """Remember how the latest website scan went on the business, so the dashboard
+    can say "Score not available - website scan failed" instead of a stale number."""
+    if businesses_col is None or not business_id or not isinstance(scrape_result, dict):
+        return
+    failure = _fetch_failure(scrape_result)
+    info = failure or {"ok": True, "http_status": (scrape_result.get("fetch") or {}).get("http_status"), "reason": None}
+    try:
+        await businesses_col.update_one(
+            {"_id": ObjectId(str(business_id))},
+            {"$set": {"last_crawl": {**info, "at": _scan_run_now()}}},
+        )
+    except Exception as e:
+        print(f"[ScanRun] could not store last_crawl for {business_id}: {e}")
+
+
 async def _record_manual_crawl_run(current_user, business, scrape_result) -> None:
     """A manual Analyzer crawl is a one-leg scan run. When it completes, the
     Wonder Score is recomputed from this fresh website health plus the latest
@@ -894,7 +990,13 @@ async def _record_manual_crawl_run(current_user, business, scrape_result) -> Non
             business_id=str(business.get("_id")), user_id=current_user.get("id"),
             url=business.get("url") or "", trigger="manual_analyzer", legs=["crawl"],
         )
-        await _scan_run_set_leg(run_id, "crawl", "ok", score=scores.get("total"))
+        failure = _fetch_failure(scrape_result)
+        await _record_last_crawl(business.get("_id"), scrape_result)
+        if failure:
+            print(f"[ScanRun] website scan failed for {business.get('url')}: HTTP {failure.get('http_status')} - {failure.get('reason')}")
+            await _scan_run_set_leg(run_id, "crawl", "failed", error=failure.get("reason"), http_status=failure.get("http_status"))
+        else:
+            await _scan_run_set_leg(run_id, "crawl", "ok", score=scores.get("total"))
         await _scan_run_finalize(run_id)
     except Exception as e:
         print(f"[ScanRun] manual crawl run failed: {e}")

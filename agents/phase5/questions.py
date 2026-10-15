@@ -12,6 +12,7 @@ from .helpers import (
     _safe_json_parse,
 )
 from .providers import _call_openai_chat_json, _call_perplexity_with_retry
+from .question_profile import natural_terms, question_profile, uses_location, violates_profile
 
 
 def _clean_question(value: str) -> str:
@@ -37,6 +38,13 @@ def _merge_context(page_context: dict, business_context: dict | None) -> dict:
         "description": ["description", "businessDescription", "aiDescription"],
     }
     for target, keys in field_map.items():
+        for key in keys:
+            value = _text(supplied.get(key))
+            if value:
+                ctx[target] = value
+                break
+
+    for target, keys in {"sub_type": ["sub_type", "subType"], "audience": ["target_audience", "targetAudience", "audience"]}.items():
         for key in keys:
             value = _text(supplied.get(key))
             if value:
@@ -233,6 +241,7 @@ async def generate_preview_questions(
 
     Rules:
     - Every question must be realistic, specific to this real business's category/location, and end with "?".
+    - Ask about what customers of this kind of business really care about; never use venue wording (book, table, stay, visit, menu) unless it is a restaurant, hotel or similar venue.
     - Never mention the business name in nonBranded or localSeo.
     - JSON only, no markdown.
     """
@@ -252,7 +261,7 @@ async def generate_preview_questions(
         ("localSeo", "local-seo", "Local SEO"),
     ]:
         text = _clean_question(parsed.get(key))
-        if text and not _is_low_quality_query(text):
+        if text and not _is_low_quality_query(text) and not violates_profile(text, question_profile(category, ctx.get("sub_type"))):
             out.append({"text": text, "type": type_key, "label": label})
     return out
 
@@ -282,7 +291,7 @@ async def generate_brand_questions(
     # pattern below) — at 5 local SEO questions that's 2, at 10 it's 4. This
     # is a floor enforced by re-prompting the AI for real candidates that
     # match it (see the retry loop), never by splicing in a templated string.
-    local_pattern_min = max(1, round(local_seo_target * 0.4)) if local_seo_target > 0 else 0
+    local_pattern_min_wanted = max(1, round(local_seo_target * 0.4)) if local_seo_target > 0 else 0
     page_ctx = await _fetch_page_context(url)
     ctx = _merge_context(page_ctx, business_context)
 
@@ -291,7 +300,14 @@ async def generate_brand_questions(
     location = _text(ctx.get("location"))
     description = _text(ctx.get("description"))
     services = ctx.get("services") if isinstance(ctx.get("services"), list) else []
-    services = [_text(item) for item in services if _text(item)][:8]
+    services = [_text(item) for item in services if _text(item)][:10]
+    sub_type = _text(ctx.get("sub_type"))
+    audience = _text(ctx.get("audience"))
+    # L2: what this kind of business's customers ask - and whether a place belongs in it
+    profile = question_profile(category, sub_type)
+    use_loc = uses_location(profile, location)
+    # services plus everyday words for this kind of business, for the on-topic checks below
+    match_services = services + natural_terms(profile, sub_type)
     avoid_questions = ctx.get("avoidQuestions") if isinstance(ctx.get("avoidQuestions"), list) else []
     avoid_questions = [_clean_question(item) for item in avoid_questions if _text(item)][:30]
 
@@ -300,7 +316,7 @@ async def generate_brand_questions(
         missing.append("business name")
     if not category:
         missing.append("category")
-    if not location:
+    if not location and profile["location_mode"] == "required":
         missing.append("location")
     if missing:
         raise ValueError(
@@ -308,17 +324,61 @@ async def generate_brand_questions(
             f"Missing: {', '.join(missing)}."
         )
 
+    local_pattern_min = local_pattern_min_wanted if use_loc else 0
     domain = _normalize_domain(url)
+    if use_loc:
+        location_line = f"Primary location to use in every local query: {location}"
+    elif location:
+        location_line = f"Based in: {location} (use it only if it fits a question naturally)"
+    else:
+        location_line = "Location: not a factor for this business - do not put a place name in the questions"
     context_block = "\n".join(
         [
             f"Business name: {brand_name}",
             f"Website domain: {domain}",
-            f"Business category: {category}",
-            f"Primary location to use in every local query: {location}",
-            f"Description: {description[:260]}" if description else "",
+            f"Business category: {category}" + (f" (specifically: {sub_type})" if sub_type else ""),
+            f"Kind of business: {profile['label']}",
+            location_line,
+            f"Who it serves: {audience}" if audience else "",
+            f"Description: {description[:400]}" if description else "",
             f"Services / offers: {', '.join(services)}" if services else "",
         ]
     ).strip()
+    intent_text = "; ".join(profile["intents"])
+    wording_rule = (
+        ""
+        if profile.get("hospitality_words_ok")
+        else "- This is NOT a hospitality or venue business. Never use the words book, booking, reserve, reservation, table, stay, visit, check-in or menu, and never write about visiting, booking a table or staying at it.\n"
+    )
+    if use_loc:
+        local_rules = f"""- Do NOT include "{brand_name}", "{domain}", the website URL, or any obvious brand variant.
+- Every question MUST include the same business location: "{location}".
+- Every question must be specific to this category: "{category}".
+- Use service/details from the context when available.
+- Cover these intents: {intent_text}.
+- Do not use placeholder words such as "business", "company", or "place".
+- Avoid repeated wording patterns.
+- At least {local_pattern_min} of the {candidate_counts["localSeo"]} local_seo_queries MUST use the classic, high-volume real-search shape "Best <category> in <location>?" - questions shaped like "Best {category} in {location}?", using the exact location "{location}" every time and a natural real-world variant of the category or a specific service each time (do not repeat the identical sentence). Example shape only (do not reuse this exact wording): "{profile['example']}"
+- The remaining local_seo_queries should use other natural local-intent phrasings rather than all following the same "Best X in Y" shape."""
+        broad_rules = f"""- Do NOT include "{brand_name}", "{domain}", the website URL, or any obvious brand variant.
+- Identify the actual real-world neighboring areas, neighborhoods, boroughs, or districts surrounding "{location}" and write questions using those real neighboring names, e.g. "Which [category] near [Neighboring Area] would people recommend?".
+- The goal is to see if the AI engine recommends "{brand_name}" to people searching from these nearby surrounding areas.
+- Do NOT use the exact string "{location}" in these questions. Instead, use the real surrounding areas.
+- Every question must be specific to this category: "{category}" or the listed services.
+- Avoid repeated wording patterns."""
+    else:
+        place_note = f" It is based in {location}, but a place name is not required." if location else ""
+        local_rules = f"""- Do NOT include "{brand_name}", "{domain}", the website URL, or any obvious brand variant.
+- These are specific, market-focused discovery questions: a particular need, audience, or use case this kind of business serves.{place_note}
+- Every question must be specific to this category: "{category}" or the listed services.
+- Cover these intents: {intent_text}.
+- Do not use placeholder words such as "business", "company", or "place".
+- Avoid repeated wording patterns. Example shape only (do not reuse this exact wording): "{profile['example']}" """
+        broad_rules = f"""- Do NOT include "{brand_name}", "{domain}", the website URL, or any obvious brand variant.
+- These are wider comparison and alternative-seeking questions: "alternatives to ...", "which option is best for [audience or use case]", "what is the difference between ...", for the services in this category.
+- Do NOT put any place name in these questions.
+- Every question must be specific to this category: "{category}" or the listed services.
+- Avoid repeated wording patterns."""
     avoid_block = "\n".join([f"- {item}" for item in avoid_questions[:20]])
 
     base_prompt = f"""
@@ -337,11 +397,13 @@ Required structure:
 - broad_seo_queries: exactly {candidate_counts["broadSeo"]} candidate questions.
 
 Important quality rules:
-- Do not write thin generic prompts such as "Best Hotel in City of London?".
-- Do not write broken prompts such as "Best Hotel options for Angler?".
+- Do not write thin generic prompts that could apply to any business.
+- Do not write broken prompts such as "Best options for <business name>?".
 - Do not write general advice prompts such as "What should I look for...", "How do I compare...", "How do I check...", or "What is the best way to...".
-- Every question must include a useful buyer intent such as reviews, booking, menu/service details, suitability, occasion, price/value, comparison, trust, amenities, or availability.
-- Prefer natural full questions a real customer would type into Google, ChatGPT, Claude, or Perplexity.
+- Every question must carry a real buyer intent for THIS kind of business. The intents that matter here: {intent_text}.
+{wording_rule}- Prefer natural full questions a real customer would type into Google, ChatGPT, Claude, or Perplexity.
+- Use the services and the audience given above rather than generic wording.
+- The category label above is only our own filing label. Write the way customers talk: use the everyday name of what the business is or offers (for example "solicitors", "dentists", "online store builder"), and never paste the category label itself into a question unless it is already a natural phrase.
 - If previous questions are provided below, do not repeat them and do not create near-duplicates with only tiny wording changes.
 
 Previous questions to avoid:
@@ -349,39 +411,25 @@ Previous questions to avoid:
 
 Rules for branded_queries:
 - Each question MUST include the exact business name: "{brand_name}".
-- Each question must also use the real category or location context.
-- Make them useful for checking brand understanding, reviews, menu/services, location, trust, booking, or suitability.
+- Each question must also use the real category{" or location" if use_loc else ""} context.
+- Make them useful for checking what AI knows about the brand: {intent_text}.
 - They must be SEO-friendly questions a real customer could ask.
 
 Rules for non_branded_queries:
 - Do NOT include "{brand_name}", "{domain}", the website URL, or any obvious brand variant.
-- These are category/service discovery prompts and do NOT have to include the location.
+- These are category/service discovery prompts and do NOT have to include a place.
 - Every question must be specific to this category: "{category}" or the listed services.
-- Cover discovery, comparison, quality, reviews, booking/availability, price/value, occasion/use-case, and trust intent.
+- Cover these intents: {intent_text}.
 - Write prompts that could surface recommended providers, competitors, or ranked options.
-- Prefer patterns like "Which [category]...", "What [category] options...", "Are there [category]...", "Where can I book...".
+- Prefer patterns like "Which [category]...", "What [category] options...", "Are there [category]...".
 - Do NOT write advice/how-to prompts that only teach the user how to choose, compare, or check a provider.
 - Avoid repeated wording patterns.
 
 Rules for local_seo_queries:
-- Do NOT include "{brand_name}", "{domain}", the website URL, or any obvious brand variant.
-- Every question MUST include the same business location: "{location}".
-- Every question must be specific to this category: "{category}".
-- Use service/details from the context when available.
-- Cover discovery, comparison, quality, reviews, booking/availability, price/value, occasion/use-case, and trust intent.
-- Do not use placeholder words such as "business", "company", or "place".
-- Avoid repeated wording patterns.
-- At least {local_pattern_min} of the {candidate_counts["localSeo"]} local_seo_queries MUST use the classic, high-volume real-search shape "Best <category> in <location>?" — for this business that means questions shaped like "Best {category} in {location}?", using the exact location "{location}" every time and a natural real-world variant of the category or a specific service each time (do not repeat the identical sentence). Example shape only (do not reuse this exact wording): "Best restaurant in Belgravia?" for a restaurant in Belgravia, "Best hotel in Rye?" for a hotel in Rye, "Best supermarket in UK?" for a supermarket business covering the UK.
-- The remaining local_seo_queries should use other natural local-intent phrasings (comparison, reviews, booking, price/value, occasion) rather than all following the same "Best X in Y" shape.
+{local_rules}
 
 Rules for broad_seo_queries:
-- Do NOT include "{brand_name}", "{domain}", the website URL, or any obvious brand variant.
-- Identify the actual real-world neighboring areas, neighborhoods, boroughs, or districts surrounding "{location}" (for example, if "{location}" is "City of London", surrounding areas could include "Shoreditch", "Southwark", "Holborn", "Clerkenwell", "Whitechapel", etc.).
-- Write questions using these actual neighboring location names (e.g., "Do people in [Neighboring Area] recommend any good [Category]?" or "What are the best [Category] options around [Neighboring Area]?").
-- The goal is to see if the AI engine recommends "{brand_name}" to people searching from these nearby surrounding areas.
-- Do NOT use the exact string "{location}" in these questions. Instead, use the real surrounding areas.
-- Every question must be specific to this category: "{category}" or the listed services.
-- Avoid repeated wording patterns.
+{broad_rules}
 
 Return ONLY valid JSON:
 {{
@@ -432,10 +480,14 @@ Return ONLY valid JSON:
                 f"\n\nThe previous output failed validation. Regenerate a larger candidate pool with exactly "
                 f"{candidate_counts['branded']} branded, {candidate_counts['nonBranded']} non-branded, "
                 f"{candidate_counts['localSeo']} local SEO, and {candidate_counts['broadSeo']} broad SEO candidates. "
-                f"Keep the exact location \"{location}\" in every local SEO question. "
-                f"Remember: at least {local_pattern_min} of the local_seo_queries MUST be the classic "
-                f"\"Best {category} in {location}?\" shape (real category/service wording, exact location) — "
-                f"this attempt was short on that pattern last time, so include more of them, not fewer."
+                + (
+                    f"Keep the exact location \"{location}\" in every local SEO question. "
+                    f"Remember: at least {local_pattern_min} of the local_seo_queries MUST be the classic "
+                    f"\"Best {category} in {location}?\" shape (real category/service wording, exact location) - "
+                    f"this attempt was short on that pattern last time, so include more of them, not fewer."
+                    if use_loc else
+                    "Keep every question specific to this kind of business and its services, with no place names."
+                )
             )
 
         if provider_name == "openai":
@@ -476,11 +528,11 @@ Return ONLY valid JSON:
             if len(text) < 12 or key in seen:
                 continue
             quality_text = re.sub(re.escape(brand_name), "", text, flags=re.IGNORECASE)
-            if _is_low_quality_query(quality_text):
+            if _is_low_quality_query(quality_text) or violates_profile(text, profile):
                 continue
             if not _includes_brand(text, brand_name):
                 continue
-            if not _includes_location(text, location) and not _includes_category_or_service(text, category, services):
+            if not (use_loc and _includes_location(text, location)) and not _includes_category_or_service(text, category, match_services):
                 continue
             seen.add(key)
             branded.append(text)
@@ -492,11 +544,11 @@ Return ONLY valid JSON:
             key = text.lower().rstrip("?.!")
             if len(text) < 12 or key in seen:
                 continue
-            if _is_low_quality_query(text):
+            if _is_low_quality_query(text) or violates_profile(text, profile):
                 continue
             if _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain):
                 continue
-            if not _includes_category_or_service(text, category, services):
+            if not _includes_category_or_service(text, category, match_services):
                 continue
             seen.add(key)
             non_branded.append(text)
@@ -516,13 +568,13 @@ Return ONLY valid JSON:
             key = text.lower().rstrip("?.!")
             if len(text) < 12 or key in seen:
                 continue
-            if _is_low_quality_query(text):
+            if _is_low_quality_query(text) or violates_profile(text, profile):
                 continue
             if _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain):
                 continue
-            if not _includes_location(text, location):
+            if use_loc and not _includes_location(text, location):
                 continue
-            if not _includes_category_or_service(text, category, services):
+            if not _includes_category_or_service(text, category, match_services):
                 continue
             seen.add(key)
             valid_local_candidates.append(text)
@@ -530,7 +582,7 @@ Return ONLY valid JSON:
         for text in valid_local_candidates:
             if len(local_seo) >= local_pattern_min:
                 break
-            if _matches_best_in_location_pattern(text, category, location, services):
+            if _matches_best_in_location_pattern(text, category, location, match_services):
                 local_seo.append(text)
 
         for text in valid_local_candidates:
@@ -540,7 +592,7 @@ Return ONLY valid JSON:
                 local_seo.append(text)
 
         local_pattern_count = sum(
-            1 for text in local_seo if _matches_best_in_location_pattern(text, category, location, services)
+            1 for text in local_seo if _matches_best_in_location_pattern(text, category, location, match_services)
         )
 
         for item in raw_broad_seo:
@@ -548,11 +600,11 @@ Return ONLY valid JSON:
             key = text.lower().rstrip("?.!")
             if len(text) < 12 or key in seen:
                 continue
-            if _is_low_quality_query(text):
+            if _is_low_quality_query(text) or violates_profile(text, profile):
                 continue
             if _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain):
                 continue
-            if not _includes_category_or_service(text, category, services):
+            if not _includes_category_or_service(text, category, match_services):
                 continue
             seen.add(key)
             broad_seo.append(text)
@@ -568,7 +620,7 @@ Return ONLY valid JSON:
         # whichever simply has more items — a fuller list that's short on
         # the required "Best X in Y" shape isn't actually the better result.
         best_local_pattern_count = sum(
-            1 for text in best_local_seo if _matches_best_in_location_pattern(text, category, location, services)
+            1 for text in best_local_seo if _matches_best_in_location_pattern(text, category, location, match_services)
         )
         local_is_better = (
             min(local_pattern_count, local_pattern_min) > min(best_local_pattern_count, local_pattern_min)
@@ -608,7 +660,7 @@ Return ONLY valid JSON:
     total_generated = len(final_branded) + len(final_non_branded) + len(final_local_seo) + len(final_broad_seo)
     if total_generated > 0:
         final_local_pattern_count = sum(
-            1 for text in final_local_seo if _matches_best_in_location_pattern(text, category, location, services)
+            1 for text in final_local_seo if _matches_best_in_location_pattern(text, category, location, match_services)
         )
         print(
             "[Phase5] advanced question-gen completed with validated output "

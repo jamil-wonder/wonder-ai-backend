@@ -81,7 +81,8 @@ async def _build_weekly_blogs_for_business(
             **generated,
             "id": f"{week_id}-blog-{idx + 1}",
             "idea": idea,
-            "humanizedScore": _humanized_blog_score(generated, blog_voice),
+            # F6: a real readability score (Flesch reading ease + band), not a made-up "humanized" number
+            "readability": readability_of_sections(generated.get("sections")),
             "humanizeNote": "Edit a few details, add a real customer example, and adjust wording to match the business voice before publishing.",
             "language": generated.get("language"),
             # F1: what to confirm before this goes live (statements sourced to the
@@ -137,6 +138,10 @@ async def _build_weekly_blogs_for_business(
     }
     if force:
         updates["last_manually_refreshed_at"] = now_iso
+    await _notify(
+        current_user["id"], business_id, notif.blogs_ready(business_name, len(drafts)),
+        f"blogs_ready:{business_id}:{now_iso}",
+    )
 
     await businesses_col.update_one(
         {"_id": ObjectId(business_id), "user_id": current_user["id"]},
@@ -150,6 +155,16 @@ def _public_weekly_blog_doc(doc: dict | None) -> dict | None:
         return None
     out = dict(doc)
     out["id"] = str(out.pop("_id", ""))
+    # F6: drafts stored before the real score existed get it worked out from their text
+    drafts = []
+    for d in out.get("drafts") or []:
+        d = dict(d)
+        d.pop("humanizedScore", None)
+        if not d.get("readability"):
+            d["readability"] = readability_of_sections(d.get("sections"))
+        drafts.append(d)
+    if drafts:
+        out["drafts"] = drafts
     return out
 
 
@@ -323,6 +338,7 @@ async def api_blogs_generate(request: BlogGenerateRequest, current_user: dict = 
         sections=sections,
         wordCount=int(generated.get("wordCount") or 0),
         modelUsed=str(generated.get("modelUsed") or selected_model),
+        readability=readability_of_sections(generated.get("sections")),
         checkBeforePublishing=[str(x) for x in (generated.get("checkBeforePublishing") or [])],
         claims=generated.get("claims") or [],
     )

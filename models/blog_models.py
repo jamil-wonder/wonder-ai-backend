@@ -67,6 +67,8 @@ class BlogGenerateResult(BaseModel):
     # F1: what to confirm before publishing, and where each claim came from
     checkBeforePublishing: List[str] = []
     claims: List[dict] = []
+    # F6: Flesch reading ease {score, band, words, sentences}
+    readability: Optional[dict] = None
 
 
 class BlogGenerateResponse(BaseModel):

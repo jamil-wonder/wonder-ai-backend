@@ -478,7 +478,8 @@ async def _process_phase5_job(job_doc: dict):
             await _scan_run_tracker_failed(job_doc, "cancelled")
             return
 
-        # Calculate accurate target score now that all questions are finished
+        # Calculate the target score now that all questions are finished (replaced by the
+        # measured one below when a market ladder could be built)
         target_score = _estimate_target_visibility_score(accumulated_results)
         domain = _normalize_domain(job_doc["url"])
         
@@ -495,6 +496,30 @@ async def _process_phase5_job(job_doc: dict):
             "evidence": "Your site score from visibility and rank consistency across analyzed prompts.",
             "confidence": "target",
         })
+
+        # A2: score every competitor the same way as the business - from the same
+        # questions and the same stored answers - instead of an estimate. Without a
+        # measured comparison there is no ladder (the old estimated scores are not shown).
+        ladder = {"rows": [], "position": None, "measured": False}
+        if model_provider == "multi":
+            try:
+                ladder = build_market_ladder(
+                    accumulated_results, questions, domain, None,
+                    [c for c in deep_competitors if isinstance(c, dict) and c.get("confidence") != "target"],
+                )
+            except Exception as ladder_error:
+                print(f"[Phase5] market ladder failed job_id={job_id}: {ladder_error}")
+        ladder_by_domain = {r["domain"]: r for r in ladder["rows"]}
+        for c in deep_competitors:
+            row = ladder_by_domain.get(_normalize_domain(str(c.get("domain") or ""))) if ladder["measured"] else None
+            if row:
+                c["score"] = row["score"]
+                c["evidence"] = market_evidence_text(row)
+                c["score_basis"] = "measured"
+                c["appeared"] = row["appeared"]
+                c["answered"] = row["answered"]
+            elif c.get("confidence") != "target":
+                c["score_basis"] = "estimated"
 
         # Generate accurate brand summary now that questions are finished
         brand_summary = None
@@ -537,7 +562,8 @@ async def _process_phase5_job(job_doc: dict):
                     "domain": c.get("domain"),
                     "url": c.get("url"),
                     "name": c.get("name"),
-                    "score": c.get("score"),
+                    # A2: only a measured score is stored as a score
+                    "score": c.get("score") if c.get("score_basis") == "measured" else None,
                     "status": c.get("confidence") or "AI evidence",
                     "evidence": c.get("evidence") or "",
                 }
@@ -582,6 +608,7 @@ async def _process_phase5_job(job_doc: dict):
                         if run_incomplete else None
                     ),
                     "deep_competitors": deep_competitors,
+                    "market_ladder": ladder,
                     "brand_summary": brand_summary,
                     "updated_at": datetime.utcnow().isoformat(),
                 }
@@ -591,6 +618,10 @@ async def _process_phase5_job(job_doc: dict):
 
         scan_run_id = job_doc.get("scan_run_id")
         if scan_run_id and model_provider == "multi":
+            if ladder["measured"] and not run_incomplete:
+                await _scan_run_set_leg(scan_run_id, "competitors", "ok", market_position=ladder["position"], job_id=job_id)
+            else:
+                await _scan_run_set_leg(scan_run_id, "competitors", "skipped")
             await _scan_run_set_leg(
                 scan_run_id, "tracker", "incomplete" if run_incomplete else "ok", job_id=job_id,
                 mention_rate=None if run_incomplete else compute_mention_rate(accumulated_results, questions),

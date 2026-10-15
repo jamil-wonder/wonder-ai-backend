@@ -1,5 +1,6 @@
 import os
 import json
+from blog_dates import date_prompt_block, fix_blog_dates
 from blog_claims import CLAIM_RULES, facts_prompt_block, vet_blog
 from blog_language import DEFAULT_LOCALE, language_prompt_block, localize_spelling
 from blog_structure import fix_structure, structure_feedback, structure_problems, structure_prompt_block
@@ -987,7 +988,7 @@ async def generate_seo_blog(
     - Tone: {tone or "clear, authoritative, helpful"}
     - Key features: {json.dumps(key_features or [])}
     - Selling points: {json.dumps(selling_points or [])}
-{structure_prompt_block(internal_links)}{topics_prompt_block(topic_keywords)}{CLAIM_RULES.format(facts=facts_prompt_block(facts))}{language_prompt_block(language)}
+{structure_prompt_block(internal_links)}{topics_prompt_block(topic_keywords)}{CLAIM_RULES.format(facts=facts_prompt_block(facts))}{language_prompt_block(language)}{date_prompt_block()}
     Return strict JSON only with this exact shape:
     {{
       "title": "optimized H1 title",
@@ -1009,6 +1010,7 @@ async def generate_seo_blog(
     1. BRAND MENTIONS: Name the business "{brand}" naturally where it is relevant - roughly 4 to 8 times in the whole article. Never force it into a sentence.
     2. INTEGRATION: Use the business facts above, its services and its location where they are listed. Do not add authority, awards or customer proof that is not in the facts.
     3. FORMAT: Do not include markdown code block fences. Return raw JSON only.
+    4. READABILITY: plain English a busy customer reads easily. Average sentence under 18 words, everyday words over long ones, no stacked clauses. The article is scored on the Flesch reading ease and should reach 60 or more.
     """
 
     # F2: a draft that repeats a keyword phrase word for word is rejected and
@@ -1044,7 +1046,17 @@ async def generate_seo_blog(
     # F3: whatever the writer slipped, the finished text uses the business's own English
     protect = " ".join([brand] + [f["text"] for f in facts] + [str(title)])
     sections, language_fixes = localize_spelling(sections, language, protect)
+    # L3: today's year in the title / headings; a past year left in the text is listed
+    raw_slug = str(parsed.get("slug") or re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")).strip()
+    dated = fix_blog_dates(
+        str(parsed.get("title") or title).strip(),
+        str(parsed.get("metaTitle") or title).strip(),
+        raw_slug,
+        sections,
+    )
+    sections = dated["sections"]
     check_list = list(vetted["checkBeforePublishing"])
+    check_list.extend(dated["notes"])
     if remaining_repeats:
         listed = "; ".join(f'"{k}" ({n} times)' for k, n in remaining_repeats.items())
         check_list.insert(0, f"Reword the repeated keyword phrases - they still appear word for word more than once: {listed}.")
@@ -1061,10 +1073,10 @@ async def generate_seo_blog(
         "structureProblems": remaining_structure,
         "keywordAttempts": attempts,
         "keywordRepeats": remaining_repeats,
-        "title": str(parsed.get("title") or title).strip(),
-        "metaTitle": str(parsed.get("metaTitle") or title).strip()[:90],
+        "title": dated["title"],
+        "metaTitle": dated["metaTitle"][:90],
         "metaDescription": str(parsed.get("metaDescription") or "").strip()[:220],
-        "slug": str(parsed.get("slug") or re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")).strip(),
+        "slug": dated["slug"],
         "excerpt": str(parsed.get("excerpt") or "").strip(),
         "keywords": [str(k).strip() for k in (parsed.get("keywords") if isinstance(parsed.get("keywords"), list) else []) if str(k).strip()],
         "sections": sections,
@@ -1116,8 +1128,10 @@ async def generate_weekly_blog_ideas(
       ]
     }}
 
+    {date_prompt_block()}
     Rules:
     - Return exactly 2 ideas.
+    - Do not put any number, statistic, ranking claim or year in a title unless it comes from the business details above (a year, if any, is the current year).
     - Focus on likely ranking opportunities for the business niche and location.
     - Avoid generic topics; include category, service, location, or buyer intent.
     - Keywords must be natural search phrases.

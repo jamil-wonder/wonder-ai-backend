@@ -1,5 +1,6 @@
 import json
 
+from scraping.fetch_check import assess_fetch
 import re
 import asyncio
 import sys
@@ -178,6 +179,8 @@ async def _fetch_with_playwright(target_url: str) -> Dict[str, Any]:
         "timed_out": False,
         "screenshot_bytes": None,
         "warnings": [],
+        "http_status": None,
+        "blocked": False,
     }
 
     async with async_playwright() as p:
@@ -202,7 +205,8 @@ async def _fetch_with_playwright(target_url: str) -> Dict[str, Any]:
         await page.route("**/*", route_intercept)
 
         try:
-            await page.goto(target_url, wait_until='domcontentloaded', timeout=25000)
+            nav = await page.goto(target_url, wait_until='domcontentloaded', timeout=25000)
+            result["http_status"] = nav.status if nav is not None else None
         except Exception as e:
             if 'Timeout' in str(type(e)):
                 result["timed_out"] = True
@@ -224,6 +228,7 @@ async def _fetch_with_playwright(target_url: str) -> Dict[str, Any]:
 
         if any(trigger in content_lower for trigger in cf_triggers):
             result["warnings"].append("Cloudflare / 403 block detected. Dropping Playwright context.")
+            result["blocked"] = True
             result["used_playwright"] = False
         else:
             result["final_url"] = page.url
@@ -334,6 +339,11 @@ async def fetch_ai_bot_access(origin: str, robots_txt_found: bool) -> Dict[str, 
         return {key: True for key in _AI_BOT_USER_AGENTS}
 
 async def fetch_with_httpx(url: str) -> Tuple[str, str]:
+    text, final_url, _status = await fetch_with_httpx_status(url)
+    return text, final_url
+
+
+async def fetch_with_httpx_status(url: str) -> Tuple[str, str, int]:
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -344,7 +354,7 @@ async def fetch_with_httpx(url: str) -> Tuple[str, str]:
         if response.status_code in [403, 401, 429]:
             # Some WAFs target simulated browser UAs. Re-try natively.
             response = await client.get(url)
-        return response.text, str(response.url)
+        return response.text, str(response.url), response.status_code
 
 async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bool = True) -> dict:
     warnings = []
@@ -367,6 +377,8 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
     timed_out = False
     used_playwright = False
     screenshot_bytes = None
+    http_status = None
+    blocked_by_waf = False
 
     playwright_enabled = can_use_playwright_on_current_loop()
     if PLAYWRIGHT_AVAILABLE and not playwright_enabled:
@@ -380,6 +392,8 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
             used_playwright = pw_result["used_playwright"]
             timed_out = pw_result["timed_out"]
             screenshot_bytes = pw_result["screenshot_bytes"]
+            http_status = pw_result.get("http_status")
+            blocked_by_waf = bool(pw_result.get("blocked"))
             debug_notes.extend(pw_result["warnings"])
         except Exception as e:
             debug_notes.append(f"Playwright error: {str(e)[:100]}. Falling back to standard fetch.")
@@ -393,6 +407,8 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
             used_playwright = pw_result["used_playwright"]
             timed_out = pw_result["timed_out"]
             screenshot_bytes = pw_result["screenshot_bytes"]
+            http_status = pw_result.get("http_status")
+            blocked_by_waf = bool(pw_result.get("blocked"))
             debug_notes.extend(pw_result["warnings"])
             if used_playwright:
                 debug_notes.append("Playwright executed in dedicated worker thread mode.")
@@ -402,11 +418,15 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
 
     if not used_playwright:
         try:
-            content, final_url = await fetch_with_httpx(target_url)
+            content, final_url, http_status = await fetch_with_httpx_status(target_url)
+            blocked_by_waf = blocked_by_waf or any("Cloudflare / 403 block detected" in str(w) for w in debug_notes)
             debug_notes.append("Note: JS-rendering was disabled or blocked. Dynamic content missing.")
         except Exception as e:
             raise Exception(f"Failed to fetch {target_url}: {str(e)}")
 
+    # L1: did we really get the website? Recorded with the result and logged.
+    fetch_info = assess_fetch(http_status, content, blocked=blocked_by_waf)
+    print(f"[Scrape] {target_url} -> HTTP {http_status}, fetch {'ok' if fetch_info['ok'] else 'FAILED: ' + str(fetch_info['reason'])}")
     is_protected_site = any("Cloudflare / 403 block detected" in str(w) for w in debug_notes)
     force_full_ai = os.getenv("PHASE1_FORCE_FULL_AI", "1").strip() == "1"
     if timed_out:
@@ -1168,6 +1188,7 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
         "rawMeta": raw_meta,
         "warnings": warnings,
         "debugNotes": debug_notes,
+        "fetch": fetch_info,
         "seoInfo": seo_info,
         "technologies": technologies,
         "aiSuggestions": {str(k): str(v)[:180] for k, v in ai_suggestions.items() if str(k).strip() and str(v).strip()},

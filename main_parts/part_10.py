@@ -238,7 +238,16 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str, trigger: st
             await _scan_run_finalize(scan_run_id)
             return
         crawl_scores = result.get("scores") if isinstance(result.get("scores"), dict) else {}
-        await _scan_run_set_leg(scan_run_id, "crawl", "ok", score=crawl_scores.get("total"))
+        crawl_failure = _fetch_failure(result)
+        await _record_last_crawl(business_id, result)
+        if crawl_failure:
+            print(f"[Scheduler] website scan failed for {url}: HTTP {crawl_failure.get('http_status')} - {crawl_failure.get('reason')}")
+            await _scan_run_set_leg(scan_run_id, "crawl", "failed", error=crawl_failure.get("reason"), http_status=crawl_failure.get("http_status"))
+            # an error page must not overwrite the saved profile / analysis, and nothing else is measured
+            await _scan_run_finalize(scan_run_id)
+            return
+        else:
+            await _scan_run_set_leg(scan_run_id, "crawl", "ok", score=crawl_scores.get("total"))
 
         await _upsert_user_business(
             current_user=user_mock,
@@ -247,7 +256,7 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str, trigger: st
             location=biz_doc.get("location"),
             business_name=result.get("businessName"),
             logo_url=result.get("logoUrl"),
-            phase1_score=((result.get("scores") or {}).get("total") if isinstance(result.get("scores"), dict) else None),
+            phase1_score=_phase1_score_of(result),
             business_id=business_id,
             scrape_result=result,
         )
@@ -278,17 +287,9 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str, trigger: st
         # the next catch-up pass retries it instead of treating it as done.
         tracker_ok = True
 
-        try:
-            await _build_weekly_blogs_for_business(
-                business_doc={**biz_doc, "businessName": result.get("businessName") or biz_doc.get("businessName"), "latest_scrape_result": result},
-                current_user=user_mock,
-                force=False,
-            )
-            print(f"[Scheduler] Weekly blogs ready for {url}")
-            await _scan_run_set_leg(scan_run_id, "plan", "ok")
-        except Exception as blog_err:
-            print(f"[Scheduler] Weekly blog generation failed for {url}: {blog_err}")
-            await _scan_run_set_leg(scan_run_id, "plan", "failed", error=str(blog_err)[:300])
+        # L3: blogs are never generated on their own - only when the owner presses
+        # Generate - so the weekly run does not write any.
+        await _scan_run_set_leg(scan_run_id, "plan", "skipped")
 
         # Weekly Search Tracker re-run (Part 5 of the flow
         # spec): "the analyser runs every Sunday night —
