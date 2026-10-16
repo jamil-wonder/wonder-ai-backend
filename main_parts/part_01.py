@@ -34,6 +34,7 @@ from models import (
     BlogUsageResponse,
     BlogWeeklySetupRequest,
     BlogWeeklyEnsureRequest,
+    BlogDraftUpdateRequest,
     ContentPageGeneratorRequest,
     ContentPageGeneratorResponse,
     CompetitorTrackingRunRequest,
@@ -102,7 +103,7 @@ from models import ForgotPasswordRequest, ResetCheckRequest, ResetPasswordReques
 import password_reset as pwreset
 import notifications as notif
 from blog_readability import readability_of_sections
-from models import BusinessResponse, BusinessUpsertRequest
+from models import BusinessResponse, BusinessUpsertRequest, BusinessExtraLocationsRequest
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from pydantic import BaseModel, Field
@@ -491,7 +492,7 @@ EMAIL_OTP_MAX_ATTEMPTS = 5
 EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS = 120
 
 
-async def send_email(to_email: str, subject: str, html_body: str, text_body: str) -> bool:
+async def send_email(to_email: str, subject: str, html_body: str, text_body: str, reply_to: str | None = None) -> bool:
     if not SMTP_USER or not SMTP_PASSWORD:
         print(f"[Email] SMTP not configured — skipping send to {to_email} ({subject})")
         return False
@@ -503,6 +504,8 @@ async def send_email(to_email: str, subject: str, html_body: str, text_body: str
         message["From"] = f"{SMTP_FROM_NAME} <{SMTP_USER}>"
         message["To"] = to_email
         message["Subject"] = subject
+        if reply_to:
+            message["Reply-To"] = reply_to
         message.set_content(text_body)
         message.add_alternative(html_body, subtype="html")
 
@@ -616,16 +619,17 @@ async def send_verification_email(to_email: str, name: str, user_id: str, purpos
 def _build_welcome_email(name: str, dashboard_url: str) -> tuple[str, str]:
     display_name = name or "there"
     steps = [
-        ("Run your first scan", "Head to the Analyser tab and enter your website — Wonderscore crawls it and scores your AI visibility in a couple of minutes."),
-        ("Save your business profile", "Save the business, add competitors and the pages you want tracked, so every future scan builds on it."),
-        ("Let it run itself", "Every Sunday at 4am we automatically re-scan your saved businesses and email you a fresh summary — no need to remember to check back."),
+        ("Tell us about your business", "Add your website and a few details. We write the 20 questions your customers would ask an AI assistant, and you can edit them."),
+        ("Get your first score", "One scan reads your website and asks ChatGPT, Claude, Perplexity and Gemini those questions. It takes a few minutes and you can leave the page."),
+        ("Every Sunday night, it runs itself", "We re-ask the same 20 questions, update your Wonder Score and email you what changed and what to do next - no need to remember to check back."),
     ]
     text_steps = "\n".join(f"{i}. {title} — {desc}" for i, (title, desc) in enumerate(steps, start=1))
     text_body = (
         f"Hi {display_name},\n\n"
         f"Welcome to Wonderscore — glad to have you.\n\n"
         f"Here's how to get started:\n{text_steps}\n\n"
-        f"Go to your dashboard: {dashboard_url}\n\n"
+        f"Log in any time: {dashboard_url}\n\n"
+        f"Questions? Just reply to this email - a real person reads it.\n"
         f"You can turn scan-complete emails on or off any time from Settings.\n"
     )
 
@@ -680,7 +684,7 @@ def _build_welcome_email(name: str, dashboard_url: str) -> tuple[str, str]:
             <table role="presentation" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
               <tr>
                 <td style="border-radius:12px;background:#15463b;">
-                  <a href="{dashboard_url}" style="display:inline-block;padding:12px 22px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;">Go to your dashboard</a>
+                  <a href="{dashboard_url}" style="display:inline-block;padding:12px 22px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;">Log in to your dashboard</a>
                 </td>
               </tr>
             </table>
@@ -688,6 +692,7 @@ def _build_welcome_email(name: str, dashboard_url: str) -> tuple[str, str]:
         </div>
 
         <p style="margin:18px 0 0 0;text-align:center;font-size:11px;line-height:18px;color:#9b927f;">
+          Questions? Just reply to this email - a real person reads it.<br/>
           You can turn scan-complete emails on or off any time from Settings.
         </p>
       </div>
@@ -702,7 +707,41 @@ async def send_welcome_email(to_email: str, name: str) -> bool:
     frontend_url = (os.getenv("FRONTEND_APP_URL") or "http://localhost:3000").rstrip("/")
     dashboard_url = f"{frontend_url}/overview"
     html_body, text_body = _build_welcome_email(name, dashboard_url)
-    return await send_email(to_email, "Welcome to Wonderscore", html_body, text_body)
+    return await send_email(to_email, "Welcome to Wonderscore", html_body, text_body, reply_to=CONTACT_NOTIFY_EMAIL)
+
+
+def _build_run_complete_email(name: str, business_name: str, score, dashboard_url: str) -> tuple[str, str]:
+    """H6: the email that says a scan has finished - the one number and where to look."""
+    who = name or "there"
+    biz = business_name or "your business"
+    score_line = f"{biz} now has a Wonder Score of {score}/100." if isinstance(score, (int, float)) else f"The scan for {biz} has finished."
+    text_body = (
+        f"Hi {who},\n\n{score_line}\n\n"
+        f"See what changed and what to do next: {dashboard_url}\n\n"
+        f"You can turn these emails off any time from Settings.\n"
+    )
+    html_body = f"""
+    <div style="margin:0;padding:0;background:#faf8f3;">
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;padding:28px 16px;color:#23211b;">
+        <div style="background:#ffffff;border:1px solid #ece3d1;border-radius:24px;padding:30px 28px;">
+          <div style="font-size:20px;font-weight:700;color:#15463b;margin-bottom:14px;">Wonderscore</div>
+          <h1 style="margin:0 0 10px 0;font-size:24px;line-height:30px;color:#15463b;">Your scan is ready</h1>
+          <p style="margin:0 0 22px 0;font-size:14px;line-height:22px;color:#6f6757;">Hi {who}, {score_line}</p>
+          <a href="{dashboard_url}" style="display:inline-block;padding:12px 22px;border-radius:12px;background:#15463b;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;">See your results</a>
+        </div>
+        <p style="margin:18px 0 0 0;text-align:center;font-size:11px;line-height:18px;color:#6f6757;">You can turn these emails off any time from Settings.</p>
+      </div>
+    </div>
+    """
+    return html_body, text_body
+
+
+async def send_run_complete_email(to_email: str, name: str, business_name: str, score) -> bool:
+    if not to_email:
+        return False
+    frontend_url = (os.getenv("FRONTEND_APP_URL") or "http://localhost:3000").rstrip("/")
+    html_body, text_body = _build_run_complete_email(name, business_name, score, f"{frontend_url}/overview")
+    return await send_email(to_email, f"Your Wonder Score is ready - {business_name or 'your business'}", html_body, text_body, reply_to=CONTACT_NOTIFY_EMAIL)
 
 
 def _grade_pill_color(grade: str) -> tuple[str, str]:

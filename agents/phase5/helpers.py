@@ -531,3 +531,46 @@ def _extract_text_value(node) -> str:
             if text:
                 return text
     return ""
+
+
+def _why_for_verdict(
+    *,
+    status: str,
+    domain: str,
+    named_in_answer: bool,
+    named_evidence: str | None,
+    cited_as_source: bool,
+    position: int | None,
+    source_count: int,
+    reference_count: int,
+    model_reasoning: str = "",
+) -> str:
+    """B5: the "Why" shown next to a verdict is written FROM the verdict, so it can never argue with it.
+
+    A model's own explanation is written before our named-or-cited check decides the verdict, and
+    can say the opposite ("not mentioned" under a Mentioned row). The facts we actually checked are
+    used instead; the model's wording is only kept for a miss when it agrees with that miss."""
+    site = domain or "your site"
+    rank = f" (rank #{position})" if isinstance(position, int) else ""
+    if status == "Mentioned":
+        if named_in_answer and named_evidence:
+            quoted = str(named_evidence).strip().rstrip(".")
+            tail = f" It also cites {site} as a source." if cited_as_source else ""
+            return f'Named in the answer{rank}: "{quoted}."{tail}'
+        if named_in_answer:
+            return f"The answer names the business{rank}." + (f" It also cites {site} as a source." if cited_as_source else "")
+        if cited_as_source:
+            return f"The answer does not name the business in its text, but it cites {site} as a source{rank}."
+        return f"{site} appears in the evidence the model returned{rank}."
+    # a miss
+    sources = max(source_count, 0) + max(reference_count, 0)
+    base = f"The answer neither names the business nor cites {site}."
+    if sources:
+        base += f" It drew on {sources} other source{'s' if sources != 1 else ''}."
+    reasoning = str(model_reasoning or "").strip()
+    low = reasoning.lower()
+    positive = any(m in low for m in ("is mentioned", "appears in", "ranked", "is listed", "recommends"))
+    negative = any(m in low for m in ("not mentioned", "absent", "not present", "not listed", "does not appear", "no mention", "missing"))
+    if reasoning and negative and not positive and len(reasoning) <= 280:
+        return f"{base} {reasoning}"
+    return base

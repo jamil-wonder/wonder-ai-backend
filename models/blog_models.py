@@ -115,3 +115,17 @@ class BlogWeeklyEnsureRequest(BaseModel):
     voice: Optional[str] = None
     keywords: List[str] = []
     force: bool = False
+
+
+class BlogDraftEditSection(BaseModel):
+    id: Optional[str] = None
+    heading: Optional[str] = None
+    content: str
+
+
+class BlogDraftUpdateRequest(BaseModel):
+    """F8: the owner's edits to a draft, and whether they have published it."""
+    business_id: str
+    draft_id: str
+    sections: Optional[List[BlogDraftEditSection]] = None
+    published: Optional[bool] = None

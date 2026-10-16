@@ -22,6 +22,7 @@ from .config import (
 from .context import _fetch_page_context
 from .helpers import (
     _align_reasoning_with_status,
+    _why_for_verdict,
     _build_fallback_concise_answer,
     _extract_domains_from_text,
     _is_non_competitor_domain,
@@ -462,13 +463,16 @@ async def _analyze_single_question_openai(
 
     status = "Mentioned" if (target_mentioned or position is not None) else "Not Mentioned"
     reasoning_raw = str(data.get("reasoning", "")).strip() if isinstance(data, dict) else ""
-    reasoning = _align_reasoning_with_status(
-        reasoning=reasoning_raw,
+    reasoning = _why_for_verdict(
         status=status,
         domain=domain,
+        named_in_answer=named_in_answer,
+        named_evidence=named_evidence,
+        cited_as_source=cited_as_source,
         position=position,
         source_count=len(clean_sources),
         reference_count=len(clean_references),
+        model_reasoning=reasoning_raw,
     )
     answer_text = (
         concise_answer[:4000]
@@ -705,13 +709,16 @@ async def _analyze_single_question_perplexity(
 
     status = "Mentioned" if (target_mentioned or position is not None) else "Not Mentioned"
     reasoning_raw = str(data.get("reasoning", "")).strip() if isinstance(data, dict) else ""
-    reasoning = _align_reasoning_with_status(
-        reasoning=reasoning_raw,
+    reasoning = _why_for_verdict(
         status=status,
         domain=domain,
+        named_in_answer=named_in_answer,
+        named_evidence=named_evidence,
+        cited_as_source=cited_as_source,
         position=position,
         source_count=len(clean_sources),
         reference_count=len(clean_references),
+        model_reasoning=reasoning_raw,
     )
     answer_text = (
         concise_answer[:4000]

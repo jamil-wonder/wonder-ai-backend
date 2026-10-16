@@ -560,3 +560,50 @@ async def api_delete_track_url(url: str, phase: str):
 # --- Admin Dash Routes ---
 
 from models import UserRoleUpdateRequest
+
+
+@app.post("/api/blogs/weekly/draft")
+async def api_blogs_weekly_draft_update(
+    request: BlogDraftUpdateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """F8: save the owner's edits to a draft article, and/or mark it published (or not).
+    Only the signed-in owner's own drafts can be touched."""
+    if weekly_blog_suggestions_col is None:
+        raise HTTPException(status_code=503, detail="weekly blog storage unavailable")
+    doc = await weekly_blog_suggestions_col.find_one({
+        "business_id": request.business_id,
+        "user_id": current_user["id"],
+        "drafts.id": request.draft_id,
+    })
+    if not doc:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    drafts = []
+    updated = None
+    for d in doc.get("drafts") or []:
+        if d.get("id") != request.draft_id:
+            drafts.append(d)
+            continue
+        d = dict(d)
+        if request.sections is not None:
+            edits = {(e.id or ""): e for e in request.sections}
+            new_sections = []
+            for idx, sec in enumerate(d.get("sections") or []):
+                sec = dict(sec)
+                edit = edits.get(str(sec.get("id") or "")) or (request.sections[idx] if idx < len(request.sections) and not request.sections[idx].id else None)
+                if edit is not None:
+                    sec["content"] = edit.content.strip()
+                    if edit.heading is not None and edit.heading.strip():
+                        sec["heading"] = edit.heading.strip()
+                new_sections.append(sec)
+            d["sections"] = new_sections
+            d["wordCount"] = sum(len(str(s.get("content") or "").split()) for s in new_sections)
+            d["readability"] = readability_of_sections(new_sections)
+            d["edited_at"] = now_iso
+        if request.published is not None:
+            d["published_at"] = now_iso if request.published else None
+        drafts.append(d)
+        updated = d
+    await weekly_blog_suggestions_col.update_one({"_id": doc["_id"]}, {"$set": {"drafts": drafts, "updated_at": now_iso}})
+    return {"success": True, "draft": updated}

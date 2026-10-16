@@ -248,7 +248,9 @@ async def _upsert_user_business(
                 "domain": domain,
                 "url": item.get("url") or (prior or {}).get("url") or f"https://{domain}/",
                 "name": _clean_optional_text(item.get("name")) or (prior or {}).get("name") or domain,
-                "score": int(float(item.get("score") or 0)),
+                # A2: a competitor's score is kept only with the basis it was measured on
+                "score": int(float(item.get("score"))) if item.get("score") is not None else None,
+                "score_basis": item.get("score_basis") or None,
                 "status": _clean_optional_text(item.get("status")) or _clean_optional_text(item.get("confidence")) or "AI evidence",
                 "evidence": _clean_optional_text(item.get("evidence")) or "",
                 "first_seen_at": (prior or {}).get("first_seen_at") or now_iso,
@@ -765,14 +767,14 @@ async def _latest_completed_tracker_mention_rate(business_id: str) -> float | No
     return (await _latest_completed_tracker_mention(business_id))[0]
 
 
-async def _notify(user_id, business_id, item: dict | None, dedupe_key: str) -> None:
+async def _notify(user_id, business_id, item: dict | None, dedupe_key: str) -> bool:
     """J10: store one in-app notification. Best effort - never breaks the caller - and the
     same event (dedupe_key) is only ever stored once, so a re-finalized run does not repeat itself."""
     if notifications_col is None or not item or not user_id:
-        return
+        return False
     try:
         if await notifications_col.find_one({"user_id": str(user_id), "dedupe_key": dedupe_key}):
-            return
+            return False
         await notifications_col.insert_one({
             **item,
             "user_id": str(user_id),
@@ -781,8 +783,10 @@ async def _notify(user_id, business_id, item: dict | None, dedupe_key: str) -> N
             "created_at": datetime.utcnow(),
             "read_at": None,
         })
+        return True
     except Exception as e:
         print(f"[Notify] could not store {dedupe_key}: {e}")
+        return False
 
 
 async def _competitors_of_job(job_id) -> list:
@@ -794,7 +798,15 @@ async def _competitors_of_job(job_id) -> list:
 
 async def _emit_run_notifications(run: dict, business_name: str, score, previous_score, tracker_job_id) -> None:
     run_id, user_id, business_id = run.get("run_id"), run.get("user_id"), run.get("business_id")
-    await _notify(user_id, business_id, notif.scan_complete(business_name, score), f"scan_complete:{run_id}")
+    first_time = await _notify(user_id, business_id, notif.scan_complete(business_name, score), f"scan_complete:{run_id}")
+    if first_time and not os.getenv("PYTEST_CURRENT_TEST"):
+        # H6: the same event also goes by email (once per run), unless the owner turned these off
+        try:
+            user_doc = await users_col.find_one({"_id": ObjectId(str(user_id))}) if users_col is not None else None
+            if user_doc and user_doc.get("notify_scan_complete", True):
+                await send_run_complete_email(user_doc.get("email", ""), user_doc.get("name", ""), business_name, score)
+        except Exception as e:
+            print(f"[Email] run-complete email failed run={run_id}: {e}")
     await _notify(user_id, business_id, notif.score_moved(business_name, previous_score, score), f"score_moved:{run_id}")
     if tracker_job_id and phase5_jobs_col is not None:
         try:
@@ -889,7 +901,12 @@ async def _scan_run_finalize(run_id) -> dict | None:
     if score is not None and businesses_col is not None:
         try:
             biz = await businesses_col.find_one({"_id": ObjectId(business_id)}, {"wonder_scores": 1})
-            history = [h for h in ((biz or {}).get("wonder_scores") or []) if h.get("run_id") != run_id]
+            # A7: one point per day - a re-run the same day REPLACES that day's point
+            today = now[:10]
+            history = [
+                h for h in ((biz or {}).get("wonder_scores") or [])
+                if h.get("run_id") != run_id and str(h.get("created_at") or "")[:10] != today
+            ]
             previous_score = history[-1].get("score") if history else None
             history.append({
                 "run_id": run_id,

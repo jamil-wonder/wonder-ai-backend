@@ -337,3 +337,8 @@ class CompetitorTrackingStatusResponse(BaseModel):
     success: bool
     latest: Optional[Dict[str, Any]] = None
     history: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class BusinessExtraLocationsRequest(BaseModel):
+    """G4: the other places a business is tracked in."""
+    locations: List[str] = Field(default_factory=list)

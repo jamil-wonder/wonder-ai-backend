@@ -79,6 +79,30 @@ def _location_aliases(location: str) -> set[str]:
     return {alias for alias in aliases if alias}
 
 
+def spread_local_over_locations(local_items: list[str], primary: str, extras: list[str]) -> list[str]:
+    """G4: a business that tracks several locations gets its local questions split across them.
+    Question i goes to location i of [primary, *extras] (round robin); a question generated for the
+    primary location is re-pointed by swapping the place name, so every question still names exactly one place."""
+    places = [p for p in [_text(primary), *[_text(e) for e in extras]] if p]
+    if len(places) < 2 or not _text(primary):
+        return list(local_items)
+    out = []
+    for i, text in enumerate(local_items):
+        target = places[i % len(places)]
+        if target.lower() == _text(primary).lower():
+            out.append(text)
+            continue
+        swapped = re.sub(re.escape(_text(primary)), target, text, flags=re.I)
+        if swapped == text:
+            # the question named the place by a short alias (e.g. just the city): swap that instead
+            for alias in sorted(_location_aliases(primary), key=len, reverse=True):
+                swapped = re.sub(rf"\b{re.escape(alias)}\b", target, text, count=1, flags=re.I)
+                if swapped != text:
+                    break
+        out.append(swapped)
+    return out
+
+
 def _includes_location(text: str, location: str) -> bool:
     raw = _text(text).lower()
     if not raw:
@@ -345,11 +369,17 @@ async def generate_brand_questions(
         ]
     ).strip()
     intent_text = "; ".join(profile["intents"])
+    place_bound = use_loc and profile["location_mode"] == "required"
+    non_branded_place_rule = (
+        f'Every question MUST name the city or area: "{location}" (someone choosing this kind of business is choosing it in a place).'
+        if place_bound else "They do NOT have to include a place."
+    )
     wording_rule = (
         ""
         if profile.get("hospitality_words_ok")
         else "- This is NOT a hospitality or venue business. Never use the words book, booking, reserve, reservation, table, stay, visit, check-in or menu, and never write about visiting, booking a table or staying at it.\n"
     )
+    visitors = use_loc and profile["family"] == "hospitality" and re.search(r"hotel|hospitality|travel|tourism|lodging|resort|hostel|b&b|bed and breakfast|venue|events|entertainment", f"{category} {sub_type}", re.I)
     if use_loc:
         local_rules = f"""- Do NOT include "{brand_name}", "{domain}", the website URL, or any obvious brand variant.
 - Every question MUST include the same business location: "{location}".
@@ -364,6 +394,13 @@ async def generate_brand_questions(
 - Identify the actual real-world neighboring areas, neighborhoods, boroughs, or districts surrounding "{location}" and write questions using those real neighboring names, e.g. "Which [category] near [Neighboring Area] would people recommend?".
 - The goal is to see if the AI engine recommends "{brand_name}" to people searching from these nearby surrounding areas.
 - Do NOT use the exact string "{location}" in these questions. Instead, use the real surrounding areas.
+- Every question must be specific to this category: "{category}" or the listed services.
+- Avoid repeated wording patterns."""
+        if visitors:
+            # travellers do not live next door: they plan a trip to the place from somewhere else
+            broad_rules = f"""- Do NOT include "{brand_name}", "{domain}", the website URL, or any obvious brand variant.
+- These are written by VISITORS planning a trip to the area around "{location}" from somewhere else (another city or country): where to stay or what to book for a weekend, a first visit, a family trip, a special occasion, a business trip.
+- Name the wider destination (the city or the well-known district of "{location}") - not nearby neighbourhoods.
 - Every question must be specific to this category: "{category}" or the listed services.
 - Avoid repeated wording patterns."""
     else:
@@ -417,7 +454,7 @@ Rules for branded_queries:
 
 Rules for non_branded_queries:
 - Do NOT include "{brand_name}", "{domain}", the website URL, or any obvious brand variant.
-- These are category/service discovery prompts and do NOT have to include a place.
+- These are category/service discovery prompts. {non_branded_place_rule}
 - Every question must be specific to this category: "{category}" or the listed services.
 - Cover these intents: {intent_text}.
 - Write prompts that could surface recommended providers, competitors, or ranked options.
@@ -467,6 +504,10 @@ Return ONLY valid JSON:
             "localSeo": local_seo_items,
             "broadSeo": broad_seo_items,
         }
+        extras = business_context.get("extraLocations") if isinstance(business_context, dict) else None
+        if use_loc and isinstance(extras, list) and extras:
+            local_seo_items = spread_local_over_locations(local_seo_items, location, extras)
+            groups["localSeo"] = local_seo_items
         flat = [*branded_items, *non_branded_items, *local_seo_items, *broad_seo_items]
         if return_groups:
             return {"questions": flat, "questionGroups": groups}
@@ -549,6 +590,8 @@ Return ONLY valid JSON:
             if _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain):
                 continue
             if not _includes_category_or_service(text, category, match_services):
+                continue
+            if place_bound and not _includes_location(text, location):
                 continue
             seen.add(key)
             non_branded.append(text)

@@ -194,6 +194,7 @@ def _public_business_doc(doc: dict | None) -> dict | None:
         "blogVoice": doc.get("blogVoice"),
         # F3: the English blogs are written in - the owner's choice ("" = detect) and what detection gives
         "blogLanguage": doc.get("blogLanguage") or "",
+        "extraLocations": doc.get("extraLocations") if isinstance(doc.get("extraLocations"), list) else [],
         "blogLanguageDetected": resolve_blog_language(doc),
         "blogKeywords": doc.get("blogKeywords") if isinstance(doc.get("blogKeywords"), list) else [],
         "questionGeneration": _normalize_question_generation_settings(doc.get("questionGeneration")),

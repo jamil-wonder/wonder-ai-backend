@@ -498,6 +498,8 @@ async def api_phase5_generate_questions(
                 or []
             ),
             "avoidQuestions": req.avoidQuestions or [],
+            # G4: other places the business is tracked in - the local questions are split across them
+            "extraLocations": (business_doc.get("extraLocations") if business_doc else None) or [],
             # L2: the kind of business and who it serves shape the questions
             "sub_type": _first_text(business_doc.get("sub_type") if business_doc else ""),
             "target_audience": _first_text(business_doc.get("target_audience") if business_doc else ""),

@@ -840,7 +840,12 @@ async def api_public_report(token: str):
     previous_pick = pick_previous_score(visibility_history, latest_run_id, latest_run_at) if has_visibility_score else None
     previous_score = previous_pick["score"] if previous_pick else None
 
-    system_competitors = business.get("systemCompetitors") or []
+    # A2: only competitors scored from the same answers as the business are ranked; scores stored
+    # before that (estimates) are not shown on a shared report
+    system_competitors = [
+        c for c in (business.get("systemCompetitors") or [])
+        if isinstance(c, dict) and c.get("score_basis") == "measured"
+    ]
     competitor_scores = [
         float(c.get("score")) for c in system_competitors
         if isinstance(c, dict) and isinstance(c.get("score"), (int, float))
@@ -926,6 +931,9 @@ async def api_public_report(token: str):
     return {
         "businessName": business.get("businessName") or "",
         "domain": _normalize_site(business.get("url") or ""),
+        # E2: what the report is branded with
+        "logoUrl": business.get("logo_url") or business.get("logoUrl") or None,
+        "websiteUrl": business.get("url") or None,
         "score": _round_half_up(headline_score) if isinstance(headline_score, (int, float)) else None,
         "grade": get_grade(_round_half_up(headline_score)) if isinstance(headline_score, (int, float)) else None,
         # False whenever the "score"/"grade" above are only ever the Phase 1
@@ -1303,3 +1311,30 @@ async def api_scan_run_status(run_id: str, current_user: dict = Depends(get_curr
         "wonder_score": run.get("wonder_score"),
         "inputs": run.get("inputs"),
     }
+
+
+@app.post("/api/user/businesses/{business_id}/locations")
+async def api_business_extra_locations(
+    business_id: str,
+    request: BusinessExtraLocationsRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """G4: the other places this business is tracked in (up to 4 besides its main location)."""
+    if businesses_col is None:
+        raise HTTPException(status_code=503, detail="business storage unavailable")
+    try:
+        oid = ObjectId(business_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid business ID format")
+    biz = await businesses_col.find_one({"_id": oid, "user_id": current_user["id"]})
+    if not biz:
+        raise HTTPException(status_code=404, detail="Business not found")
+    main = str(biz.get("location") or "").strip().lower()
+    cleaned: list[str] = []
+    for raw in request.locations or []:
+        name = " ".join(str(raw or "").split())[:80]
+        if name and name.lower() != main and name.lower() not in [c.lower() for c in cleaned]:
+            cleaned.append(name)
+    cleaned = cleaned[:4]
+    await businesses_col.update_one({"_id": oid}, {"$set": {"extraLocations": cleaned, "updated_at": datetime.utcnow().isoformat() + "Z"}})
+    return {"success": True, "extraLocations": cleaned}

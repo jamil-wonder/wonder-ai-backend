@@ -564,6 +564,7 @@ async def _process_phase5_job(job_doc: dict):
                     "name": c.get("name"),
                     # A2: only a measured score is stored as a score
                     "score": c.get("score") if c.get("score_basis") == "measured" else None,
+                    "score_basis": "measured" if c.get("score_basis") == "measured" else None,
                     "status": c.get("confidence") or "AI evidence",
                     "evidence": c.get("evidence") or "",
                 }
