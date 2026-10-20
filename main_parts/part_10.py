@@ -247,7 +247,7 @@ async def _run_weekly_business_pipeline(biz_doc: dict, week_id: str, trigger: st
             await _scan_run_finalize(scan_run_id)
             return
         else:
-            await _scan_run_set_leg(scan_run_id, "crawl", "ok", score=crawl_scores.get("total"))
+            await _scan_run_set_leg(scan_run_id, "crawl", "ok", score=crawl_scores.get("total"), pages=result.get("pagesRead"))
 
         await _upsert_user_business(
             current_user=user_mock,

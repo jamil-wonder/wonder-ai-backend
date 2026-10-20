@@ -1224,7 +1224,7 @@ async def _first_run_background(run_id: str, business_doc: dict, user_mock: dict
             business_name=business_doc.get("businessName") or result.get("businessName"), logo_url=result.get("logoUrl"),
             phase1_score=_phase1_score_of(result), business_id=business_id, scrape_result=result,
         )
-        await _scan_run_set_leg(run_id, "crawl", "ok", score=scores.get("total"))
+        await _scan_run_set_leg(run_id, "crawl", "ok", score=scores.get("total"), pages=result.get("pagesRead"))
 
         job_id = uuid.uuid4().hex
         now_iso = datetime.utcnow().isoformat() + "Z"
@@ -1256,6 +1256,14 @@ async def api_user_business_first_run(business_id: str, request: FirstRunRequest
     business = await businesses_col.find_one({"_id": oid, "user_id": current_user["id"]})
     if not business:
         raise HTTPException(status_code=404, detail="Business not found")
+    # H6: no first scan (and so no spend on AI calls) until the owner has confirmed their email
+    try:
+        user_key = ObjectId(current_user["id"])
+    except Exception:
+        user_key = current_user["id"]
+    user_doc = await users_col.find_one({"_id": user_key}) if users_col is not None else None
+    if not user_doc or not user_doc.get("email_verified"):
+        raise HTTPException(status_code=403, detail="Please confirm your email address first - we sent you a code.")
     items = [q for q in request.questions if q.query.strip()]
     if not items:
         raise HTTPException(status_code=422, detail="Your questions are needed before the first scan.")
@@ -1286,6 +1294,28 @@ async def api_user_business_first_run(business_id: str, request: FirstRunRequest
 _LEG_LABELS = ("crawl", "tracker")
 
 
+def _run_models_progress(results) -> dict:
+    """J1: per AI model, how many questions it has answered so far and in how many of them the business was
+    mentioned - for the progress screen's "Mentioned in 7 of 20" lines. Failed answers are left out (A4)."""
+    out = {name: {"answered": 0, "mentioned": 0, "failed": 0} for name in ("chatgpt", "claude", "perplexity", "gemini")}
+    for row in (results or {}).values():
+        providers = row.get("providers") if isinstance(row, dict) else None
+        if not isinstance(providers, dict):
+            continue
+        for name, bucket in out.items():
+            pdata = providers.get(name)
+            if not isinstance(pdata, dict):
+                continue
+            state = provider_result_state(pdata)
+            if state == "failed":
+                bucket["failed"] += 1
+            elif state == "ok":
+                bucket["answered"] += 1
+                if pdata.get("mentioned") or str(pdata.get("status") or "") == "Mentioned":
+                    bucket["mentioned"] += 1
+    return out
+
+
 @app.get("/api/scan-runs/{run_id}")
 async def api_scan_run_status(run_id: str, current_user: dict = Depends(get_current_user)):
     """What the progress screen shows: each leg's state, the tracker's question count, the score."""
@@ -1297,17 +1327,23 @@ async def api_scan_run_status(run_id: str, current_user: dict = Depends(get_curr
     legs = run.get("legs") or {}
     tracker = legs.get("tracker") or {}
     progress = None
+    models_progress = None
+    competitors_found = None
     if tracker.get("job_id") and phase5_jobs_col is not None:
-        job = await phase5_jobs_col.find_one({"job_id": tracker["job_id"]}, projection={"processed": 1, "total": 1, "status": 1, "error": 1})
+        job = await phase5_jobs_col.find_one({"job_id": tracker["job_id"]}, projection={"processed": 1, "total": 1, "status": 1, "error": 1, "results": 1, "deep_competitors": 1})
         if job:
             progress = {"processed": job.get("processed") or 0, "total": job.get("total") or 0, "status": job.get("status"), "error": job.get("error")}
+            models_progress = _run_models_progress(job.get("results"))
+            competitors_found = len(job.get("deep_competitors") or [])
     return {
         "run_id": run_id,
         "status": run.get("status"),
         "created_at": run.get("created_at"),
         "completed_at": run.get("completed_at"),
-        "legs": {n: {k: v for k, v in (legs.get(n) or {}).items() if k in ("status", "error", "http_status", "score")} for n in _LEG_LABELS if n in legs},
+        "legs": {n: {k: v for k, v in (legs.get(n) or {}).items() if k in ("status", "error", "http_status", "score", "pages")} for n in _LEG_LABELS if n in legs},
         "tracker_progress": progress,
+        "models": models_progress,
+        "competitors_found": competitors_found,
         "wonder_score": run.get("wonder_score"),
         "inputs": run.get("inputs"),
     }

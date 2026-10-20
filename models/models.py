@@ -66,6 +66,9 @@ class ScrapeResult(BaseModel):
     hasMobileMeta: bool
     hasAnalytics: bool
     hasContactPath: bool = False
+    pagesRead: int = 0
+    contactPageUrl: str = ""
+    aboutPageUrl: str = ""
     pageSpeedHints: List[str]
     schemas: List[Dict[str, Any]]
     scores: Dict[str, Any]

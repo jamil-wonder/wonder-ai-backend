@@ -1013,7 +1013,7 @@ async def _record_manual_crawl_run(current_user, business, scrape_result) -> Non
             print(f"[ScanRun] website scan failed for {business.get('url')}: HTTP {failure.get('http_status')} - {failure.get('reason')}")
             await _scan_run_set_leg(run_id, "crawl", "failed", error=failure.get("reason"), http_status=failure.get("http_status"))
         else:
-            await _scan_run_set_leg(run_id, "crawl", "ok", score=scores.get("total"))
+            await _scan_run_set_leg(run_id, "crawl", "ok", score=scores.get("total"), pages=(scrape_result or {}).get("pagesRead"))
         await _scan_run_finalize(run_id)
     except Exception as e:
         print(f"[ScanRun] manual crawl run failed: {e}")

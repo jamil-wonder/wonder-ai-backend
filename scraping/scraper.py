@@ -1066,6 +1066,20 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
     # universal signal than booking.
     has_contact_path = bool(soup.find_all('a', href=re.compile(r'contact|get-?in-?touch|enquir|reach-?us', re.I)))
 
+    # C5: the real pages on this site that back the "verified" ticks - a link only counts when it
+    # points at the same site, so a tick can always be followed to a page that exists.
+    def _same_site_link(pattern: str) -> str:
+        host = (urlparse(target_url).netloc or "").lower().replace("www.", "")
+        for link in soup.find_all('a', href=re.compile(pattern, re.I)):
+            full = urljoin(target_url, link.get('href') or "")
+            parsed = urlparse(full)
+            if parsed.scheme in ("http", "https") and (parsed.netloc or "").lower().replace("www.", "") == host:
+                return full.split('#')[0]
+        return ""
+
+    contact_page_url = _same_site_link(r'contact|get-?in-?touch|enquir|reach-?us')
+    about_page_url = _same_site_link(r'about|our-?story|who-?we-?are')
+
     # C3: only a LocalBusiness-family @type counts. `Organization`, `WebSite`
     # or `Service` alone say nothing about where the business is or what kind
     # it is, so they no longer earn the type points - and without one the
@@ -1172,6 +1186,9 @@ async def scrape_website(url: str, enable_ai: bool = True, enable_deep_crawl: bo
         "hasMobileMeta": has_mobile_meta,
         "hasAnalytics": has_analytics,
         "hasContactPath": has_contact_path,
+        "pagesRead": len(all_soups),
+        "contactPageUrl": contact_page_url,
+        "aboutPageUrl": about_page_url,
         "pageSpeedHints": page_speed_hints,
         "schemas": schemas,
         "scores": {

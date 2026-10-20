@@ -635,3 +635,22 @@ async def api_phase5_analyze_single(req: Phase5AnalyzeSingleRequest, current_use
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/phase5/rewrite-question")
+async def api_phase5_rewrite_question(
+    req: Phase5RewriteRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """J8: rewrite one question in a more human tone. `rewritten` is None when the AI could not do it safely."""
+    question = (req.question or "").strip()
+    if not question or len(question) > 300:
+        raise HTTPException(status_code=400, detail="Give one question to rewrite")
+    rewritten = await rewrite_question_human(
+        question,
+        brand_name=req.businessName or "",
+        category=req.category or "",
+        location=req.location or "",
+        branded=bool(req.branded),
+    )
+    return {"success": True, "rewritten": rewritten}

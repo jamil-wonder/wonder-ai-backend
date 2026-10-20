@@ -718,3 +718,56 @@ Return ONLY valid JSON:
         "Question generation failed validation. The AI provider did not return any usable prompts. "
         "Please improve the saved business name, category, and location, then retry."
     )
+
+
+def accept_rewrite(original: str, rewritten: str, brand_name: str, location: str, branded: bool) -> str | None:
+    """J8: a "more human" rewrite is only taken if it keeps what made the question valid:
+    still a question, still names the brand (branded) or still does not (non-branded), and keeps the place if it had one."""
+    if not str(rewritten or "").strip().endswith("?"):
+        return None
+    text = _clean_question(rewritten)
+    if not text or len(text) > 220:
+        return None
+    has_brand = bool(brand_name) and brand_name.lower() in text.lower()
+    if branded and brand_name and not has_brand:
+        return None
+    if not branded and has_brand:
+        return None
+    if location and _includes_location(original, location) and not _includes_location(text, location):
+        return None
+    return text
+
+
+async def rewrite_question_human(
+    question: str,
+    brand_name: str = "",
+    category: str = "",
+    location: str = "",
+    branded: bool = False,
+) -> str | None:
+    """J8: rewrite one tracked question the way a real customer would type it. None when the AI is unavailable
+    or its rewrite breaks the rules above - the caller then keeps the original."""
+    original = _text(question)
+    if not original:
+        return None
+    prompt = f"""
+    Rewrite this question so it sounds like a real person typing it into ChatGPT or Google - natural, casual, specific - without changing what is being asked.
+
+    Question: "{original}"
+    Business: {brand_name or "unknown"} ({category or "unknown category"}){f", based in {location}" if location else ""}
+
+    Rules:
+    - Keep it a single question that ends with "?".
+    - {"Keep the business name " + repr(brand_name) + " in it." if branded and brand_name else "Do NOT mention the business name."}
+    {f"- Keep the place name: {location}." if location and _includes_location(original, location) else ""}
+    - No marketing words, no quotes, no list.
+    Return JSON only: {{"question": "..."}}
+    """
+    try:
+        parsed = await _call_openai_chat_json(prompt, timeout_sec=PHASE5_QUESTION_GEN_TIMEOUT_SEC)
+    except Exception as e:
+        print(f"[Phase5] question rewrite failed: {e}")
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return accept_rewrite(original, str(parsed.get("question") or ""), _text(brand_name), _text(location), branded)

@@ -12,6 +12,14 @@ class Phase5QuestionsRequest(BaseModel):
     questionGeneration: Optional[dict[str, int]] = None
     avoidQuestions: List[str] = Field(default_factory=list)
 
+class Phase5RewriteRequest(BaseModel):
+    """J8: one question to make sound more human."""
+    question: str
+    businessName: Optional[str] = None
+    category: Optional[str] = None
+    location: Optional[str] = None
+    branded: bool = False
+
 class Phase5QuestionsResponse(BaseModel):
     questions: List[str]
     questionGroups: Optional[dict[str, List[str]]] = None
