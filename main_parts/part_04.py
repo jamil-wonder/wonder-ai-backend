@@ -424,11 +424,13 @@ async def api_user_businesses(current_user: dict = Depends(get_current_user)):
     docs = await cursor.to_list(length=100)
     await _ensure_wonder_scores(docs)
     active_runs = await _scan_run_active_for([str(d.get("_id")) for d in docs])
+    last_problems = await _scan_run_last_problem_for([str(d.get("_id")) for d in docs])
     out = []
     for doc in docs:
         public = _public_business_doc(doc)
         if public:
             public["scan_run_active"] = active_runs.get(str(doc.get("_id")))
+            public["scan_run_last_problem"] = last_problems.get(str(doc.get("_id")))
             out.append(public)
     return out
 

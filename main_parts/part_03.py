@@ -959,6 +959,31 @@ async def _scan_run_active_for(business_ids: list) -> dict:
     return out
 
 
+async def _scan_run_last_problem_for(business_ids: list) -> dict:
+    """J5: business_id -> its latest finished run IF that run failed or was incomplete, so the dashboard
+    can say "your scan didn't finish" instead of just offering a first scan again. A newer complete run clears it."""
+    if scan_runs_col is None or not business_ids:
+        return {}
+    out: dict = {}
+    seen: set = set()
+    cursor = scan_runs_col.find(
+        {"business_id": {"$in": [str(b) for b in business_ids]}, "status": {"$in": ["failed", "incomplete", "complete"]}},
+        {"_id": 0, "run_id": 1, "business_id": 1, "status": 1, "legs": 1, "created_at": 1, "completed_at": 1},
+    ).sort("created_at", -1)
+    async for run in cursor:
+        bid = run["business_id"]
+        if bid in seen:
+            continue
+        seen.add(bid)
+        if run.get("status") == "complete":
+            continue
+        legs = run.get("legs") or {}
+        crawl = legs.get("crawl") or {}
+        reason = crawl.get("error") if crawl.get("status") == "failed" else "Some of the AI models couldn't be reached, so no score was recorded."
+        out[bid] = {"run_id": run["run_id"], "status": run.get("status"), "reason": reason, "at": run.get("completed_at") or run.get("created_at")}
+    return out
+
+
 def _fetch_failure(scrape_result) -> dict | None:
     """L1: the scraper's verdict when it could NOT get the website ({ok: False,
     http_status, reason}), else None. A result without the verdict (older

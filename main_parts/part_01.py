@@ -66,6 +66,7 @@ from agents.content_agent import analyze_url_content
 from models.phase5_models import (
     Phase5QuestionsRequest,
     Phase5RewriteRequest,
+    Phase5SuggestRequest,
     Phase5QuestionsResponse,
     Phase5AnalyzeRequest,
 
@@ -82,6 +83,7 @@ from agents.phase5_agent import (
     generate_brand_questions,
     generate_preview_questions,
     rewrite_question_human,
+    suggest_extra_questions,
     rank_brand_in_ai,
     analyze_single_question,
     analyze_single_question_multi,

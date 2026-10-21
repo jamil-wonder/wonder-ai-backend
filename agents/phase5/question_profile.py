@@ -174,8 +174,18 @@ def natural_terms(profile: dict, sub_type="") -> list[str]:
     return [t for t in dict.fromkeys(out) if len(t) >= 4]
 
 
+ONLINE_LOCATION = "Online / everywhere"
+
+
+def is_online_location(location) -> bool:
+    """J3: a business that works everywhere / online has no place to name in its questions."""
+    return str(location or "").strip().lower() in {ONLINE_LOCATION.lower(), "online", "everywhere", "worldwide"}
+
+
 def uses_location(profile: dict, location) -> bool:
     """Whether the questions for this business should name a place."""
+    if is_online_location(location):
+        return False
     mode = profile.get("location_mode")
     if mode == "required":
         return True

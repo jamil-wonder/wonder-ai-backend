@@ -654,3 +654,30 @@ async def api_phase5_rewrite_question(
         branded=bool(req.branded),
     )
     return {"success": True, "rewritten": rewritten}
+
+
+@app.post("/api/phase5/suggest-questions")
+async def api_phase5_suggest_questions(
+    req: Phase5SuggestRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """J8: a handful of extra candidate questions in one quick call (not the full retry-heavy generation)."""
+    if businesses_col is None:
+        raise HTTPException(status_code=503, detail="business storage unavailable")
+    try:
+        business = await businesses_col.find_one({"_id": ObjectId(req.business_id), "user_id": current_user["id"]})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid business ID format")
+    if not business:
+        raise HTTPException(status_code=404, detail="Business not found")
+    context = {
+        "name": business.get("businessName") or "",
+        "category": business.get("category") or "",
+        "sub_type": business.get("sub_type") or business.get("subType") or "",
+        "location": business.get("location") or "",
+        "description": business.get("businessDescription") or business.get("ai_description") or "",
+        "services": business.get("services") if isinstance(business.get("services"), list) else [],
+        "target_audience": business.get("target_audience") or business.get("targetAudience") or "",
+    }
+    questions = await suggest_extra_questions(context, [str(q)[:300] for q in req.existing[:60]], count=6)
+    return {"success": True, "questions": questions}

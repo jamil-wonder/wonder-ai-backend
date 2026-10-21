@@ -12,7 +12,7 @@ from .helpers import (
     _safe_json_parse,
 )
 from .providers import _call_openai_chat_json, _call_perplexity_with_retry
-from .question_profile import natural_terms, question_profile, uses_location, violates_profile
+from .question_profile import is_online_location, natural_terms, question_profile, uses_location, violates_profile
 
 
 def _clean_question(value: str) -> str:
@@ -77,6 +77,37 @@ def _location_aliases(location: str) -> set[str]:
     words = [w for w in re.findall(r"[a-z0-9]+", raw) if len(w) >= 4]
     aliases.update(words)
     return {alias for alias in aliases if alias}
+
+
+# L2: claims that sound like facts about a business. A question may only use one if the owner's own
+# profile (name, description, services, audience) already says it - never an invented detail.
+_CLAIM_WORDS = [
+    "michelin", "award-winning", "award winning", "awarded", "five-star", "five star", "5-star", "luxury",
+    "family-run", "family run", "family-owned", "family owned", "certified", "accredited", "iso 9001",
+    "world-class", "world class", "celebrity", "historic", "century-old", "since 19", "since 20", "rooftop",
+    "organic", "vegan", "halal", "gluten-free", "pet-friendly", "wheelchair",
+]
+
+
+def invented_claim(text: str, support_text: str) -> str | None:
+    """The first claim word in `text` that the profile text does not contain, else None."""
+    low, support = _text(text).lower(), _text(support_text).lower()
+    for word in _CLAIM_WORDS:
+        if word in low and word not in support:
+            return word
+    return None
+
+
+def verbatim_category_label(text: str, category: str, services: list[str]) -> bool:
+    """L2: our filing label ("Professional Services", "Restaurant & Food") pasted into a question as if
+    customers said it. A single plain word ("restaurant") is fine; a multi-word or "&" label is not,
+    unless the business itself uses that phrase as one of its services."""
+    label = _text(category).lower()
+    if not label or (len(label.split()) < 2 and "&" not in label):
+        return False
+    if label in {_text(item).lower() for item in services}:
+        return False
+    return label in _text(text).lower()
 
 
 def spread_local_over_locations(local_items: list[str], primary: str, extras: list[str]) -> list[str]:
@@ -332,6 +363,14 @@ async def generate_brand_questions(
     use_loc = uses_location(profile, location)
     # services plus everyday words for this kind of business, for the on-topic checks below
     match_services = services + natural_terms(profile, sub_type)
+    support_text = " ".join([
+        _text(ctx.get("name")), _text(ctx.get("description")), _text(ctx.get("sub_type")),
+        _text(ctx.get("audience")), " ".join(services),
+    ])
+
+    def _bad_wording(text: str) -> bool:
+        return verbatim_category_label(text, category, services) or invented_claim(text, support_text) is not None
+
     avoid_questions = ctx.get("avoidQuestions") if isinstance(ctx.get("avoidQuestions"), list) else []
     avoid_questions = [_clean_question(item) for item in avoid_questions if _text(item)][:30]
 
@@ -340,7 +379,7 @@ async def generate_brand_questions(
         missing.append("business name")
     if not category:
         missing.append("category")
-    if not location and profile["location_mode"] == "required":
+    if not location and profile["location_mode"] == "required" and not is_online_location(location):
         missing.append("location")
     if missing:
         raise ValueError(
@@ -390,11 +429,19 @@ async def generate_brand_questions(
 - Avoid repeated wording patterns.
 - At least {local_pattern_min} of the {candidate_counts["localSeo"]} local_seo_queries MUST use the classic, high-volume real-search shape "Best <category> in <location>?" - questions shaped like "Best {category} in {location}?", using the exact location "{location}" every time and a natural real-world variant of the category or a specific service each time (do not repeat the identical sentence). Example shape only (do not reuse this exact wording): "{profile['example']}"
 - The remaining local_seo_queries should use other natural local-intent phrasings rather than all following the same "Best X in Y" shape."""
+        confirmed_towns = [t for t in (business_context.get("extraLocations") if isinstance(business_context, dict) else []) or [] if _text(t)]
+        if confirmed_towns:
+            area_rule = f'- Use ONLY these towns/areas the owner confirmed: {", ".join(_text(t) for t in confirmed_towns)}. Do not name any other place.'
+        else:
+            area_rule = (
+                f'- Use the WIDER area around "{location}" - the metropolitan area, county or region it belongs to (for example for London: "London" or "South East England"). '
+                "Do NOT name individual districts, boroughs or neighbourhoods; a business is not expected to be found in them."
+            )
         broad_rules = f"""- Do NOT include "{brand_name}", "{domain}", the website URL, or any obvious brand variant.
-- Identify the actual real-world neighboring areas, neighborhoods, boroughs, or districts surrounding "{location}" and write questions using those real neighboring names, e.g. "Which [category] near [Neighboring Area] would people recommend?".
-- The goal is to see if the AI engine recommends "{brand_name}" to people searching from these nearby surrounding areas.
-- Do NOT use the exact string "{location}" in these questions. Instead, use the real surrounding areas.
-- Every question must be specific to this category: "{category}" or the listed services.
+{area_rule}
+- The goal is to see if the AI engine recommends "{brand_name}" to people searching across this wider area.
+- Do NOT use the exact string "{location}" in these questions.
+- Every question must be specific to this category: "{category}" or the listed services (in everyday words, not the label).
 - Avoid repeated wording patterns."""
         if visitors:
             # travellers do not live next door: they plan a trip to the place from somewhere else
@@ -440,7 +487,8 @@ Important quality rules:
 - Every question must carry a real buyer intent for THIS kind of business. The intents that matter here: {intent_text}.
 {wording_rule}- Prefer natural full questions a real customer would type into Google, ChatGPT, Claude, or Perplexity.
 - Use the services and the audience given above rather than generic wording.
-- The category label above is only our own filing label. Write the way customers talk: use the everyday name of what the business is or offers (for example "solicitors", "dentists", "online store builder"), and never paste the category label itself into a question unless it is already a natural phrase.
+- The category label above is only our own filing label. Write the way customers talk: use the everyday name of what the business is or offers (for example "solicitors", "dentists", "online store builder"), and NEVER paste the category label itself into a question (for example never write "professional services for bars").
+- Do not invent facts. Only use details that appear in the description, services or audience above. Never add awards, stars, ratings, certifications, prices, "luxury", "family-run" or similar claims that the profile does not state.
 - If previous questions are provided below, do not repeat them and do not create near-duplicates with only tiny wording changes.
 
 Previous questions to avoid:
@@ -569,7 +617,7 @@ Return ONLY valid JSON:
             if len(text) < 12 or key in seen:
                 continue
             quality_text = re.sub(re.escape(brand_name), "", text, flags=re.IGNORECASE)
-            if _is_low_quality_query(quality_text) or violates_profile(text, profile):
+            if _is_low_quality_query(quality_text) or violates_profile(text, profile) or _bad_wording(text):
                 continue
             if not _includes_brand(text, brand_name):
                 continue
@@ -585,7 +633,7 @@ Return ONLY valid JSON:
             key = text.lower().rstrip("?.!")
             if len(text) < 12 or key in seen:
                 continue
-            if _is_low_quality_query(text) or violates_profile(text, profile):
+            if _is_low_quality_query(text) or violates_profile(text, profile) or _bad_wording(text):
                 continue
             if _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain):
                 continue
@@ -611,7 +659,7 @@ Return ONLY valid JSON:
             key = text.lower().rstrip("?.!")
             if len(text) < 12 or key in seen:
                 continue
-            if _is_low_quality_query(text) or violates_profile(text, profile):
+            if _is_low_quality_query(text) or violates_profile(text, profile) or _bad_wording(text):
                 continue
             if _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain):
                 continue
@@ -643,7 +691,7 @@ Return ONLY valid JSON:
             key = text.lower().rstrip("?.!")
             if len(text) < 12 or key in seen:
                 continue
-            if _is_low_quality_query(text) or violates_profile(text, profile):
+            if _is_low_quality_query(text) or violates_profile(text, profile) or _bad_wording(text):
                 continue
             if _is_branded_question(text, blocked_tokens, blocked_phrases, blocked_domain):
                 continue
@@ -771,3 +819,73 @@ async def rewrite_question_human(
     if not isinstance(parsed, dict):
         return None
     return accept_rewrite(original, str(parsed.get("question") or ""), _text(brand_name), _text(location), branded)
+
+
+async def suggest_extra_questions(
+    business_context: dict,
+    existing: list[str],
+    count: int = 6,
+) -> list[dict]:
+    """J8: a few more candidate questions in ONE quick AI call (no retries), for the owner to swap in.
+    Same rules as the main set: no brand in non-branded ones, brand in branded ones, no pasted category label,
+    no invented claims, no repeats of what they already have. Returns [{"text", "type", "label"}]."""
+    ctx = business_context or {}
+    brand = _text(ctx.get("name"))
+    category = _text(ctx.get("category"))
+    location = _text(ctx.get("location"))
+    description = _text(ctx.get("description"))
+    services = [_text(x) for x in (ctx.get("services") or []) if _text(x)][:8] if isinstance(ctx.get("services"), list) else []
+    if not brand or not category:
+        return []
+    profile = question_profile(category, ctx.get("sub_type"))
+    use_loc = uses_location(profile, location)
+    match_services = services + natural_terms(profile, ctx.get("sub_type"))
+    support_text = " ".join([brand, description, _text(ctx.get("sub_type")), _text(ctx.get("target_audience")), " ".join(services)])
+    have = {_text(x).lower().rstrip("?.!") for x in existing}
+
+    place_line = f", based in {location}" if use_loc and location else ""
+    if use_loc and location:
+        last_group = f'2 "localSeo" (naming {location})'
+    else:
+        last_group = '2 more "nonBranded"'
+    existing_lines = chr(10).join("- " + _text(x) for x in existing[:25])
+    prompt = f"""
+    Business: {brand} ({category}){place_line}
+    Description: {description or "none"}
+    Services: {", ".join(services) or "unknown"}
+
+    Suggest {count} MORE questions a real customer might ask an AI assistant. Mix: 2 "branded" (name {brand}), 2 "nonBranded" (no business name), {last_group}.
+    Rules: each ends with "?"; natural everyday wording - never paste the category label "{category}"; use only facts in the description/services above (no awards, stars, ratings, "luxury", prices); do not repeat or lightly reword these:
+    {existing_lines}
+    Return JSON only: {{"questions": [{{"type": "branded|nonBranded|localSeo", "text": "..."}}]}}
+    """
+    try:
+        parsed = await _call_openai_chat_json(prompt, timeout_sec=PHASE5_QUESTION_GEN_TIMEOUT_SEC)
+    except Exception as e:
+        print(f"[Phase5] suggest-more failed: {e}")
+        return []
+    rows = parsed.get("questions") if isinstance(parsed, dict) else None
+    out: list[dict] = []
+    types = {"branded": ("branded", "Branded"), "nonbranded": ("non-branded", "Non-Branded"), "localseo": ("local-seo", "Local SEO")}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        kind = types.get(_text(row.get("type")).lower().replace("-", "").replace("_", ""))
+        text = _clean_question(row.get("text"))
+        key = text.lower().rstrip("?.!")
+        if not kind or len(text) < 12 or key in have:
+            continue
+        if _is_low_quality_query(text) or violates_profile(text, profile):
+            continue
+        if verbatim_category_label(text, category, services) or invented_claim(text, support_text):
+            continue
+        has_brand = brand.lower() in text.lower()
+        if (kind[0] == "branded") != has_brand:
+            continue
+        if kind[0] == "local-seo" and use_loc and not _includes_location(text, location):
+            continue
+        if not _includes_category_or_service(text, category, match_services) and not (use_loc and _includes_location(text, location)):
+            continue
+        have.add(key)
+        out.append({"text": text, "type": kind[0], "label": kind[1]})
+    return out[:count]

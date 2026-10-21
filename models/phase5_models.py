@@ -20,6 +20,11 @@ class Phase5RewriteRequest(BaseModel):
     location: Optional[str] = None
     branded: bool = False
 
+class Phase5SuggestRequest(BaseModel):
+    """J8: a few more candidate questions, given what the owner already has."""
+    business_id: str
+    existing: List[str] = Field(default_factory=list)
+
 class Phase5QuestionsResponse(BaseModel):
     questions: List[str]
     questionGroups: Optional[dict[str, List[str]]] = None

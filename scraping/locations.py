@@ -864,6 +864,8 @@ def parse_location_input(value: Any, postcode: Any = "") -> Dict[str, str]:
 def location_input_problem(value: Any) -> str:
     """"" if `value` is a city/area, else why it isn't (same rules the wizard shows)."""
     text = _collapse(value)
+    if text.lower() in ("online / everywhere", "online", "everywhere", "worldwide"):
+        return ""  # J3: "we work everywhere / online" is a real answer
     if not text:
         return "Tell us where you're based so we can track the local searches your customers make."
     if len(text) < 2:

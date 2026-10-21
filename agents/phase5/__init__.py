@@ -2,7 +2,7 @@ from .analysis import analyze_single_question, analyze_single_question_multi, ra
 from .competitors import generate_brand_perception_summary, generate_deep_competitor_scores, generate_public_competitor_suggestions
 from .helpers import _estimate_target_visibility_score, _normalize_domain
 from .providers import Phase5RateLimitError
-from .questions import generate_brand_questions, generate_preview_questions, rewrite_question_human
+from .questions import generate_brand_questions, generate_preview_questions, rewrite_question_human, suggest_extra_questions
 from .scoring import compute_mention_rate, compute_mention_rate_margin, wonder_margin, compute_provider_score, compute_run_health, compute_wonder_score, provider_result_state
 
 __all__ = [
@@ -15,6 +15,7 @@ __all__ = [
     "generate_brand_questions",
     "generate_preview_questions",
     "rewrite_question_human",
+    "suggest_extra_questions",
     "compute_provider_score",
     "compute_run_health",
     "compute_mention_rate",
