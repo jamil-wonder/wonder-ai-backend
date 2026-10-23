@@ -107,10 +107,35 @@ def compute_competitor_score(seed_results: dict, domain: str) -> dict:
 
 PROVIDER_NAMES = ("perplexity", "chatgpt", "claude", "gemini")
 
-# A run where more than this share of model results failed is "incomplete":
-# no score is written (J6/A4). The failures are on our side (credits, rate
-# limits, timeouts), so they must never be reported to the client as zero.
+# A4 (decided): each model is judged on its OWN answers. A model counts only if it answered at least
+# 75% of the questions it was asked (it failed no more than this share). A run is scored from the models
+# that count, provided at least MIN_USABLE_MODELS of them do; with fewer it is "incomplete" and no score is
+# written (J6). The failures are on our side (credits, rate limits, timeouts), so they must never be
+# reported to the client as zero.
 INCOMPLETE_FAILED_FRACTION = float(os.getenv("PHASE5_INCOMPLETE_FAILED_FRACTION", "0.25"))
+MIN_USABLE_MODELS = int(os.getenv("PHASE5_MIN_USABLE_MODELS", "3"))
+
+
+def provider_counts(results: dict, provider: str) -> tuple:
+    """(answered ok, failed) for one model across a run; not-run answers are neither."""
+    ok = failed = 0
+    for row in (results if isinstance(results, dict) else {}).values():
+        providers = row.get("providers") if isinstance(row, dict) else None
+        pdata = providers.get(provider) if isinstance(providers, dict) else None
+        if not isinstance(pdata, dict):
+            continue
+        state = provider_result_state(pdata)
+        if state == "ok":
+            ok += 1
+        elif state == "failed":
+            failed += 1
+    return ok, failed
+
+
+def provider_usable(ok: int, failed: int) -> bool:
+    """A model counts when it answered something and failed no more than 25% of what it was asked."""
+    attempted = ok + failed
+    return ok > 0 and (failed / attempted) <= INCOMPLETE_FAILED_FRACTION
 # B2: more than this share of returned answers with no captured sources = citation capture failed
 CITATIONS_MISSING_FRACTION = 0.5
 
@@ -159,6 +184,8 @@ def compute_mention_rate(results: dict, questions: list | None) -> float | None:
 
     per_model_rates = []
     for provider in PROVIDER_NAMES:
+        if not provider_usable(*provider_counts(rows, provider)):
+            continue  # A4: a model that failed too many of its own answers is left out, not scored as zero
         mentioned_w = 0
         answered_w = 0
         for qid, row in rows.items():
@@ -199,6 +226,8 @@ def compute_mention_rate_margin(results: dict, questions: list | None) -> float 
 
     model_vars = []
     for provider in PROVIDER_NAMES:
+        if not provider_usable(*provider_counts(rows, provider)):
+            continue
         total_w = 0
         cells = []
         for qid, row in rows.items():
@@ -282,11 +311,20 @@ def compute_run_health(results: dict) -> dict:
     # half of "mentioned" cannot be trusted, so the run is incomplete too.
     cm_fraction = (citations_missing / counts["ok"]) if counts["ok"] else 0.0
     cm_majority = counts["ok"] > 0 and cm_fraction > CITATIONS_MISSING_FRACTION
-    too_many_failed = attempted > 0 and fraction > INCOMPLETE_FAILED_FRACTION
+    # A4: judge each model on its own answers; the run is scored from the models that count
+    per_model = {name: provider_counts(rows, name) for name in PROVIDER_NAMES}
+    asked = [name for name, (ok, failed) in per_model.items() if ok + failed > 0]
+    usable = [name for name in asked if provider_usable(*per_model[name])]
+    unusable = [name for name in asked if name not in usable]
+    needed = min(MIN_USABLE_MODELS, len(asked))
+    too_many_failed = bool(asked) and len(usable) < needed
     return {
         **counts,
         "failed_fraction": round(fraction, 4),
         "failed_by_provider": failed_by_provider,
+        "models_asked": asked,
+        "models_usable": usable,
+        "models_unusable": unusable,
         "citations_missing": citations_missing,
         "citations_missing_fraction": round(cm_fraction, 4),
         "citations_missing_by_provider": citations_missing_by_provider,
